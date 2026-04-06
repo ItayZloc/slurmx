@@ -1,7 +1,7 @@
 """
-MCP server exposing slurm_utils tools to Claude Code.
+MCP server exposing slurm_mcp tools to Claude Code.
 
-Run: uv run --with "mcp[cli]" python ~/.claude/mcp-servers/slurm-utils/server.py
+Run: uv run --with "mcp[cli]" python ~/.claude/mcp-servers/slurm-mcp/server.py
 """
 
 from __future__ import annotations
@@ -12,13 +12,13 @@ import subprocess
 import sys
 import os
 
-# Ensure slurm_utils, claude_job, config are importable from same directory
+# Ensure slurm_mcp, claude_job, config are importable from same directory
 sys.path.insert(0, os.path.dirname(__file__))
 
-import slurm_utils
+import slurm_mcp
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("slurm-utils", instructions="""\
+mcp = FastMCP("slurm-mcp", instructions="""\
 ## SLURM Job Submission Rules
 
 When the user says "job" or "a job running", they mean a SLURM job — not a local process.
@@ -33,7 +33,7 @@ Check with MCP my_jobs or squeue, not ps aux.
 - For multi-GPU training, use `torchrun --nproc_per_node=2 train.py` as the command.
 - Maintenance windows are enforced automatically — job time limits are capped to finish
   before scheduled maintenance. If a window is imminent (<5 min), submissions are blocked.
-- Do NOT write raw sbatch scripts or Python code that imports slurm_utils — always use MCP tools.
+- Do NOT write raw sbatch scripts or Python code that imports slurm_mcp — always use MCP tools.
 - Use cluster_summary as a single-call dashboard to see jobs + GPU availability.
 - Use diagnose_job to classify failures (OOM, timeout, missing module, code error).
 """)
@@ -45,9 +45,9 @@ def check_gpu_availability() -> str:
 
     Returns a summary of free/total GPUs by type and who is using golden tickets.
     """
-    avail = slurm_utils.check_availability()
+    avail = slurm_mcp.check_availability()
 
-    lines = [f"=== Golden Tickets ({slurm_utils.GOLDEN_QOS} QoS) ==="]
+    lines = [f"=== Golden Tickets ({slurm_mcp.GOLDEN_QOS} QoS) ==="]
     for name, g in avail.golden.items():
         lines.append(f"  {name}: {g.free}/{g.total} free")
         if g.users:
@@ -75,13 +75,13 @@ def select_gpu(vram_gb: int) -> str:
     if vram_gb == 0:
         return "CPU-only job — no GPU needed. Use submit_job with vram_gb=0."
 
-    selection = slurm_utils.select_gpu(vram_gb)
-    avail = slurm_utils.check_availability()
+    selection = slurm_mcp.select_gpu(vram_gb)
+    avail = slurm_mcp.check_availability()
 
     if selection is None:
-        capable = [g for g in slurm_utils.GPU_TYPES if g.vram_gb >= vram_gb]
+        capable = [g for g in slurm_mcp.GPU_TYPES if g.vram_gb >= vram_gb]
         if not capable:
-            max_gpu = max(slurm_utils.GPU_TYPES, key=lambda g: g.vram_gb)
+            max_gpu = max(slurm_mcp.GPU_TYPES, key=lambda g: g.vram_gb)
             return f"No GPU has >= {vram_gb}GB VRAM. Max available: {max_gpu.vram_gb}GB ({max_gpu.name})."
         lines = [f"No GPU with >= {vram_gb}GB VRAM is currently free.", ""]
         for g in capable:
@@ -93,7 +93,7 @@ def select_gpu(vram_gb: int) -> str:
         return "\n".join(lines)
 
     gpu_type, partition, qos = selection
-    gpu_info = slurm_utils.GPU_BY_NAME[gpu_type]
+    gpu_info = slurm_mcp.GPU_BY_NAME[gpu_type]
     golden = avail.golden.get(gpu_type)
     cluster = avail.cluster.get(gpu_type)
     gstr = f"golden {golden.free}/{golden.total}" if golden else "no golden"
@@ -112,8 +112,8 @@ def cluster_summary() -> str:
 
     Combines job listing and GPU status into one overview.
     """
-    avail = slurm_utils.check_availability()
-    jobs = slurm_utils.my_jobs()
+    avail = slurm_mcp.check_availability()
+    jobs = slurm_mcp.my_jobs()
 
     # Summarize user's jobs
     running = [j for j in jobs if j["state"] == "RUNNING"]
@@ -155,7 +155,7 @@ def my_jobs(qos: str | None = None) -> str:
     Args:
         qos: Optional QoS filter (e.g. 'yisroel' for golden tickets only).
     """
-    jobs = slurm_utils.my_jobs(qos=qos)
+    jobs = slurm_mcp.my_jobs(qos=qos)
     if not jobs:
         return "No jobs found."
 
@@ -176,7 +176,7 @@ def get_job_status(job_id: int) -> str:
     Args:
         job_id: The SLURM job ID.
     """
-    status = slurm_utils.get_job_status(job_id)
+    status = slurm_mcp.get_job_status(job_id)
     return json.dumps(status.to_dict(), indent=2)
 
 
@@ -189,7 +189,7 @@ def read_job_log(job_id: int, output_dir: str = "logs", tail: int = 100) -> str:
         output_dir: Directory to search for log files (default: 'logs').
         tail: Number of lines from the end to return (default: 100, 0 = all).
     """
-    content = slurm_utils.read_job_log(job_id, output_dir=output_dir, tail=tail)
+    content = slurm_mcp.read_job_log(job_id, output_dir=output_dir, tail=tail)
     if content is None:
         return f"No log file found for job {job_id} in {output_dir}/"
     return content
@@ -215,7 +215,7 @@ def diagnose_job(job_id: int, output_dir: str = "logs", log_lines: int = 50) -> 
         output_dir: Directory to search for log files (default: 'logs').
         log_lines: Number of tail lines to include (default: 50).
     """
-    status = slurm_utils.get_job_status(job_id)
+    status = slurm_mcp.get_job_status(job_id)
 
     if status.state in ("RUNNING", "PENDING"):
         reason = f" (reason: {status.reason})" if status.reason else ""
@@ -241,7 +241,7 @@ def diagnose_job(job_id: int, output_dir: str = "logs", log_lines: int = 50) -> 
         pass
 
     # Read log
-    log = slurm_utils.read_job_log(job_id, output_dir=output_dir, tail=log_lines)
+    log = slurm_mcp.read_job_log(job_id, output_dir=output_dir, tail=log_lines)
 
     # Classify failure
     log_text = log or ""
@@ -251,7 +251,7 @@ def diagnose_job(job_id: int, output_dir: str = "logs", log_lines: int = 50) -> 
     if status.state == "OUT_OF_MEMORY" or any(m in log_text for m in _OOM_MARKERS):
         classification = "OOM"
         gpu_name = gpu_used.split(":")[0] if gpu_used else ""
-        gpu_info = slurm_utils.GPU_BY_NAME.get(gpu_name)
+        gpu_info = slurm_mcp.GPU_BY_NAME.get(gpu_name)
         if gpu_info and gpu_info.vram_gb in _VRAM_ESCALATION:
             next_vram = _VRAM_ESCALATION[gpu_info.vram_gb]
             suggestion = f"Retry with more VRAM: {gpu_info.vram_gb}GB -> {next_vram}GB."
@@ -338,7 +338,7 @@ def submit_job(
         dependency: Job dependency (e.g. 'afterok:12345').
         dry_run: If true, preview the script without submitting.
     """
-    result = slurm_utils.submit_job(
+    result = slurm_mcp.submit_job(
         cmd=cmd,
         vram_gb=vram_gb,
         job_name=job_name,
@@ -373,7 +373,7 @@ def cancel_jobs(job_ids: list[int] | None = None, all_jobs: bool = False, pendin
         all_jobs: Cancel all your jobs.
         pending_only: Only cancel pending jobs (use with all_jobs=true).
     """
-    count = slurm_utils.cancel_jobs(
+    count = slurm_mcp.cancel_jobs(
         job_ids=job_ids,
         all_jobs=all_jobs,
         pending_only=pending_only,
@@ -390,7 +390,7 @@ def wait_for_job(job_id: int, poll_interval: int = 30, timeout: int = 600) -> st
         poll_interval: Seconds between status checks (default: 30).
         timeout: Max seconds to wait (default: 600, 0 = no limit).
     """
-    status = slurm_utils.wait_for_job(job_id, poll_interval=poll_interval, timeout=timeout)
+    status = slurm_mcp.wait_for_job(job_id, poll_interval=poll_interval, timeout=timeout)
     return json.dumps(status.to_dict(), indent=2)
 
 

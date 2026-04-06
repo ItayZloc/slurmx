@@ -23,20 +23,20 @@ MCP server that lets Claude Code submit, monitor, and manage SLURM GPU jobs dire
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/ItayZloc/slurm-mcp.git ~/.claude/mcp-servers/slurm-utils
+git clone https://github.com/ItayZloc/slurm-mcp.git ~/.claude/mcp-servers/slurm-mcp
 
 # 2. Configure
-cd ~/.claude/mcp-servers/slurm-utils
+cd ~/.claude/mcp-servers/slurm-mcp
 cp config.example.py config.py
-# Edit config.py — fill in MAIL_USER and CLAUDE_LOG_DIR
+# Edit config.py — fill in MAIL_USER (CLAUDE_LOG_DIR is auto-detected)
 
 # 3. Create venv and install dependencies
 uv sync
 
 # 4. Register with Claude Code
-claude mcp add slurm-utils \
-  ~/.claude/mcp-servers/slurm-utils/.venv/bin/python \
-  ~/.claude/mcp-servers/slurm-utils/server.py
+claude mcp add slurm-mcp \
+  ~/.claude/mcp-servers/slurm-mcp/.venv/bin/python \
+  ~/.claude/mcp-servers/slurm-mcp/server.py
 ```
 
 Verify it works:
@@ -51,9 +51,8 @@ Edit `config.py` (copied from `config.example.py`):
 | Field | What to fill in |
 |-------|----------------|
 | `MAIL_USER` | Your cluster email (for SLURM mail notifications) |
-| `CLAUDE_LOG_DIR` | Path to store Claude job logs, e.g. `/home/USERNAME/.claude/logs` |
 
-The rest (GPU definitions, QoS, partitions) is pre-filled for the shared cluster.
+`CLAUDE_LOG_DIR` and other paths are auto-populated from your `$USER` environment variable. GPU definitions, QoS, and partitions are pre-filled for the shared cluster.
 
 ## Maintenance Windows
 

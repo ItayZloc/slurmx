@@ -1,8 +1,8 @@
 """
-slurm_utils — Smart SLURM job submission for GPU clusters.
+slurm_mcp — Smart SLURM job submission for GPU clusters.
 
 Usage from a project:
-    from slurm_utils import submit_job, check_availability, select_gpu
+    from slurm_mcp import submit_job, check_availability, select_gpu
 
     # Auto-select GPU based on VRAM requirement
     result = submit_job(

@@ -4,9 +4,13 @@ Copy this to config.py and fill in the personal fields marked with TODO.
 Shared cluster values (GPU definitions, QoS, partitions) are pre-filled.
 """
 
-# --- Personal (TODO: fill these in) ---
-MAIL_USER = ""  # your cluster email, e.g. "user@post.bgu.ac.il"
-CLAUDE_LOG_DIR = ""  # e.g. "/home/USERNAME/.claude/logs"
+import os
+
+# --- Auto-detected ---
+USERNAME = os.environ.get("USER", "")
+
+# --- Personal (TODO: fill in your email) ---
+MAIL_USER = ""  # e.g. "username@post.bgu.ac.il"
 
 # --- QoS / Partitions ---
 GOLDEN_QOS = "yisroel"
@@ -31,3 +35,6 @@ GPU_DEFINITIONS = [
     ("rtx_2080",     "RTX 2080",     11, 0,  None),
     ("gtx_1080",     "GTX 1080",     8,  0,  None),
 ]
+
+# --- Claude Job Defaults (auto-populated from USERNAME) ---
+CLAUDE_LOG_DIR = f"/home/{USERNAME}/.claude/logs"

@@ -1,5 +1,5 @@
 """
-Comprehensive tests for slurm_utils.py
+Comprehensive tests for slurm_mcp.py
 
 Tests are split into:
   1. Unit tests with mocked SLURM commands (always runnable)
@@ -17,11 +17,11 @@ import subprocess
 import pytest
 from unittest.mock import patch, MagicMock
 
-# Ensure we import from the local slurm_utils
+# Ensure we import from the local slurm_mcp
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import slurm_utils
-from slurm_utils import (
+import slurm_mcp
+from slurm_mcp import (
     GPU_TYPES, GPU_BY_NAME, GOLDEN_QOS, MAX_MEM_GB, MAIL_USER,
     GPUType, GPUAvailability, Availability, JobResult, JobStatus,
     check_availability, select_gpu, submit_job,
@@ -123,7 +123,7 @@ class TestGPUDefinitions:
 # ============================================================
 
 class TestCheckAvailabilityMocked:
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_parses_golden_running_jobs(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output=MOCK_SQUEUE_GOLDEN, sinfo_output=MOCK_SINFO
@@ -138,7 +138,7 @@ class TestCheckAvailabilityMocked:
         assert avail.golden["rtx_6000"].used == 1
         assert avail.golden["rtx_6000"].free == 12 - 1  # = 11
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_golden_users_tracked(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output=MOCK_SQUEUE_GOLDEN, sinfo_output=MOCK_SINFO
@@ -153,7 +153,7 @@ class TestCheckAvailabilityMocked:
         users_6000 = avail.golden["rtx_6000"].users
         assert users_6000["weissroy"] == 1
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_pending_jobs_not_counted(self, mock_rq):
         """PENDING jobs should NOT count toward 'used' GPUs."""
         mock_rq.side_effect = mock_run_quiet_factory(
@@ -163,7 +163,7 @@ class TestCheckAvailabilityMocked:
         # The last line in mock is PENDING — should not be counted
         assert avail.golden["rtx_pro_6000"].used == 5  # not 6
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_cluster_total_gpus(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output="", sinfo_output=MOCK_SINFO
@@ -183,7 +183,7 @@ class TestCheckAvailabilityMocked:
         # rtx_2080: 4
         assert avail.cluster["rtx_2080"].total == 4
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_cluster_allocated_gpus(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output="", sinfo_output=MOCK_SINFO
@@ -197,7 +197,7 @@ class TestCheckAvailabilityMocked:
         assert avail.cluster["rtx_3090"].used == 2     # 2 (drained excluded)
         assert avail.cluster["rtx_2080"].used == 0
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_cluster_free_gpus(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output="", sinfo_output=MOCK_SINFO
@@ -211,7 +211,7 @@ class TestCheckAvailabilityMocked:
         assert avail.cluster["rtx_3090"].free == 6      # 8 - 2
         assert avail.cluster["rtx_2080"].free == 4      # 4 - 0
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_down_drained_nodes_excluded(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output="", sinfo_output=MOCK_SINFO
@@ -222,7 +222,7 @@ class TestCheckAvailabilityMocked:
         assert avail.cluster["rtx_4090"].total == 6    # only the 2 alive nodes
         assert avail.cluster["rtx_3090"].total == 8    # only cs-3090-01
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_node_deduplication(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output="", sinfo_output=MOCK_SINFO_WITH_DUPES
@@ -232,7 +232,7 @@ class TestCheckAvailabilityMocked:
         assert avail.cluster["gtx_1080"].total == 8  # still 4+4, not 4+4+4
         assert avail.cluster["rtx_pro_6000"].total == 16  # still 8+8, not 8+8+8
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_empty_squeue_output(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output="", sinfo_output=MOCK_SINFO
@@ -243,7 +243,7 @@ class TestCheckAvailabilityMocked:
         assert avail.golden["rtx_6000"].used == 0
         assert avail.golden["rtx_6000"].free == 12
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_empty_sinfo_output(self, mock_rq):
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output=MOCK_SQUEUE_GOLDEN, sinfo_output=""
@@ -254,7 +254,7 @@ class TestCheckAvailabilityMocked:
             assert avail.cluster[gpu.name].total == 0
             assert avail.cluster[gpu.name].free == 0
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_tres_per_node_parsing(self, mock_rq):
         """Jobs that use --gpus-per-node show GPU in tres-per-node field."""
         squeue = (
@@ -294,7 +294,7 @@ class TestSelectGPUMocked:
             )
         return avail
 
-    @patch("slurm_utils.check_availability")
+    @patch("slurm_mcp.check_availability")
     def test_selects_golden_rtx_6000_for_48gb(self, mock_avail):
         mock_avail.return_value = self._make_avail(
             golden_free={"rtx_pro_6000": 5, "rtx_6000": 3},
@@ -303,7 +303,7 @@ class TestSelectGPUMocked:
         result = select_gpu(48)
         assert result == ("rtx_6000", "rtx6000", "yisroel")
 
-    @patch("slurm_utils.check_availability")
+    @patch("slurm_mcp.check_availability")
     def test_selects_golden_rtx_pro_for_96gb(self, mock_avail):
         mock_avail.return_value = self._make_avail(
             golden_free={"rtx_pro_6000": 5, "rtx_6000": 3},
@@ -311,7 +311,7 @@ class TestSelectGPUMocked:
         result = select_gpu(96)
         assert result == ("rtx_pro_6000", "rtx_pro_6000", "yisroel")
 
-    @patch("slurm_utils.check_availability")
+    @patch("slurm_mcp.check_availability")
     def test_falls_back_to_golden_pro_when_6000_full(self, mock_avail):
         mock_avail.return_value = self._make_avail(
             golden_free={"rtx_pro_6000": 5, "rtx_6000": 0},
@@ -320,7 +320,7 @@ class TestSelectGPUMocked:
         # rtx_6000 golden is full, should try rtx_pro_6000 golden
         assert result == ("rtx_pro_6000", "rtx_pro_6000", "yisroel")
 
-    @patch("slurm_utils.check_availability")
+    @patch("slurm_mcp.check_availability")
     def test_falls_back_to_cluster_when_golden_full(self, mock_avail):
         mock_avail.return_value = self._make_avail(
             golden_free={"rtx_pro_6000": 0, "rtx_6000": 0},
@@ -329,7 +329,7 @@ class TestSelectGPUMocked:
         result = select_gpu(48)
         assert result == ("rtx_6000", "main", "normal")
 
-    @patch("slurm_utils.check_availability")
+    @patch("slurm_mcp.check_availability")
     def test_cluster_picks_smallest_gpu(self, mock_avail):
         mock_avail.return_value = self._make_avail(
             golden_free={"rtx_pro_6000": 0, "rtx_6000": 0},
@@ -342,7 +342,7 @@ class TestSelectGPUMocked:
         assert result[1] == "main"
         assert result[2] == "normal"
 
-    @patch("slurm_utils.check_availability")
+    @patch("slurm_mcp.check_availability")
     def test_returns_none_when_nothing_available(self, mock_avail):
         mock_avail.return_value = self._make_avail(
             golden_free={"rtx_pro_6000": 0, "rtx_6000": 0},
@@ -355,7 +355,7 @@ class TestSelectGPUMocked:
         result = select_gpu(200)
         assert result is None
 
-    @patch("slurm_utils.check_availability")
+    @patch("slurm_mcp.check_availability")
     def test_8gb_prefers_golden(self, mock_avail):
         """Even for 8GB, golden is preferred over public queue."""
         mock_avail.return_value = self._make_avail(
@@ -414,10 +414,10 @@ class TestBuildSbatchScript:
             cmd="python train.py", partition="main", qos="normal",
             gpu_type="rtx_4090", num_gpus=1, job_name="test",
             output_path="out.log",
-            workdir="/home/user/project",
+            workdir="/tmp/test-project",
         )
-        assert "cd /home/user/project" in script
-        cd_pos = script.index("cd /home/user/project")
+        assert "cd /tmp/test-project" in script
+        cd_pos = script.index("cd /tmp/test-project")
         cmd_pos = script.index("python train.py")
         assert cd_pos < cmd_pos
 
@@ -436,7 +436,7 @@ class TestBuildSbatchScript:
 # ============================================================
 
 class TestSubmitJobMocked:
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_dry_run_returns_script(self, mock_select):
         mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
         result = submit_job(
@@ -452,19 +452,19 @@ class TestSubmitJobMocked:
         assert "python train.py" in result.sbatch_script
         assert "#SBATCH --partition rtx6000" in result.sbatch_script
 
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_dry_run_with_workdir(self, mock_select):
         mock_select.return_value = ("rtx_pro_6000", "rtx_pro_6000", "yisroel")
         result = submit_job(
             cmd="python train.py --lr 1e-4",
             vram_gb=96,
-            workdir="/home/user/project",
+            workdir="/tmp/test-project",
             output_dir="/tmp/logs",
             job_name="train-bert",
             dry_run=True,
         )
         assert result.success is True
-        assert "cd /home/user/project" in result.sbatch_script
+        assert "cd /tmp/test-project" in result.sbatch_script
         assert "/tmp/logs/slurm-train-bert-%J.out" in result.sbatch_script
         assert "#SBATCH --mem=80G" in result.sbatch_script
         assert "#SBATCH --time 7-0:00:00" in result.sbatch_script
@@ -510,17 +510,17 @@ class TestSubmitJobMocked:
         assert "24GB VRAM" in result.message
         assert "50GB requested" in result.message
 
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_vram_too_high_no_gpu_type_exists(self, mock_select):
         mock_select.return_value = None
         result = submit_job(cmd="echo hi", vram_gb=200, dry_run=True)
         assert result.success is False
         assert "No GPU type has >= 200GB VRAM" in result.message
 
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_nothing_available_shows_availability(self, mock_select):
         mock_select.return_value = None
-        with patch("slurm_utils.check_availability") as mock_avail:
+        with patch("slurm_mcp.check_availability") as mock_avail:
             avail = Availability()
             avail.golden["rtx_6000"] = GPUAvailability("rtx_6000", 12, 12, 0)
             avail.golden["rtx_pro_6000"] = GPUAvailability("rtx_pro_6000", 16, 16, 0)
@@ -533,13 +533,13 @@ class TestSubmitJobMocked:
             assert "currently free" in result.message
             assert "rtx_6000" in result.message
 
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_default_job_name_from_command(self, mock_select):
         mock_select.return_value = ("gtx_1080", "main", "normal")
         result = submit_job(cmd="python train.py --lr 1e-4", vram_gb=8, dry_run=True)
         assert "#SBATCH --job-name python" in result.sbatch_script
 
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_custom_job_name(self, mock_select):
         mock_select.return_value = ("gtx_1080", "main", "normal")
         result = submit_job(
@@ -547,7 +547,7 @@ class TestSubmitJobMocked:
         )
         assert "#SBATCH --job-name my-training" in result.sbatch_script
 
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_multi_gpu_request(self, mock_select):
         mock_select.return_value = ("rtx_pro_6000", "rtx_pro_6000", "yisroel")
         result = submit_job(
@@ -563,8 +563,8 @@ class TestSubmitJobMocked:
         assert result.success is False
         assert "exceeds cluster limit" in result.message
 
-    @patch("slurm_utils._run")
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp._run")
+    @patch("slurm_mcp.select_gpu")
     def test_actual_submit_parses_job_id(self, mock_select, mock_run):
         mock_select.return_value = ("gtx_1080", "main", "normal")
         mock_run.return_value = "Submitted batch job 12345678\n"
@@ -572,8 +572,8 @@ class TestSubmitJobMocked:
         assert result.success is True
         assert result.job_id == 12345678
 
-    @patch("slurm_utils._run")
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp._run")
+    @patch("slurm_mcp.select_gpu")
     def test_submit_failure_returns_error(self, mock_select, mock_run):
         mock_select.return_value = ("gtx_1080", "main", "normal")
         mock_run.side_effect = RuntimeError("sbatch: error: invalid partition")
@@ -587,7 +587,7 @@ class TestSubmitJobMocked:
 # ============================================================
 
 class TestMyJobsMocked:
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_parses_jobs(self, mock_rq):
         mock_rq.return_value = (
             "15908232    "
@@ -605,7 +605,7 @@ class TestMyJobsMocked:
         assert jobs[0]["state"] == "RUNNING"
         assert jobs[0]["qos"] == "yisroel"
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_empty_returns_empty_list(self, mock_rq):
         mock_rq.return_value = ""
         jobs = my_jobs()
@@ -617,7 +617,7 @@ class TestMyJobsMocked:
 # ============================================================
 
 class TestCancelJobsMocked:
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_cancel_specific_ids(self, mock_rq):
         mock_rq.return_value = ""
         count = cancel_jobs(job_ids=[123, 456, 789])
@@ -626,12 +626,12 @@ class TestCancelJobsMocked:
         calls = [c for c in mock_rq.call_args_list if c[0][0][0] == "scancel"]
         assert len(calls) == 3
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_cancel_returns_zero_when_nothing(self, mock_rq):
         count = cancel_jobs()
         assert count == 0
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_cancel_all_counts(self, mock_rq):
         mock_rq.return_value = "job1\njob2\njob3\n"
         count = cancel_jobs(all_jobs=True)
@@ -670,7 +670,7 @@ class TestBuildSbatchScriptDependency:
         )
         assert "#SBATCH --dependency=afterok:111:222:333" in script
 
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_dependency_in_submit_job_dry_run(self, mock_select):
         mock_select.return_value = ("rtx_4090", "main", "normal")
         result = submit_job(
@@ -686,7 +686,7 @@ class TestBuildSbatchScriptDependency:
 # ============================================================
 
 class TestGetJobStatusMocked:
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_running_job_from_squeue(self, mock_rq):
         # squeue format: JobId:12,State:20,NodeList:25,TimeUsed:15,Reason:40
         mock_rq.return_value = (
@@ -704,7 +704,7 @@ class TestGetJobStatusMocked:
         assert status.reason == ""
         assert status.finished is False
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_pending_job_with_reason(self, mock_rq):
         mock_rq.return_value = (
             "12345678    "
@@ -718,7 +718,7 @@ class TestGetJobStatusMocked:
         assert status.reason == "QOSMaxGRESPerAccount"
         assert status.finished is False
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_pending_job_resources_reason(self, mock_rq):
         mock_rq.return_value = (
             "12345678    "
@@ -731,7 +731,7 @@ class TestGetJobStatusMocked:
         assert status.state == "PENDING"
         assert status.reason == "Resources"
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_completed_job_from_sacct(self, mock_rq):
         def side_effect(cmd):
             if cmd[0] == "squeue":
@@ -746,7 +746,7 @@ class TestGetJobStatusMocked:
         assert status.finished is True
         assert status.node == "ise-6000p-01"
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_failed_job_from_sacct(self, mock_rq):
         def side_effect(cmd):
             if cmd[0] == "squeue":
@@ -760,7 +760,7 @@ class TestGetJobStatusMocked:
         assert status.exit_code == 1
         assert status.finished is True
 
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp._run_quiet")
     def test_unknown_job(self, mock_rq):
         mock_rq.return_value = ""
         status = get_job_status(99999)
@@ -819,8 +819,8 @@ class TestReadJobLog:
 # ============================================================
 
 class TestWaitForJobMocked:
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_returns_when_finished(self, mock_status, mock_sleep):
         mock_status.return_value = JobStatus(
             job_id=123, state="COMPLETED", exit_code=0, finished=True,
@@ -830,8 +830,8 @@ class TestWaitForJobMocked:
         assert result.finished is True
         mock_sleep.assert_not_called()
 
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_polls_until_finished(self, mock_status, mock_sleep):
         mock_status.side_effect = [
             JobStatus(job_id=123, state="PENDING"),
@@ -842,9 +842,9 @@ class TestWaitForJobMocked:
         assert result.state == "COMPLETED"
         assert mock_sleep.call_count == 2
 
-    @patch("slurm_utils.time.time")
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.time")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_timeout_returns_last_status(self, mock_status, mock_sleep, mock_time):
         mock_time.side_effect = [0, 5, 100]  # start, check, check (past timeout)
         mock_status.return_value = JobStatus(job_id=123, state="PENDING")
@@ -865,8 +865,8 @@ class TestWaitForRunningMocked:
             sbatch_script="#!/bin/bash\n",
         )
 
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_immediately_running(self, mock_status, mock_sleep):
         mock_status.return_value = JobStatus(
             job_id=12345, state="RUNNING", node="ise-6000p-01",
@@ -877,8 +877,8 @@ class TestWaitForRunningMocked:
         assert "RUNNING" in result.message
         mock_sleep.assert_not_called()
 
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_pending_then_running(self, mock_status, mock_sleep):
         mock_status.side_effect = [
             JobStatus(job_id=12345, state="PENDING", reason="Resources"),
@@ -891,9 +891,9 @@ class TestWaitForRunningMocked:
         assert "RUNNING" in result.message
         assert mock_sleep.call_count == 2
 
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
+    @patch("slurm_mcp._run_quiet")
     def test_quota_reason_cancels_job(self, mock_rq, mock_status, mock_sleep):
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="QOSMaxGRESPerAccount",
@@ -904,9 +904,9 @@ class TestWaitForRunningMocked:
         assert "QOSMaxGRESPerAccount" in result.message
         mock_rq.assert_called_once_with(["scancel", "12345"])
 
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
+    @patch("slurm_mcp._run_quiet")
     def test_user_quota_reason_qos_max_user(self, mock_rq, mock_status, mock_sleep):
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="QOSMaxGRESPerUser",
@@ -918,9 +918,9 @@ class TestWaitForRunningMocked:
         assert "QOSMaxGRESPerUser" in result.message
         mock_rq.assert_called_once_with(["scancel", "12345"])
 
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
-    @patch("slurm_utils._run_quiet")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
+    @patch("slurm_mcp._run_quiet")
     def test_fatal_reason_dependency_never_satisfied(self, mock_rq, mock_status, mock_sleep):
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="DependencyNeverSatisfied",
@@ -930,8 +930,8 @@ class TestWaitForRunningMocked:
         assert result.success is False
         assert "DependencyNeverSatisfied" in result.message
 
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_job_finished_before_running(self, mock_status, mock_sleep):
         mock_status.return_value = JobStatus(
             job_id=12345, state="FAILED", exit_code=1, finished=True,
@@ -941,8 +941,8 @@ class TestWaitForRunningMocked:
         assert result.success is False
         assert "FAILED" in result.message
 
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_job_cancelled_before_running(self, mock_status, mock_sleep):
         mock_status.return_value = JobStatus(
             job_id=12345, state="CANCELLED", finished=True,
@@ -952,9 +952,9 @@ class TestWaitForRunningMocked:
         assert result.success is False
         assert "CANCELLED" in result.message
 
-    @patch("slurm_utils.time.time")
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.time")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_timeout_does_not_cancel_job(self, mock_status, mock_sleep, mock_time):
         """On timeout with benign reason, job stays queued (not cancelled)."""
         mock_time.side_effect = [0, 301]  # start, past timeout
@@ -967,9 +967,9 @@ class TestWaitForRunningMocked:
         assert "still pending" in result.message
         assert "remains queued" in result.message
 
-    @patch("slurm_utils.time.time")
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
+    @patch("slurm_mcp.time.time")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
     def test_timeout_includes_reason_in_message(self, mock_status, mock_sleep, mock_time):
         mock_time.side_effect = [0, 301]
         mock_status.return_value = JobStatus(
@@ -979,10 +979,10 @@ class TestWaitForRunningMocked:
         assert outcome == "still_pending"
         assert "Priority" in result.message
 
-    @patch("slurm_utils._run")
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp._run")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
+    @patch("slurm_mcp.select_gpu")
     def test_submit_job_with_wait_until_running(self, mock_select, mock_status, mock_sleep, mock_run):
         """Integration test: submit_job with wait_until_running=True."""
         mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
@@ -999,11 +999,11 @@ class TestWaitForRunningMocked:
         assert "RUNNING" in result.message
         assert result.job_id == 12345
 
-    @patch("slurm_utils._run")
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
-    @patch("slurm_utils._run_quiet")
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp._run")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
+    @patch("slurm_mcp._run_quiet")
+    @patch("slurm_mcp.select_gpu")
     def test_submit_job_quota_hit_falls_back_to_normal(self, mock_select, mock_rq, mock_status, mock_sleep, mock_run):
         """Quota hit on golden -> cancel, resubmit on normal QoS, then runs."""
         mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
@@ -1027,11 +1027,11 @@ class TestWaitForRunningMocked:
         assert result.qos == "normal"
         assert result.partition == "main"
 
-    @patch("slurm_utils._run")
-    @patch("slurm_utils.time.sleep")
-    @patch("slurm_utils.get_job_status")
-    @patch("slurm_utils._run_quiet")
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp._run")
+    @patch("slurm_mcp.time.sleep")
+    @patch("slurm_mcp.get_job_status")
+    @patch("slurm_mcp._run_quiet")
+    @patch("slurm_mcp.select_gpu")
     def test_submit_job_user_quota_does_not_fallback(self, mock_select, mock_rq, mock_status, mock_sleep, mock_run):
         """QOSMaxGRESPerUser should NOT trigger fallback — it's a per-user limit across all QoS."""
         mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
@@ -1048,8 +1048,8 @@ class TestWaitForRunningMocked:
         # Should only have submitted ONCE (no fallback)
         assert mock_run.call_count == 1
 
-    @patch("slurm_utils._run")
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp._run")
+    @patch("slurm_mcp.select_gpu")
     def test_submit_job_without_wait_still_works(self, mock_select, mock_run):
         """submit_job without wait_until_running should return immediately."""
         mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
@@ -1064,7 +1064,7 @@ class TestWaitForRunningMocked:
 # ============================================================
 
 class TestCLIJsonOutput:
-    @patch("slurm_utils.select_gpu")
+    @patch("slurm_mcp.select_gpu")
     def test_json_dry_run(self, mock_select):
         mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
         import subprocess

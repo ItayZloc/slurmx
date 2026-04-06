@@ -20,7 +20,7 @@ import sys
 # Allow import from the same directory as this script
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from slurm_utils import submit_job, GPU_TYPES
+from slurm_mcp import submit_job, GPU_TYPES
 
 BOLD = "\033[1m"
 GREEN = "\033[0;32m"
