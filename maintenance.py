@@ -13,8 +13,7 @@ from typing import Optional
 # --- Scheduled maintenance windows ---
 # Each entry: (start_datetime, end_datetime)
 WINDOWS = [
-    # Add maintenance windows as (start, end) datetime tuples. Example:
-    # (datetime(2026, 5, 1, 8, 0), datetime(2026, 5, 1, 20, 0)),
+    (datetime(2026, 4, 12, 8, 0), datetime(2026, 4, 12, 20, 0)),
 ]
 
 BUFFER = timedelta(minutes=15)  # jobs must finish this long before a window
