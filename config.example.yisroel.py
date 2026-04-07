@@ -1,7 +1,7 @@
-"""Cluster-specific configuration — TEMPLATE.
+"""Cluster-specific configuration — Yisroel's lab.
 
-Copy this to config.py and fill in the fields marked with TODO.
-See config.example.yisroel.py for a filled-in reference.
+Pre-filled with Yisroel's QoS and golden ticket quotas.
+Copy to config.py and fill in MAIL_USER.
 """
 
 import os
@@ -12,8 +12,8 @@ USERNAME = os.environ.get("USER", "")
 # --- Personal (TODO: fill in your email) ---
 MAIL_USER = ""  # e.g. "username@post.bgu.ac.il"
 
-# --- QoS / Partitions (TODO: fill in your QoS) ---
-GOLDEN_QOS = ""  # e.g. "yisroel"
+# --- QoS / Partitions ---
+GOLDEN_QOS = "yisroel"
 CPU_PARTITION = "cpu"
 CPU_QOS = "normal"
 
@@ -27,14 +27,13 @@ START_TIMEOUT = 300  # seconds to wait for job to start
 # --- GPU Definitions ---
 # Each tuple: (name, display_name, vram_gb, golden_quota, golden_partition)
 # golden_quota and golden_partition are QoS-specific reserved allocations
-# TODO: fill in golden_quota and golden_partition for your QoS
 GPU_DEFINITIONS = [
-    ("rtx_pro_6000", "RTX 6000 Pro", 96, 0, None),  # TBA
-    ("rtx_6000",     "RTX 6000",     48, 0, None),  # TBA
-    ("rtx_4090",     "RTX 4090",     24, 0, None),  # TBA
-    ("rtx_3090",     "RTX 3090",     24, 0, None),  # TBA
-    ("rtx_2080",     "RTX 2080",     11, 0, None),  # TBA
-    ("gtx_1080",     "GTX 1080",     8,  0, None),  # TBA
+    ("rtx_pro_6000", "RTX 6000 Pro", 96, 16, "rtx_pro_6000"),
+    ("rtx_6000",     "RTX 6000",     48, 12, "rtx6000"),
+    ("rtx_4090",     "RTX 4090",     24, 0,  None),
+    ("rtx_3090",     "RTX 3090",     24, 0,  None),
+    ("rtx_2080",     "RTX 2080",     11, 0,  None),
+    ("gtx_1080",     "GTX 1080",     8,  0,  None),
 ]
 
 # --- Claude Job Defaults (auto-populated from USERNAME) ---
