@@ -51,8 +51,10 @@ Edit `config.py` (copied from `config.example.py`):
 | Field | What to fill in |
 |-------|----------------|
 | `MAIL_USER` | Your cluster email (for SLURM mail notifications) |
+| `GOLDEN_QOS` | Your QoS name (e.g. `"yisroel"`) |
+| `GPU_DEFINITIONS` | Golden ticket quotas and partitions for your QoS |
 
-`CLAUDE_LOG_DIR` and other paths are auto-populated from your `$USER` environment variable. GPU definitions, QoS, and partitions are pre-filled for the shared cluster.
+`CLAUDE_LOG_DIR` and other paths are auto-populated from your `$USER` environment variable. See `config.example.yisroel.py` for a filled-in reference with Yisroel's lab quotas.
 
 ## Maintenance Windows
 
