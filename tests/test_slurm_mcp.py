@@ -130,9 +130,9 @@ class TestCheckAvailabilityMocked:
         )
         avail = check_availability()
 
-        # itayzloc: 2x1 = 2, pankajak: 1, gressel: 2 = total 5 rtx_pro_6000
-        assert avail.golden["rtx_pro_6000"].used == 5
-        assert avail.golden["rtx_pro_6000"].free == 16 - 5  # = 11
+        # itayzloc: 2 running + 1 pending = 3, pankajak: 1, gressel: 2 = total 6 rtx_pro_6000
+        assert avail.golden["rtx_pro_6000"].used == 6
+        assert avail.golden["rtx_pro_6000"].free == 16 - 6  # = 10
 
         # weissroy: 1 rtx_6000
         assert avail.golden["rtx_6000"].used == 1
@@ -146,7 +146,7 @@ class TestCheckAvailabilityMocked:
         avail = check_availability()
 
         users = avail.golden["rtx_pro_6000"].users
-        assert users["itayzloc"] == 2
+        assert users["itayzloc"] == 3  # 2 running + 1 pending
         assert users["pankajak"] == 1
         assert users["gressel"] == 2
 
@@ -154,14 +154,14 @@ class TestCheckAvailabilityMocked:
         assert users_6000["weissroy"] == 1
 
     @patch("slurm_mcp._run_quiet")
-    def test_pending_jobs_not_counted(self, mock_rq):
-        """PENDING jobs should NOT count toward 'used' GPUs."""
+    def test_pending_jobs_counted(self, mock_rq):
+        """PENDING jobs count toward 'used' to prevent over-submission."""
         mock_rq.side_effect = mock_run_quiet_factory(
             squeue_output=MOCK_SQUEUE_GOLDEN, sinfo_output=MOCK_SINFO
         )
         avail = check_availability()
-        # The last line in mock is PENDING — should not be counted
-        assert avail.golden["rtx_pro_6000"].used == 5  # not 6
+        # The last line in mock is PENDING — should be counted
+        assert avail.golden["rtx_pro_6000"].used == 6
 
     @patch("slurm_mcp._run_quiet")
     def test_cluster_total_gpus(self, mock_rq):
@@ -1120,7 +1120,7 @@ class TestCheckAvailabilityLive:
         for name, g in avail.golden.items():
             assert g.free >= 0, f"Golden {name} free is negative: {g.free}"
             assert g.used >= 0
-            assert g.used + g.free == g.total
+            assert g.free == max(0, g.total - g.used)
 
     def test_cluster_has_all_gpu_types(self):
         avail = check_availability()

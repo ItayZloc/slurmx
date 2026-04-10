@@ -138,8 +138,8 @@ def check_availability() -> Availability:
         tres_node = line[80:140].strip()
         state = line[140:152].strip()
 
-        if state != "RUNNING":
-            continue
+        if state not in ("RUNNING", "PENDING"):
+            continue  # Count pending too — avoids over-submission when queue is full
 
         # Find GPU info from whichever TRES field has it
         gres_field = ""
@@ -171,7 +171,7 @@ def check_availability() -> Availability:
                 gpu_type=gpu.name,
                 total=gpu.golden_quota,
                 used=used,
-                free=gpu.golden_quota - used,
+                free=max(0, gpu.golden_quota - used),
                 users=golden_users.get(gpu.name, {}),
             )
 
