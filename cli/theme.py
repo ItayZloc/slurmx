@@ -106,15 +106,15 @@ def init_theme() -> dict:
 
     hi = getattr(curses, "COLORS", 8) >= 256
     if hi:
-        # Muted xterm-256 shades: soft teal / sage / tan / brick / gray.
-        cyan, green, yellow, red, gray = 73, 108, 179, 167, 245
+        # Muted xterm-256 shades: soft teal / sage / tan / brick / gray / light gray.
+        cyan, green, yellow, red, gray, light = 73, 108, 179, 167, 245, 252
     else:
-        cyan, green, yellow, red, gray = (
+        cyan, green, yellow, red, gray, light = (
             curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW,
-            curses.COLOR_RED, curses.COLOR_WHITE,
+            curses.COLOR_RED, curses.COLOR_WHITE, curses.COLOR_WHITE,
         )
 
-    for idx, fg in ((1, cyan), (2, green), (3, yellow), (4, red), (5, gray)):
+    for idx, fg in ((1, cyan), (2, green), (3, yellow), (4, red), (5, gray), (6, light)):
         try:
             curses.init_pair(idx, fg, -1)
         except curses.error:
@@ -126,7 +126,7 @@ def init_theme() -> dict:
         Role.HEADER: cp(1) | soften,
         Role.CARD_FREE: cp(2) | soften,
         Role.CARD_FULL: cp(4) | soften,
-        Role.LABEL: cp(5) | curses.A_DIM,
+        Role.LABEL: cp(6),   # light gray — readable Running/Pending section labels
         Role.ROW_RUNNING: 0,
         Role.ROW_PENDING: cp(3) | soften,
         Role.SQUEUE_RUNNING: cp(2) | soften,
