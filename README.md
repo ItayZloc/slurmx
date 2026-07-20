@@ -43,9 +43,10 @@ flag (`--golden-only` on the CLI):
   Recommended for training you don't want evicted.
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
-card's pending jobs in dispatch order — one `user: N GPU(s)` row per queued job
-(the same user can appear at several positions) — so you can see who is ahead of
-you.
+card's pending GPUs by user in dispatch order — like the Running block but
+ordered: consecutive jobs from the same user merge into one `user: N GPU(s)` row
+(GPUs summed), and a user split by another user shows at each position — so you
+can see who is ahead of you.
 
 ## Installation
 

@@ -7,8 +7,23 @@ import re
 
 import slurm_mcp
 
-# How many queued jobs to list per full card before collapsing into a "+N more".
+# How many pending rows to list per full card before collapsing into a "+N more".
 QUEUE_DISPLAY_LIMIT = 15
+
+
+def _merge_consecutive_users(rows: list[dict]) -> list[tuple[str, int]]:
+    """Merge consecutive same-user queue rows into (user, total_gpus), keeping
+    dispatch order. GPUs are summed; job count is dropped — we care about GPUs
+    and order, not how many jobs. A user split by another user stays separate, so
+    interleaving is preserved (itay, doron, itay -> three rows)."""
+    merged: list[list] = []
+    for r in rows:
+        user, gpus = r["user"], r.get("gpu_count", 0)
+        if merged and merged[-1][0] == user:
+            merged[-1][1] += gpus
+        else:
+            merged.append([user, gpus])
+    return [(u, g) for u, g in merged]
 
 
 def render_golden_all(avail: slurm_mcp.Availability,
@@ -18,13 +33,15 @@ def render_golden_all(avail: slurm_mcp.Availability,
     """One '=== Golden Tickets ({qos} QoS) ===' section per configured QoS.
 
     Iterates avail.golden_by_qos. If qos_filter is set, only that QoS is shown.
-    Each card lists Running (per user) and a single Pending block: when `queues`
+    Each card lists Running (per user) and a single Pending block. When `queues`
     carries that QoS's ordered waiting queue (from slurm_mcp.golden_queues, fetched
-    when the ticket is full), Pending is the queue in dispatch order, one
-    'user: N GPU(s)' row per queued job — so the same user can appear at several
-    positions. Otherwise it falls back to the per-user pending aggregate.
+    when the ticket is full), Pending mirrors the Running block (per-user GPU
+    totals) but in dispatch order: consecutive jobs from the same user merge into
+    one 'user: N GPU(s)' row (GPUs summed), while a user split by another user
+    stays as separate rows so interleaving is preserved. Otherwise it falls back
+    to the per-user pending aggregate.
 
-    `limit` caps how many queued rows are listed per card (default
+    `limit` caps how many pending rows are listed per card (default
     QUEUE_DISPLAY_LIMIT); pass None to list all of them (the scrollable TUI does
     this since it can page through the full queue).
     """
@@ -45,19 +62,23 @@ def render_golden_all(avail: slurm_mcp.Availability,
                 card.append("    Running:")
                 for user, count in sorted(g.running_users.items(), key=lambda x: -x[1]):
                     card.append(f"      {user}: {count} GPU(s)")
-            # Pending: the ordered waiting queue, one row per queued job in
-            # dispatch order (so a user can appear at several positions, e.g.
-            # itay: 3 / doron: 2 / itay: 1). Falls back to the per-user aggregate
-            # when the ordered queue isn't available (card not full, so
-            # golden_queues didn't fetch it). Never both.
+            # Pending: the waiting queue in dispatch order, presented like the
+            # Running block (per-user GPU totals) but ordered — consecutive jobs
+            # from the same user merge into one 'user: N GPU(s)' row (GPUs
+            # summed; job count is irrelevant). A user split by another user
+            # stays separate, so interleaving is kept (itay: 3 / doron: 2 /
+            # itay: 1). Falls back to the per-user aggregate when the ordered
+            # queue isn't available (card not full). Never both.
             waiting = [r for r in qos_queue if r.get("gpu_type") == name]
             if waiting:
-                card.append(f"    Pending ({len(waiting)} waiting, next first):")
-                shown = waiting if limit is None else waiting[:limit]
-                for r in shown:
-                    card.append(f"      {r['user']}: {r['gpu_count']} GPU(s)")
-                if limit is not None and len(waiting) > limit:
-                    card.append(f"      ... and {len(waiting) - limit} more queued")
+                runs = _merge_consecutive_users(waiting)
+                card.append("    Pending (next first):")
+                shown = runs if limit is None else runs[:limit]
+                for user, gpus in shown:
+                    card.append(f"      {user}: {gpus} GPU(s)")
+                if limit is not None and len(runs) > limit:
+                    more = sum(g for _, g in runs[limit:])
+                    card.append(f"      ... and {more} more GPU(s) queued")
             elif g.pending_users:
                 card.append("    Pending:")
                 for user, count in sorted(g.pending_users.items(), key=lambda x: -x[1]):

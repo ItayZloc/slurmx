@@ -1376,8 +1376,8 @@ class TestRenderGoldenQueue:
         return avail
 
     def test_full_card_lists_pending_in_order(self):
-        # Pending is the ordered queue as compact 'user: N GPU(s)' rows; the
-        # verbose jobid/jobname queue block is gone.
+        # Pending mirrors Running (per-user GPU totals) but ordered; no
+        # jobid/jobname.
         from cli import render
         avail = self._avail_full()
         queues = {"yisroel": [
@@ -1387,14 +1387,29 @@ class TestRenderGoldenQueue:
              "gpu_type": "rtx_6000", "gpu_count": 2, "priority": 100},
         ]}
         out = render.render_golden_all(avail, queues=queues)
-        assert "Pending (2 waiting, next first):" in out
+        assert "Pending (next first):" in out
         assert "alice: 1 GPU(s)" in out and "bob: 2 GPU(s)" in out
         assert out.index("alice") < out.index("bob")   # dispatch order
         assert "train-a" not in out and "1001" not in out  # no jobid/jobname
 
+    def test_consecutive_same_user_gpus_combined(self):
+        # 4 in-line 1-GPU jobs from one user collapse to a single summed row
+        # (GPUs, not job count) — the reported case.
+        from cli import render
+        avail = self._avail_full()
+        queues = {"yisroel": [
+            {"job_id": str(i), "user": "itayzloc", "name": f"EM-{i}",
+             "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100}
+            for i in range(4)
+        ]}
+        out = render.render_golden_all(avail, queues=queues)
+        pending = out.split("Pending")[1]
+        assert pending.count("itayzloc:") == 1        # one merged row, not four
+        assert "itayzloc: 4 GPU(s)" in pending        # GPUs summed
+
     def test_repeated_user_keeps_queue_order(self):
-        # The edge case: same user at multiple positions must survive (an
-        # aggregate would collapse itay's two jobs into one).
+        # Interleaving edge case: the same user split by another user must stay
+        # at both positions (consecutive-only merge).
         from cli import render
         avail = self._avail_full()
         queues = {"yisroel": [
@@ -1406,7 +1421,7 @@ class TestRenderGoldenQueue:
              "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100},
         ]}
         out = render.render_golden_all(avail, queues=queues)
-        assert out.count("itay:") == 2  # not aggregated
+        assert out.count("itay:") == 2  # not merged across doron
         assert (out.index("itay: 3 GPU(s)") < out.index("doron: 2 GPU(s)")
                 < out.index("itay: 1 GPU(s)"))
 
@@ -1440,7 +1455,7 @@ class TestRenderGoldenQueue:
             for i in range(20)
         ]
         out = render.render_golden_all(avail, queues={"yisroel": rows})
-        assert "and 5 more queued" in out  # 20 - QUEUE_DISPLAY_LIMIT(15)
+        assert "and 5 more GPU(s) queued" in out  # 20 rows - LIMIT(15) = 5 GPUs
 
     def test_limit_none_lists_all(self):
         # The scrollable TUI passes limit=None to show every queued row.
@@ -1452,7 +1467,7 @@ class TestRenderGoldenQueue:
             for i in range(20)
         ]
         out = render.render_golden_all(avail, queues={"yisroel": rows}, limit=None)
-        assert "more queued" not in out
+        assert "more GPU(s) queued" not in out
         assert "u19: 1 GPU(s)" in out  # the 20th row is present, not truncated
 
 
