@@ -147,10 +147,11 @@ slurmx <subcommand> --help                 # per-subcommand options
 
 ### Live dashboard
 
-Run in a terminal, `slurmx status` opens a **live, scrollable** dashboard: your jobs
-(compact, one line each — no truncation, so 30 queued jobs stay readable), the golden
-tickets with the full waiting queue, and cluster-wide GPU availability. It auto-refreshes
-(default 5s, `-n/--interval N` to change) without losing your scroll position.
+Run in a terminal, `slurmx status` opens a **live, scrollable** dashboard: your jobs in
+`squeue --me` format (full list, no truncation, so 30 queued jobs stay readable), then the
+golden tickets (with the full waiting queue) and cluster-wide GPU availability shown side
+by side. It auto-refreshes (default 5s, `-n/--interval N` to change) without losing your
+scroll position.
 
 Keys: `↑/↓` or `j/k` scroll, `PgUp/PgDn` page, `g/G` top/bottom, `←/→` or `h/l` pan, `q` quit.
 

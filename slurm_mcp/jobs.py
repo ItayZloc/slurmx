@@ -3,9 +3,25 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from typing import Optional
 
 from . import shell
+
+
+def squeue_me() -> str:
+    """Raw `squeue --me` text (default columns), rstripped.
+
+    Returns an error string (not a raise) on failure so callers can print it
+    verbatim. Shared by the one-shot `slurmx status` and the live TUI.
+    """
+    try:
+        r = subprocess.run(["squeue", "--me"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return f"squeue failed: {r.stderr.strip()}"
+        return r.stdout.rstrip()
+    except Exception as e:  # noqa: BLE001 — surface the message, don't crash
+        return f"squeue error: {e}"
 
 
 def my_jobs(qos: Optional[str] = None) -> list[dict]:

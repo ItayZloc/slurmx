@@ -1435,50 +1435,44 @@ class TestWatchDashboard:
         avail.cluster["rtx_pro_6000"] = GPUAvailability("rtx_pro_6000", 56, 56, 0)
         return avail
 
-    def _jobs(self, n_pending=30, n_running=2):
-        jobs = [
-            {"job_id": str(1000 + i), "name": f"attack-sweep-{i:02d}",
-             "state": "PENDING", "qos": "yisroel",
-             "gpu_gres": "gres/gpu:rtx_pro_6000:1", "runtime": "0:00",
-             "node": "", "partition": "rtx_pro_6000",
-             "reason": "QOSMaxGRESPerAccount"}
-            for i in range(n_pending)
+    def _squeue_text(self, n=30):
+        header = "JOBID PARTITION NAME USER ST TIME NODES NODELIST(REASON)"
+        rows = [
+            f"{1000 + i} rtx6000 attack-{i:02d} itayzloc PD 0:00 1 (MaxGRESPerAccount)"
+            for i in range(n)
         ]
-        jobs += [
-            {"job_id": str(900 + i), "name": f"vaccine-run-{i}",
-             "state": "RUNNING", "qos": "yisroel",
-             "gpu_gres": "gres/gpu:rtx_pro_6000:2", "runtime": "1-04:12",
-             "node": f"node04{i}", "partition": "rtx_pro_6000", "reason": "None"}
-            for i in range(n_running)
-        ]
-        return jobs
+        return "\n".join([header, *rows])
 
-    def test_all_pending_jobs_present_and_compact(self):
+    def test_squeue_lines_pass_through_uncapped(self):
         from cli import watch
-        lines = watch.build_dashboard_lines(self._avail(), self._jobs(), {}, qos=None)
+        lines = watch.build_dashboard_lines(
+            self._avail(), self._squeue_text(30), {}, qos=None)
+        assert lines[0] == "=== squeue --me ==="
         text = "\n".join(lines)
-        for i in range(30):
-            assert str(1000 + i) in text  # none dropped
-        # one line per job (nothing truncated to a "+N more")
-        assert sum(1 for l in lines if l.strip().startswith("PEND")) == 30
-
-    def test_summary_counts_and_gpu_sum(self):
-        from cli import watch
-        lines = watch.build_dashboard_lines(self._avail(), self._jobs(), {}, qos=None)
-        assert "2 running · 30 pending · 4 GPUs" in lines[0]
-
-    def test_pending_reason_shown_running_none_hidden(self):
-        from cli import watch
-        lines = watch.build_dashboard_lines(self._avail(), self._jobs(1, 1), {}, qos=None)
-        pend = [l for l in lines if l.strip().startswith("PEND")][0]
-        run = [l for l in lines if l.strip().startswith("RUN ")][0]
-        assert "QOSMaxGRESPerAccount" in pend
-        assert "None" not in run  # the literal reason "None" is suppressed
+        for i in range(30):  # every job present, nothing dropped
+            assert f"{1000 + i} rtx6000" in text
 
     def test_no_jobs(self):
         from cli import watch
-        lines = watch.build_dashboard_lines(self._avail(), [], {}, qos=None)
-        assert any("No jobs." in l for l in lines)
+        lines = watch.build_dashboard_lines(self._avail(), "", {}, qos=None)
+        assert any("(no jobs)" in l for l in lines)
+
+    def test_golden_and_cluster_side_by_side(self):
+        from cli import watch
+        lines = watch.build_dashboard_lines(
+            self._avail(), self._squeue_text(2), {}, qos=None)
+        # the two section headers share a single row (two columns)
+        assert any("Golden Tickets" in l and "Cluster-Wide" in l for l in lines)
+
+    def test_side_by_side_helper(self):
+        from cli import watch
+        left = ["=== Golden ===", "  card: 0/16", "  q1", "  q2 deep"]
+        right = ["=== Cluster ===", "  card: 0/56"]
+        out = watch._side_by_side(left, right)
+        assert "Golden" in out[0] and "Cluster" in out[0]  # headers align
+        assert out[3] == "  q2 deep"                        # deep row left-only
+        assert watch._side_by_side(left, []) == left        # empty right guard
+        assert watch._side_by_side([], right) == right      # empty left guard
 
     def test_clamp_scroll_bounds(self):
         from cli import watch

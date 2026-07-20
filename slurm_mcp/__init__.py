@@ -24,7 +24,7 @@ from .selection import select_gpu
 from .submission import (
     submit_job, _build_sbatch_script, _wait_for_running,
 )
-from .jobs import my_jobs, cancel_jobs
+from .jobs import my_jobs, cancel_jobs, squeue_me
 from .monitoring import (
     get_job_status, read_job_log, wait_for_job,
     _FINISHED_STATES, _UNRECOVERABLE_REASONS,

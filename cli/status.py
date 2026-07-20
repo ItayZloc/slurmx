@@ -16,7 +16,6 @@ unaffected. `--once` forces the one-shot text even in a terminal.
 import argparse
 import curses
 import os
-import subprocess
 import sys
 import time
 
@@ -28,13 +27,7 @@ from cli import render
 
 def render_squeue_me() -> str:
     """Raw `squeue --me` text — unmodified, for users familiar with the CLI."""
-    try:
-        r = subprocess.run(["squeue", "--me"], capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            return f"squeue failed: {r.stderr.strip()}"
-        return r.stdout.rstrip()
-    except Exception as e:
-        return f"squeue error: {e}"
+    return slurm_mcp.squeue_me()
 
 
 def render_dashboard(qos: str | None = None) -> str:

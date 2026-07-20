@@ -19,7 +19,6 @@ Design notes:
 from __future__ import annotations
 
 import curses
-import re
 import threading
 import time
 from dataclasses import dataclass
@@ -30,71 +29,47 @@ from cli import render
 REFRESH_INTERVAL = 5.0          # seconds between snapshots (default)
 _INPUT_POLL_MS = 100            # how often getch wakes to redraw the clock
 _H_STEP = 8                     # columns per horizontal pan keypress
+_COL_GAP = 4                    # spaces between the golden and cluster columns
 _SPINNER = "|/-\\"
-_STATE_TAG = {"RUNNING": "RUN", "PENDING": "PEND"}
 
 
 # --------------------------------------------------------------------------- #
 # Pure helpers (unit-tested)
 # --------------------------------------------------------------------------- #
 
-def _trunc(s: str, n: int) -> str:
-    """Truncate to n chars with an ellipsis so table columns stay aligned."""
-    return s if len(s) <= n else s[: n - 1] + "…"
+def _side_by_side(left: list[str], right: list[str], gap: int = _COL_GAP) -> list[str]:
+    """Merge two blocks into two top-aligned columns.
 
-
-def _jobs_lines(jobs: list[dict]) -> list[str]:
-    """Compact 'Your Jobs' block: a summary header + one line per job.
-
-    Running jobs show gres/runtime/node; non-running jobs show the scheduler
-    reason (why they're still pending). The list is never truncated — that's
-    what the scrollable pad is for.
+    The left column is padded to the widest of the rows that sit beside the
+    (shorter) right block, so headers and card summaries line up. Rows past the
+    right block's height print left-only, so the deep, uncapped waiting queue
+    never collides with the right column. If either block is empty, the other is
+    returned unchanged.
     """
-    running = [j for j in jobs if j.get("state") == "RUNNING"]
-    pending = [j for j in jobs if j.get("state") == "PENDING"]
-    other = [j for j in jobs if j.get("state") not in ("RUNNING", "PENDING")]
-
-    gpu_count = 0
-    for j in running:
-        m = re.search(r":(\d+)", j.get("gpu_gres", ""))
-        if m:
-            gpu_count += int(m.group(1))
-
-    lines = [
-        f"=== Your Jobs ({len(running)} running · {len(pending)} pending · "
-        f"{gpu_count} GPUs) ==="
-    ]
-    if not jobs:
-        lines.append("  No jobs.")
-        return lines
-
-    for j in running:
-        lines.append(
-            f"  RUN  {j['job_id']:<9} {_trunc(j['name'], 32):<32} "
-            f"{j.get('gpu_gres', ''):<20} {j.get('runtime', ''):<10} "
-            f"{j.get('node', '')}"
-        )
-    for j in pending + other:
-        tag = _STATE_TAG.get(j.get("state", ""), (j.get("state", "") or "?")[:4])
-        reason = j.get("reason") or ""
-        reason = "" if reason in ("None", "N/A") else reason
-        lines.append(
-            f"  {tag:<4} {j['job_id']:<9} {_trunc(j['name'], 32):<32} {reason}"
-        )
-    return lines
+    if not left:
+        return list(right)
+    if not right:
+        return list(left)
+    overlap = min(len(left), len(right))
+    left_w = max(len(left[i]) for i in range(overlap))
+    out = []
+    for i in range(max(len(left), len(right))):
+        l = left[i] if i < len(left) else ""
+        r = right[i] if i < len(right) else ""
+        out.append(l.ljust(left_w) + " " * gap + r if r else l)
+    return out
 
 
-def build_dashboard_lines(avail, jobs, queues, qos: str | None = None) -> list[str]:
-    """Full compact line buffer for the TUI: jobs + golden (uncapped queue) +
-    cluster-wide. Pure — reuses the existing `render_*` formatters."""
-    lines: list[str] = []
-    lines.extend(_jobs_lines(jobs or []))
+def build_dashboard_lines(avail, squeue_text: str, queues, qos: str | None = None) -> list[str]:
+    """Full line buffer for the TUI: raw `squeue --me` (full width) then Golden
+    Tickets and Cluster-Wide side by side. Pure — reuses the `render_*`
+    formatters and passes limit=None so the whole waiting queue is listed."""
+    lines: list[str] = ["=== squeue --me ==="]
+    lines.extend((squeue_text or "(no jobs)").splitlines())
     lines.append("")
     golden = render.render_golden_all(avail, qos_filter=qos, queues=queues, limit=None)
-    if golden:
-        lines.extend(golden.splitlines())
-        lines.append("")
-    lines.extend(render.render_cluster_wide(avail).splitlines())
+    cluster = render.render_cluster_wide(avail)
+    lines.extend(_side_by_side(golden.splitlines(), cluster.splitlines()))
     return lines
 
 
@@ -115,7 +90,7 @@ def clamp_scroll(offset: int, total: int, viewport: int) -> int:
 @dataclass
 class _Snapshot:
     avail: object | None
-    jobs: list | None
+    squeue_text: str | None
     queues: dict | None
     stamp: str
     error: str | None = None
@@ -140,8 +115,8 @@ def _worker(state: _TuiState, qos: str | None, interval: float) -> None:
         try:
             avail = slurm_mcp.check_availability()
             queues = slurm_mcp.golden_queues(avail, qos_filter=qos)
-            jobs = slurm_mcp.my_jobs(qos=qos)
-            snap = _Snapshot(avail, jobs, queues, _now())
+            squeue_text = slurm_mcp.squeue_me()
+            snap = _Snapshot(avail, squeue_text, queues, _now())
         except Exception as e:  # noqa: BLE001 — surface, don't crash the thread
             snap = _Snapshot(None, None, None, _now(), error=f"refresh failed: {e}")
         with state.lock:
@@ -209,7 +184,7 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
             if snap.error:
                 lines = [snap.error, "", "(retrying…)"]
             else:
-                lines = build_dashboard_lines(snap.avail, snap.jobs, snap.queues, qos)
+                lines = build_dashboard_lines(snap.avail, snap.squeue_text, snap.queues, qos)
             dirty = True
         if (maxy, maxx) != last_size:
             last_size = (maxy, maxx)
