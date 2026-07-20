@@ -1,12 +1,17 @@
-"""Color layer for the live `slurmx status` TUI (cyan/teal accent).
+"""Color layer for the live `slurmx status` TUI (muted cyan/teal accent).
 
-Pure + curses helpers, kept out of cli/render.py so the one-shot text path and
-the MCP `cluster_summary` tool stay byte-stable plain strings. `classify_dashboard_lines`
-is a pure, unit-tested classifier over the already-built line list; `init_theme`
-builds the curses attribute map (guarded so a color-less terminal degrades to plain).
+Pure classifiers + curses helpers, kept out of cli/render.py so the one-shot text
+path and the MCP `cluster_summary` tool stay byte-stable plain strings.
 
-Palette: cyan accent on headers + status bars, green = free/running,
-yellow = pending, red = full, dim gray = secondary labels.
+Classification is per single-column block (`classify_block` for a golden/cluster
+column, `squeue_role` per squeue line) so a side-by-side row's golden-left and
+cluster-right segments are colored independently — the roles are carried through
+the merge as spans (see cli/watch.py `dashboard_row_spans`), not applied to the
+whole flat line.
+
+Palette: soft cyan accent on headers + status bars, muted green = free/running,
+muted gold = pending, muted red = full, dim gray = secondary labels. Kept
+low-saturation on purpose so it reads as a calm dashboard, not a warning panel.
 """
 
 from __future__ import annotations
@@ -33,38 +38,31 @@ _CARD_RE = re.compile(r"  \S+:\s+(\d+)/\d+\s+free")
 _GPUROW_RE = re.compile(r"      \S+:\s+\d+\s+GPU\(s\)")
 
 
-def classify_dashboard_lines(lines: list[str]) -> list[Role]:
-    """Map each dashboard line to a Role via a stateful prefix walk.
+def squeue_role(line: str) -> Role:
+    """Role for one raw `squeue --me` line, by its ST column token."""
+    toks = line.split()
+    if "R" in toks:
+        return Role.SQUEUE_RUNNING
+    if "PD" in toks:
+        return Role.SQUEUE_PENDING
+    return Role.PLAIN
 
-    Tracks whether we're inside the raw `squeue --me` block (state coloring by the
-    ST column) vs the golden/cluster block (card free/full + Running/Pending
-    section). Side-by-side rows that merge a golden-left and cluster-right segment
-    are colored by the left/dominant role — good enough; the pure cluster rows sit
-    below the golden overlap and classify on their own.
+
+def classify_block(lines: list[str]) -> list[Role]:
+    """Classify one single-column golden/cluster block (no side-by-side merge).
+
+    Headers (`=== … ===`), card summaries (free/full from `X/Y free`),
+    Running/Pending sub-labels, and per-user GPU rows (Running vs Pending by the
+    current section). Each column is homogeneous, so there is no left/right
+    ambiguity — the merge happens later, per segment.
     """
     roles: list[Role] = []
-    in_squeue = False
     section: str | None = None  # "running" | "pending" | None
-
     for line in lines:
-        if "=== squeue" in line:
-            in_squeue, section = True, None
-            roles.append(Role.HEADER)
-            continue
         if "===" in line:
-            in_squeue, section = False, None
+            section = None
             roles.append(Role.HEADER)
             continue
-        if in_squeue:
-            toks = line.split()
-            if "R" in toks:
-                roles.append(Role.SQUEUE_RUNNING)
-            elif "PD" in toks:
-                roles.append(Role.SQUEUE_PENDING)
-            else:
-                roles.append(Role.PLAIN)
-            continue
-
         m = _CARD_RE.match(line)
         if m:
             roles.append(Role.CARD_FULL if int(m.group(1)) == 0 else Role.CARD_FREE)
@@ -81,12 +79,11 @@ def classify_dashboard_lines(lines: list[str]) -> list[Role]:
             roles.append(Role.ROW_PENDING if section == "pending" else Role.ROW_RUNNING)
             continue
         roles.append(Role.PLAIN)
-
     return roles
 
 
-# Width-preserving status glyphs: swapped in for a card line's 2-space indent at
-# draw time (TUI only), so `_side_by_side` column widths stay aligned.
+# Width-preserving status glyphs: swapped in for a card segment's 2-space indent
+# at draw time (TUI only), so column widths stay aligned.
 GLYPH_FREE = "○ "
 GLYPH_FULL = "● "
 
@@ -94,7 +91,11 @@ GLYPH_FULL = "● "
 def init_theme() -> dict:
     """Build the {Role: curses attr} map. Returns {} if the terminal has no color
     (drawing then falls back to plain / A_REVERSE bars). Import curses lazily so
-    this module stays importable for the pure classifier tests off a TTY."""
+    this module stays importable for the pure classifier tests off a TTY.
+
+    256-color terminals get a muted, low-saturation palette; 8-color terminals
+    fall back to the basic colors softened with A_DIM where it helps.
+    """
     import curses
 
     try:
@@ -104,11 +105,14 @@ def init_theme() -> dict:
         return {}
 
     hi = getattr(curses, "COLORS", 8) >= 256
-    cyan = 44 if hi else curses.COLOR_CYAN
-    green = 42 if hi else curses.COLOR_GREEN
-    yellow = 220 if hi else curses.COLOR_YELLOW
-    red = 203 if hi else curses.COLOR_RED
-    gray = 244 if hi else curses.COLOR_WHITE
+    if hi:
+        # Muted xterm-256 shades: soft teal / sage / tan / brick / gray.
+        cyan, green, yellow, red, gray = 73, 108, 179, 167, 245
+    else:
+        cyan, green, yellow, red, gray = (
+            curses.COLOR_CYAN, curses.COLOR_GREEN, curses.COLOR_YELLOW,
+            curses.COLOR_RED, curses.COLOR_WHITE,
+        )
 
     for idx, fg in ((1, cyan), (2, green), (3, yellow), (4, red), (5, gray)):
         try:
@@ -117,17 +121,17 @@ def init_theme() -> dict:
             return {}
 
     cp = curses.color_pair
-    label_attr = cp(5) if hi else (cp(5) | curses.A_DIM)
+    soften = 0 if hi else curses.A_DIM  # 8-color needs A_DIM to calm down
     return {
-        Role.HEADER: cp(1) | curses.A_BOLD,
-        Role.CARD_FREE: cp(2),
-        Role.CARD_FULL: cp(4) | curses.A_BOLD,
-        Role.LABEL: label_attr,
+        Role.HEADER: cp(1) | soften,
+        Role.CARD_FREE: cp(2) | soften,
+        Role.CARD_FULL: cp(4) | soften,
+        Role.LABEL: cp(5) | curses.A_DIM,
         Role.ROW_RUNNING: 0,
-        Role.ROW_PENDING: cp(3),
-        Role.SQUEUE_RUNNING: cp(2),
-        Role.SQUEUE_PENDING: cp(3),
+        Role.ROW_PENDING: cp(3) | soften,
+        Role.SQUEUE_RUNNING: cp(2) | soften,
+        Role.SQUEUE_PENDING: cp(3) | soften,
         Role.PLAIN: 0,
-        Role.BAR: cp(1) | curses.A_REVERSE | curses.A_BOLD,
-        Role.RULE: cp(1),
+        Role.BAR: cp(1) | curses.A_REVERSE,
+        Role.RULE: cp(5),
     }

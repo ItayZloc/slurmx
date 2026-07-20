@@ -38,40 +38,66 @@ _SPINNER = "|/-\\"
 # Pure helpers (unit-tested)
 # --------------------------------------------------------------------------- #
 
-def _side_by_side(left: list[str], right: list[str], gap: int = _COL_GAP) -> list[str]:
-    """Merge two blocks into two top-aligned columns.
+def _side_by_side_spans(left: list[str], left_roles: list, right: list[str],
+                        right_roles: list, gap: int = _COL_GAP) -> list[list[tuple]]:
+    """Merge two blocks into rows of (text, Role) spans, top-aligned columns.
 
     The left column is padded to the widest of the rows that sit beside the
     (shorter) right block, so headers and card summaries line up. Rows past the
-    right block's height print left-only, so the deep, uncapped waiting queue
-    never collides with the right column. If either block is empty, the other is
-    returned unchanged.
+    right block's height are a single left-only span, so the deep, uncapped
+    waiting queue never collides with the right column. Each column keeps its OWN
+    role, so the golden-left and cluster-right segments of one physical line color
+    independently. If either block is empty, the other is returned as one span per
+    row (its text reproduces the plain line exactly).
     """
+    from cli.theme import Role
     if not left:
-        return list(right)
+        return [[(r, rr)] for r, rr in zip(right, right_roles)]
     if not right:
-        return list(left)
+        return [[(l, lr)] for l, lr in zip(left, left_roles)]
     overlap = min(len(left), len(right))
     left_w = max(len(left[i]) for i in range(overlap))
-    out = []
+    rows: list[list[tuple]] = []
     for i in range(max(len(left), len(right))):
         l = left[i] if i < len(left) else ""
-        r = right[i] if i < len(right) else ""
-        out.append(l.ljust(left_w) + " " * gap + r if r else l)
-    return out
+        lr = left_roles[i] if i < len(left_roles) else Role.PLAIN
+        if i < len(right) and right[i]:
+            rr = right_roles[i] if i < len(right_roles) else Role.PLAIN
+            rows.append([(l.ljust(left_w) + " " * gap, lr), (right[i], rr)])
+        else:
+            rows.append([(l, lr)])
+    return rows
+
+
+def _side_by_side(left: list[str], right: list[str], gap: int = _COL_GAP) -> list[str]:
+    """Plain-string merge (byte-stable): flatten of `_side_by_side_spans`."""
+    from cli.theme import Role
+    lr = [Role.PLAIN] * len(left)
+    rr = [Role.PLAIN] * len(right)
+    return ["".join(t for t, _ in row) for row in _side_by_side_spans(left, lr, right, rr, gap)]
+
+
+def dashboard_row_spans(avail, squeue_text: str, queues, qos: str | None = None) -> list[list[tuple]]:
+    """Full TUI buffer as rows of (text, Role) spans: raw `squeue --me` (full
+    width) then Golden Tickets and Cluster-Wide side by side, each column classified
+    on its own so the two segments of a merged row color independently. Flattening
+    a row's span texts reproduces the plain `build_dashboard_lines` line."""
+    rows: list[list[tuple]] = [[("=== squeue --me ===", theme_mod.Role.HEADER)]]
+    for line in (squeue_text or "(no jobs)").splitlines():
+        rows.append([(line, theme_mod.squeue_role(line))])
+    rows.append([("", theme_mod.Role.PLAIN)])
+    golden = render.render_golden_all(avail, qos_filter=qos, queues=queues, limit=None).splitlines()
+    cluster = render.render_cluster_wide(avail).splitlines()
+    groles = theme_mod.classify_block(golden)
+    croles = theme_mod.classify_block(cluster)
+    rows.extend(_side_by_side_spans(golden, groles, cluster, croles))
+    return rows
 
 
 def build_dashboard_lines(avail, squeue_text: str, queues, qos: str | None = None) -> list[str]:
-    """Full line buffer for the TUI: raw `squeue --me` (full width) then Golden
-    Tickets and Cluster-Wide side by side. Pure — reuses the `render_*`
-    formatters and passes limit=None so the whole waiting queue is listed."""
-    lines: list[str] = ["=== squeue --me ==="]
-    lines.extend((squeue_text or "(no jobs)").splitlines())
-    lines.append("")
-    golden = render.render_golden_all(avail, qos_filter=qos, queues=queues, limit=None)
-    cluster = render.render_cluster_wide(avail)
-    lines.extend(_side_by_side(golden.splitlines(), cluster.splitlines()))
-    return lines
+    """Plain-string TUI buffer (byte-stable, unit-tested): flatten of
+    `dashboard_row_spans`."""
+    return ["".join(t for t, _ in row) for row in dashboard_row_spans(avail, squeue_text, queues, qos)]
 
 
 def clamp_scroll(offset: int, total: int, viewport: int) -> int:
@@ -164,7 +190,7 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
     theme = theme_mod.init_theme()
 
     lines = ["loading…"]
-    roles: list = []
+    rows: list = [[("loading…", theme_mod.Role.PLAIN)]]
     stamp = "--:--:--"
     rendered_version = -1
     pad = None
@@ -198,31 +224,37 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
             rendered_version = version
             stamp = snap.stamp
             if snap.error:
-                lines = [snap.error, "", "(retrying…)"]
+                rows = [[(snap.error, theme_mod.Role.PLAIN)], [("", theme_mod.Role.PLAIN)],
+                        [("(retrying…)", theme_mod.Role.PLAIN)]]
             else:
-                lines = build_dashboard_lines(snap.avail, snap.squeue_text, snap.queues, qos)
+                rows = dashboard_row_spans(snap.avail, snap.squeue_text, snap.queues, qos)
+            lines = ["".join(t for t, _ in r) for r in rows]
             dirty = True
         if (maxy, maxx) != last_size:
             last_size = (maxy, maxx)
             dirty = True
 
         if dirty:
-            roles = theme_mod.classify_dashboard_lines(lines) if theme else []
             pad_w = max(maxx, max((len(s) for s in lines), default=0) + 1)
             pad = curses.newpad(max(len(lines) + 1, body_h), pad_w)
             pad.erase()
-            for i, s in enumerate(lines):
-                role = roles[i] if i < len(roles) else None
-                attr = theme.get(role, 0)
-                # Width-preserving status glyph: swap a card line's 2-space indent
-                # for ●/○ (2 cells) so side-by-side columns stay aligned.
-                if role in (theme_mod.Role.CARD_FREE, theme_mod.Role.CARD_FULL) and s.startswith("  "):
-                    glyph = theme_mod.GLYPH_FULL if role == theme_mod.Role.CARD_FULL else theme_mod.GLYPH_FREE
-                    s = glyph + s[2:]
-                try:
-                    pad.addstr(i, 0, s, attr)
-                except curses.error:
-                    pass
+            for i, spans in enumerate(rows):
+                x = 0
+                for text, role in spans:
+                    attr = theme.get(role, 0)
+                    s = text
+                    # Width-preserving status glyph: swap a card segment's 2-space
+                    # indent for ●/○ (2 cells) so the columns stay aligned. Only
+                    # under color (plain fallback stays glyph-free).
+                    if theme and role in (theme_mod.Role.CARD_FREE, theme_mod.Role.CARD_FULL) \
+                            and s.startswith("  "):
+                        glyph = theme_mod.GLYPH_FULL if role == theme_mod.Role.CARD_FULL else theme_mod.GLYPH_FREE
+                        s = glyph + s[2:]
+                    try:
+                        pad.addstr(i, x, s, attr)
+                    except curses.error:
+                        pass
+                    x += len(s)
 
         row = clamp_scroll(row, len(lines), body_h)
         col = clamp_scroll(col, pad_w, maxx)

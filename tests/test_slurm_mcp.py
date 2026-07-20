@@ -1725,44 +1725,74 @@ class TestNewCLISubcommands:
 # ============================================================
 
 class TestTheme:
-    _LINES = [
-        "=== squeue --me ===",
-        "  JOBID PARTITION NAME USER ST TIME NODES NODELIST(REASON)",
-        "  111 rtx6000 train me R 1:00 1 node1",
-        "  222 rtx6000 eval me PD 0:00 1 (Priority)",
-        "",
-        "=== Golden Tickets (yisroel QoS) ===    === Cluster-Wide ===",
-        "  rtx_pro_6000: 0/16 free (16 running)    rtx_pro_6000: 0/16 free",
-        "    Running:",
-        "      alice: 10 GPU(s)",
-        "    Pending (next first):",
-        "      itay: 3 GPU(s)",
-        "  rtx_6000: 5/12 free",
-    ]
+    def test_classify_block_golden(self):
+        from cli.theme import classify_block, Role
+        golden = [
+            "=== Golden Tickets (yisroel QoS) ===",
+            "  rtx_pro_6000: 0/16 free (16 running)",
+            "    Running:",
+            "      alice: 10 GPU(s)",
+            "    Pending (next first):",
+            "      itay: 3 GPU(s)",
+        ]
+        assert classify_block(golden) == [
+            Role.HEADER, Role.CARD_FULL, Role.LABEL, Role.ROW_RUNNING,
+            Role.LABEL, Role.ROW_PENDING,
+        ]
 
-    def test_classify_roles(self):
-        from cli.theme import classify_dashboard_lines, Role
-        roles = classify_dashboard_lines(self._LINES)
-        assert len(roles) == len(self._LINES)
-        assert roles[0] == Role.HEADER
-        assert roles[2] == Role.SQUEUE_RUNNING
-        assert roles[3] == Role.SQUEUE_PENDING
-        assert roles[5] == Role.HEADER
-        assert roles[6] == Role.CARD_FULL       # 0/16 free -> full/red
-        assert roles[7] == Role.LABEL
-        assert roles[8] == Role.ROW_RUNNING
-        assert roles[9] == Role.LABEL
-        assert roles[10] == Role.ROW_PENDING    # section carried from the Pending label
-        assert roles[11] == Role.CARD_FREE      # 5/12 free -> free/green
+    def test_classify_block_cluster(self):
+        from cli.theme import classify_block, Role
+        assert classify_block(["=== Cluster-Wide ===", "  rtx_6000: 5/12 free"]) == [
+            Role.HEADER, Role.CARD_FREE,
+        ]
 
-    def test_classify_plain_fallback(self):
-        from cli.theme import classify_dashboard_lines, Role
-        assert classify_dashboard_lines(["loading…"]) == [Role.PLAIN]
+    def test_squeue_role(self):
+        from cli.theme import squeue_role, Role
+        assert squeue_role("  111 rtx6000 train me R 1:00 1 node1") == Role.SQUEUE_RUNNING
+        assert squeue_role("  222 rtx6000 eval me PD 0:00 1 (Priority)") == Role.SQUEUE_PENDING
+        assert squeue_role("     JOBID PARTITION NAME USER ST TIME") == Role.PLAIN
 
     def test_init_theme_no_color_returns_empty(self):
         from cli import theme as th
         with patch("curses.has_colors", return_value=False):
             assert th.init_theme() == {}
+
+
+class TestDashboardSegments:
+    """Side-by-side rows keep the golden-left and cluster-right segments as separate
+    spans with independent roles — the fix for 'the whole merged row got one color'."""
+
+    def test_merged_row_has_two_independent_roles(self):
+        from cli.watch import _side_by_side_spans
+        from cli.theme import Role
+        # golden "Running:" (LABEL) sits beside a cluster card (CARD_FREE) on the
+        # same physical line — each segment keeps its own role.
+        rows = _side_by_side_spans(
+            ["    Running:"], [Role.LABEL],
+            ["  rtx_6000: 5/12 free"], [Role.CARD_FREE],
+        )
+        assert [role for _, role in rows[0]] == [Role.LABEL, Role.CARD_FREE]
+
+    def test_left_only_overflow_is_single_span(self):
+        from cli.watch import _side_by_side_spans
+        from cli.theme import Role
+        rows = _side_by_side_spans(
+            ["  a: 0/8 free", "      deep: 1 GPU(s)"], [Role.CARD_FULL, Role.ROW_RUNNING],
+            ["  a: 0/8 free"], [Role.CARD_FULL],
+        )
+        # row 1 has no right segment -> one span, its own role (not the right's)
+        assert len(rows[1]) == 1
+        assert rows[1][0][1] == Role.ROW_RUNNING
+
+    def test_spans_flatten_matches_plain_lines(self):
+        # Flattening span texts must reproduce the byte-stable plain merge.
+        from cli.watch import _side_by_side_spans, _side_by_side
+        from cli.theme import Role
+        left = ["=== Golden ===", "  a: 0/8 free", "    Running:"]
+        right = ["=== Cluster-Wide ===", "  a: 0/8 free"]
+        spans = _side_by_side_spans(left, [Role.PLAIN] * 3, right, [Role.PLAIN] * 2)
+        flat = ["".join(t for t, _ in r) for r in spans]
+        assert flat == _side_by_side(left, right)
 
 
 # ============================================================
