@@ -7,8 +7,6 @@ Run: uv run --with "mcp[cli]" python ~/.claude/mcp-servers/slurmx/server.py
 from __future__ import annotations
 
 import json
-import re
-import subprocess
 import sys
 import os
 from typing import Literal
@@ -33,6 +31,10 @@ Check with MCP cluster_summary or squeue, not ps aux.
 - Default to 1 GPU. Use num_gpus=2 only when the user explicitly requests multi-GPU
   or the workload requires it (e.g. model too large for a single card).
   Max 2 GPUs per cluster policy — requesting more raises an error.
+- Golden-only is the DEFAULT (golden_only=true): jobs run preemption-immune on the
+  golden partition and queue there if it's full, never dropping to the preemptible
+  main pool. Pass golden_only=false only when the user explicitly wants to burst onto
+  the shared main pool. Ignored for CPU jobs.
 - For multi-GPU training, use `torchrun --nproc_per_node=2 train.py` as the command.
 - Maintenance windows are enforced automatically — job time limits are capped to finish
   before scheduled maintenance. If a window is imminent (<5 min), submissions are blocked.
@@ -152,15 +154,6 @@ def read_job_log(job_id: int, output_dir: str = "logs", tail: int = 100) -> str:
     return content
 
 
-_OOM_MARKERS = [
-    "CUDA out of memory",
-    "OutOfMemoryError",
-    "torch.cuda.OutOfMemoryError",
-    "CUDA error: out of memory",
-]
-_VRAM_ESCALATION = {48: 96, 24: 48, 11: 24, 8: 11}
-
-
 @mcp.tool()
 def diagnose_job(job_id: int, output_dir: str = "logs", log_lines: int = 50) -> str:
     """Diagnose a SLURM job failure: gets status, reads log, classifies the error.
@@ -172,93 +165,7 @@ def diagnose_job(job_id: int, output_dir: str = "logs", log_lines: int = 50) -> 
         output_dir: Directory to search for log files (default: 'logs').
         log_lines: Number of tail lines to include (default: 50).
     """
-    status = slurm_mcp.get_job_status(job_id)
-
-    if status.state in ("RUNNING", "PENDING"):
-        reason = f" (reason: {status.reason})" if status.reason else ""
-        return f"Job {job_id} is {status.state}{reason}. No diagnosis needed."
-    if status.state == "COMPLETED" and status.exit_code == 0:
-        return f"Job {job_id} completed successfully (elapsed: {status.elapsed})."
-
-    # Fetch GPU type from sacct AllocTRES
-    gpu_used = ""
-    try:
-        raw = subprocess.run(
-            ["sacct", "-j", str(job_id), "--format=JobID,AllocTRES%60", "-n", "-P", "--noconvert"],
-            capture_output=True, text=True, timeout=10,
-        )
-        for line in raw.stdout.splitlines():
-            parts = line.split("|")
-            if len(parts) >= 2 and parts[0] == str(job_id):
-                m = re.search(r"gres/gpu:([^:,]+):(\d+)", parts[1])
-                if m:
-                    gpu_used = f"{m.group(1)}:{m.group(2)}"
-                break
-    except Exception:
-        pass
-
-    # Read log
-    log = slurm_mcp.read_job_log(job_id, output_dir=output_dir, tail=log_lines)
-
-    # Classify failure
-    log_text = log or ""
-    classification = "UNKNOWN"
-    suggestion = "Check the log output below."
-
-    if status.state == "OUT_OF_MEMORY" or any(m in log_text for m in _OOM_MARKERS):
-        classification = "OOM"
-        gpu_name = gpu_used.split(":")[0] if gpu_used else ""
-        gpu_info = slurm_mcp.GPU_BY_NAME.get(gpu_name)
-        if gpu_info and gpu_info.vram_gb in _VRAM_ESCALATION:
-            next_vram = _VRAM_ESCALATION[gpu_info.vram_gb]
-            suggestion = f"Retry with more VRAM: {gpu_info.vram_gb}GB -> {next_vram}GB."
-        else:
-            suggestion = "Already on largest GPU. Reduce batch size or enable gradient accumulation."
-    elif status.state == "TIMEOUT" or "DUE TO TIME LIMIT" in log_text:
-        classification = "TIMEOUT"
-        suggestion = "Job hit time limit. Add checkpointing or request more time."
-    elif "DependencyNeverSatisfied" in log_text or status.reason == "DependencyNeverSatisfied":
-        classification = "DEPENDENCY_FAILED"
-        suggestion = "A dependency job failed or was cancelled. Check upstream jobs."
-    elif "ModuleNotFoundError" in log_text or "ImportError" in log_text:
-        classification = "MISSING_MODULE"
-        mod_match = re.search(r"(?:ModuleNotFoundError|ImportError).*?'([^']+)'", log_text)
-        mod_name = mod_match.group(1) if mod_match else "unknown"
-        suggestion = f"Missing module: {mod_name}. Install it in the job environment."
-    elif "Killed" in log_text:
-        classification = "KILLED"
-        suggestion = "Job was killed (possibly system OOM or admin). Check memory usage."
-    elif "Traceback (most recent call last)" in log_text:
-        classification = "CODE_ERROR"
-        # Extract last error line
-        tb_lines = log_text.splitlines()
-        for line in reversed(tb_lines):
-            stripped = line.strip()
-            if stripped and not stripped.startswith("File ") and not stripped.startswith("Traceback"):
-                suggestion = f"Python error: {stripped}"
-                break
-
-    parts = [
-        f"=== Job Diagnosis: {job_id} ===",
-        f"State: {status.state} (exit code: {status.exit_code})",
-        f"Classification: {classification}",
-    ]
-    if gpu_used:
-        parts.append(f"GPU: {gpu_used}")
-    if status.elapsed:
-        parts.append(f"Elapsed: {status.elapsed}")
-    parts.append("")
-    parts.append(f"Suggested action: {suggestion}")
-
-    if log:
-        parts.append("")
-        parts.append(f"--- Log tail (last {log_lines} lines) ---")
-        parts.append(log)
-    elif log is None:
-        parts.append("")
-        parts.append(f"No log file found in {output_dir}/.")
-
-    return "\n".join(parts)
+    return slurm_mcp.diagnose_job(job_id, output_dir=output_dir, log_lines=log_lines)
 
 
 @mcp.tool()
@@ -270,7 +177,7 @@ def submit_job(
     workdir: str | None = None,
     output_dir: str = "logs",
     gpu_type: str | None = None,
-    golden_only: bool = False,
+    golden_only: bool = True,
     dependency: str | None = None,
     dry_run: bool = False,
 ) -> str:
@@ -282,12 +189,12 @@ def submit_job(
     Uses --gres=gpu:TYPE:N and --nodes=1 to ensure GPUs are on the same node.
     For multi-GPU training, use torchrun: 'torchrun --nproc_per_node=2 train.py'.
 
-    Golden vs main pool: by default a job is placed golden-first (qos=yisroel on
-    the card's dedicated partition, preemption-immune) then falls back to the
-    preemptible main pool if the golden ticket is full. Set golden_only=true to
-    force the golden ticket and NEVER accept a preemptible slot — the job queues
-    on the golden partition until a slot frees. Recommended for training you don't
-    want evicted.
+    Golden vs main pool: by default a job is golden-only (qos=yisroel on the
+    card's dedicated partition, preemption-immune) — it queues on the golden
+    partition until a slot frees and NEVER accepts a preemptible main-pool slot.
+    Pass golden_only=false to allow the fallback: golden-first, then the
+    preemptible main pool when the golden ticket is full. golden_only is ignored
+    for CPU jobs.
 
     Maintenance: Job time limits are automatically capped to finish before scheduled
     maintenance windows. Submissions are blocked if <5 min remain before a window.
@@ -300,10 +207,10 @@ def submit_job(
         workdir: Working directory on compute node.
         output_dir: Directory for SLURM logs (default: 'logs').
         gpu_type: Force a specific GPU type (e.g. 'rtx_pro_6000').
-        golden_only: If true, force qos=yisroel on the card's dedicated golden
-            partition (preemption-immune) and never fall back to the preemptible
-            main pool — the job stays queued if golden is full. Ignored for CPU
-            jobs. Default false (golden-first, then main).
+        golden_only: Force qos=yisroel on the card's dedicated golden partition
+            (preemption-immune) and never fall back to the preemptible main pool —
+            the job stays queued if golden is full. Ignored for CPU jobs. Default
+            true; pass false to allow the golden-first-then-main fallback.
         dependency: Job dependency (e.g. 'afterok:12345').
         dry_run: If true, preview the script without submitting.
     """
@@ -375,64 +282,7 @@ def job_history(days: int = 3, state: str | None = None, limit: int = 30) -> str
         state: Filter by state: COMPLETED, FAILED, TIMEOUT, OOM, CANCELLED, or None for all.
         limit: Max jobs to return (default: 30).
     """
-    user = os.environ.get("USER", "")
-    cmd = [
-        "sacct",
-        "--starttime", f"now-{days}days",
-        "--format=JobID,JobName%30,State%20,ExitCode,Elapsed,AllocTRES%50,NodeList%20,Start",
-        "-n", "-P", "--noconvert",
-        "--user", user,
-    ]
-    if state:
-        state_map = {"OOM": "OUT_OF_MEMORY"}
-        cmd.extend(["--state", state_map.get(state.upper(), state.upper())])
-
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode != 0:
-            return f"sacct query failed: {result.stderr.strip()}"
-        raw = result.stdout
-    except Exception as e:
-        return f"sacct query failed: {e}"
-
-    # Parse — only main job lines (plain integer JobID, not .batch/.extern)
-    rows = []
-    for line in raw.splitlines():
-        parts = line.strip().split("|")
-        if len(parts) < 8:
-            continue
-        if not parts[0].isdigit():
-            continue
-        gpu = ""
-        m = re.search(r"gres/gpu:([^:,]+:\d+)", parts[5])
-        if m:
-            gpu = m.group(1)
-        rows.append({
-            "job_id": parts[0],
-            "name": parts[1],
-            "state": parts[2].split()[0],
-            "exit": parts[3],
-            "elapsed": parts[4],
-            "gpu": gpu,
-            "node": parts[6],
-        })
-
-    if not rows:
-        return f"No jobs found in the last {days} day(s)." + (f" (filter: {state})" if state else "")
-
-    # Most recent first (rows come sorted by start time ascending)
-    rows.reverse()
-    rows = rows[:limit]
-
-    header = f"{'JOB_ID':<12} {'NAME':<30} {'STATE':<16} {'EXIT':<6} {'ELAPSED':<12} {'GPU':<20} {'NODE'}"
-    lines = [f"Recent jobs (last {days} day(s)):", header, "-" * len(header)]
-    for r in rows:
-        lines.append(
-            f"{r['job_id']:<12} {r['name']:<30} {r['state']:<16} {r['exit']:<6} "
-            f"{r['elapsed']:<12} {r['gpu']:<20} {r['node']}"
-        )
-    lines.append(f"\n{len(rows)} job(s) shown.")
-    return "\n".join(lines)
+    return slurm_mcp.job_history(days=days, state=state, limit=limit)
 
 
 @mcp.tool()
@@ -446,7 +296,7 @@ def launch_remote_session(
         "rtx_6000", "rtx_pro_6000",
     ] | None = None,
     vram_gb: int = 24,
-    golden_only: bool = False,
+    golden_only: bool = True,
     workdir: str | None = None,
     resume: str | None = None,
     wait_url_seconds: int = 90,
@@ -509,9 +359,10 @@ def launch_remote_session(
             Takes precedence over vram_gb.
         vram_gb: VRAM fallback when gpu_type is None (default 24).
             Triggers "smallest fitting golden" auto-selection.
-        golden_only: If true, force qos=yisroel on the card's dedicated golden
-            partition (preemption-immune) and never fall back to the preemptible
-            main pool. Ignored for hardware="cpu". Default false.
+        golden_only: Force qos=yisroel on the card's dedicated golden partition
+            (preemption-immune) and never fall back to the preemptible main pool.
+            Ignored for hardware="cpu". Default true; pass false to allow the
+            golden-first-then-main fallback.
         workdir: Working directory (default: cwd).
         resume: Optional session ID to resume from a previous Claude Code
             chat. Find session IDs in the claude.ai/code session list.

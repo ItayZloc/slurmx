@@ -80,12 +80,12 @@ def test_gpu_type_param_bypasses_select_gpu(mock_run, _mock_mkdir, mock_select):
     exact card, not the smallest-fitting fallback)."""
     remote_session.submit_remote_session_job(
         name="exact-pick", hardware="gpu", days=1,
-        gpu_type="gtx_1080",
+        gpu_type="gtx_1080", golden_only=False,  # test the main-routing fallback path
     )
     mock_select.assert_not_called()
     args = mock_run.call_args[0][0]
     assert "--gres=gpu:gtx_1080:1" in args
-    # gtx_1080 has golden_quota=0 → main/normal partition
+    # gtx_1080 has golden_quota=0 → main/normal partition (with golden_only=False)
     assert "--partition=main" in args
     assert "--qos=normal" in args
 
@@ -280,7 +280,7 @@ def _make_cli_args(**overrides):
     import argparse
     ns = argparse.Namespace(
         name=None, hardware=None, days=None, vram_gb=None, gpu_type=None,
-        permission_mode=None, workdir=None, resume=None, golden_only=False,
+        permission_mode=None, workdir=None, resume=None, allow_main=False,
     )
     for k, v in overrides.items():
         setattr(ns, k, v)

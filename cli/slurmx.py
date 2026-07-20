@@ -17,6 +17,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cli import status as status_mod
 from cli import submit as submit_mod
+from cli import select_gpu as select_gpu_mod
+from cli import history as history_mod
+from cli import job_status as job_status_mod
+from cli import wait as wait_mod
+from cli import log as log_mod
+from cli import diagnose as diagnose_mod
+from cli import cancel as cancel_mod
 from slurm_mcp import remote_session
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -73,6 +80,35 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers, "remote-session", remote_session,
         aliases=("rc", "claude"),
         help="Launch `claude remote-control` as a SLURM job.",
+    )
+    _add_subcommand(
+        subparsers, "select-gpu", select_gpu_mod,
+        help="Recommend the best GPU for a VRAM requirement.",
+    )
+    _add_subcommand(
+        subparsers, "history", history_mod,
+        help="Show recent finished jobs from SLURM accounting (sacct).",
+    )
+    _add_subcommand(
+        subparsers, "job-status", job_status_mod,
+        aliases=("job",),
+        help="Show the status of a specific job.",
+    )
+    _add_subcommand(
+        subparsers, "wait", wait_mod,
+        help="Block until a job finishes.",
+    )
+    _add_subcommand(
+        subparsers, "log", log_mod,
+        help="Read a job's SLURM log file.",
+    )
+    _add_subcommand(
+        subparsers, "diagnose", diagnose_mod,
+        help="Diagnose a job failure (OOM / timeout / missing module / code error).",
+    )
+    _add_subcommand(
+        subparsers, "cancel", cancel_mod,
+        help="Cancel jobs by ID, or all your jobs.",
     )
     _add_script_subcommand(
         subparsers, "setup", "setup.sh",

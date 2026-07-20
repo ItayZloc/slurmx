@@ -223,7 +223,7 @@ def submit_job(
     output_dir: str = "logs",
     gpu_type: Optional[str] = None,
     qos: Optional[str] = None,
-    golden_only: bool = False,
+    golden_only: bool = True,
     dependency: Optional[str] = None,
     wait_until_running: bool = True,
     dry_run: bool = False,
@@ -248,7 +248,7 @@ def submit_job(
             to the preemptible main pool. The job is left queued if the golden
             partition is saturated (starts automatically as slots free) instead of
             being downgraded. Overrides `qos`. Ignored for CPU jobs (vram_gb=0).
-            (default: False = golden-first, then main.)
+            (default: True. Pass False for the golden-first-then-main fallback.)
         dependency: Job dependency expression (e.g., "afterok:12345")
         wait_until_running: If True, poll until the job reaches RUNNING state.
             On quota limits (e.g., golden tickets full), auto-cancels and

@@ -10,10 +10,12 @@ Run unit only:   python3 -m pytest tests/ -v -k "not live"
 Run live only:   python3 -m pytest tests/ -v -k "live"
 """
 
+import argparse
 import os
 import sys
 import re
 import subprocess
+from types import SimpleNamespace
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -587,6 +589,7 @@ class TestSubmitJobMocked:
             vram_gb=24,
             gpu_type="rtx_4090",
             qos="normal",
+            golden_only=False,  # qos override only applies in the fallback path
             dry_run=True,
         )
         assert result.success is True
@@ -1209,6 +1212,7 @@ class TestWaitForRunningMocked:
         ]
         result = submit_job(
             cmd="python train.py", vram_gb=48,
+            golden_only=False,  # fallback is opt-in now (default is golden-only)
             wait_until_running=True,
         )
         assert result.success is True
@@ -1230,6 +1234,7 @@ class TestWaitForRunningMocked:
         )
         result = submit_job(
             cmd="python train.py", vram_gb=48,
+            golden_only=False,  # even with fallback allowed, per-user quota must not fall back
             wait_until_running=True,
         )
         assert result.success is False
@@ -1553,12 +1558,12 @@ class TestCLIJsonOutput:
         assert data["gpu_type"] == "rtx_6000"
         assert "sbatch_script" in data
 
-    def test_json_golden_only(self):
-        """--golden-only forces the dedicated partition + yisroel QoS."""
+    def test_json_golden_only_is_default(self):
+        """golden-only is the default: dedicated partition + yisroel QoS, no flag."""
         import subprocess, json
         result = subprocess.run(
             [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--gpu-type", "rtx_4090", "--vram", "24", "--golden-only",
+             "--gpu-type", "rtx_4090", "--vram", "24",
              "--dry-run", "--json", "--", "python", "train.py"],
             capture_output=True, text=True, timeout=10,
         )
@@ -1567,6 +1572,197 @@ class TestCLIJsonOutput:
         assert data["success"] is True
         assert data["partition"] == "rtx4090"
         assert data["qos"] == "yisroel"
+
+    def test_json_allow_main_restores_fallback(self):
+        """--allow-main opts a non-owned card back onto main/normal."""
+        import subprocess, json
+        result = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
+             "--gpu-type", "rtx_4090", "--vram", "24", "--allow-main",
+             "--dry-run", "--json", "--", "python", "train.py"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["success"] is True
+        assert data["partition"] == "main"
+        assert data["qos"] == "normal"
+
+    def test_after_shorthand_builds_afterok(self):
+        """--after 111 222 -> #SBATCH --dependency=afterok:111:222 in the script."""
+        import subprocess, json
+        result = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
+             "--gpu-type", "rtx_6000", "--vram", "48", "--after", "111", "222",
+             "--dry-run", "--json", "--", "python", "train.py"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert "#SBATCH --dependency=afterok:111:222" in data["sbatch_script"]
+
+    def test_after_and_dependency_conflict_errors(self):
+        """--after and --dependency together is a user error (non-zero exit)."""
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
+             "--gpu-type", "rtx_6000", "--vram", "48",
+             "--after", "111", "--dependency", "afterany:222",
+             "--dry-run", "--json", "--", "python", "train.py"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode != 0
+        assert "not both" in result.stderr
+
+
+# ============================================================
+# Unit Tests: refactored slurm_mcp.diagnose_job / job_history
+# ============================================================
+
+class TestDiagnoseAndHistoryRefactor:
+    """diagnose_job + job_history logic now lives in slurm_mcp/ (shared by the
+    MCP tool and the `slurmx diagnose`/`history` CLIs)."""
+
+    def test_functions_exported(self):
+        assert callable(slurm_mcp.diagnose_job)
+        assert callable(slurm_mcp.job_history)
+
+    @patch("slurm_mcp.diagnostics.get_job_status")
+    def test_diagnose_running_job_short_circuits(self, mock_status):
+        mock_status.return_value = JobStatus(job_id=9, state="RUNNING")
+        out = slurm_mcp.diagnose_job(9)
+        assert "No diagnosis needed" in out
+        assert isinstance(out, str)
+
+    @patch("slurm_mcp.diagnostics.read_job_log")
+    @patch("slurm_mcp.diagnostics.get_job_status")
+    def test_diagnose_classifies_oom(self, mock_status, mock_log):
+        mock_status.return_value = JobStatus(job_id=9, state="OUT_OF_MEMORY", exit_code=1)
+        mock_log.return_value = "torch.cuda.OutOfMemoryError: CUDA out of memory"
+        out = slurm_mcp.diagnose_job(9)
+        assert "Classification: OOM" in out
+
+    @patch("slurm_mcp.history.subprocess.run")
+    def test_history_empty(self, mock_run):
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+        out = slurm_mcp.job_history(days=2)
+        assert "No jobs found" in out
+
+
+# ============================================================
+# Unit Tests: the 7 new CLI subcommands (parity with MCP tools)
+# ============================================================
+
+class TestNewCLISubcommands:
+    def test_all_registered_in_parser(self):
+        from cli import slurmx
+        parser = slurmx.build_parser()
+        for argv in (["select-gpu", "--vram", "48"], ["history"], ["job-status", "1"],
+                     ["job", "1"], ["wait", "1"], ["log", "1"], ["diagnose", "1"],
+                     ["cancel", "1"]):
+            ns = parser.parse_args(argv)
+            assert hasattr(ns, "_run")
+
+    @patch("slurm_mcp.select_gpu", return_value=None)
+    @patch("slurm_mcp.check_availability")
+    def test_select_gpu_allow_main_passes_flag(self, mock_av, mock_sel):
+        from cli import select_gpu as sg
+        from slurm_mcp.types import Availability
+        mock_av.return_value = Availability()
+        sg.run(argparse.Namespace(vram=48, allow_main=True))
+        mock_sel.assert_called_once_with(48, golden_only=False)
+
+    @patch("slurm_mcp.select_gpu", return_value=None)
+    @patch("slurm_mcp.check_availability")
+    def test_select_gpu_default_is_golden_only(self, mock_av, mock_sel):
+        from cli import select_gpu as sg
+        from slurm_mcp.types import Availability
+        mock_av.return_value = Availability()
+        sg.run(argparse.Namespace(vram=48, allow_main=False))
+        mock_sel.assert_called_once_with(48, golden_only=True)
+
+    @patch("slurm_mcp.job_history", return_value="HIST")
+    def test_history_run(self, mock_hist, capsys):
+        from cli import history
+        history.run(argparse.Namespace(days=3, state=None, limit=30))
+        assert "HIST" in capsys.readouterr().out
+        mock_hist.assert_called_once_with(days=3, state=None, limit=30)
+
+    @patch("slurm_mcp.diagnose_job", return_value="DIAG")
+    def test_diagnose_run(self, mock_d, capsys):
+        from cli import diagnose
+        diagnose.run(argparse.Namespace(job_id=1, output_dir="logs", log_lines=50))
+        assert "DIAG" in capsys.readouterr().out
+
+    @patch("slurm_mcp.get_job_status")
+    def test_job_status_json(self, mock_st, capsys):
+        from cli import job_status
+        mock_st.return_value = JobStatus(job_id=7, state="RUNNING", node="n1")
+        job_status.run(argparse.Namespace(job_id=7, json_output=True))
+        assert '"state": "RUNNING"' in capsys.readouterr().out
+
+    @patch("slurm_mcp.cancel_jobs", return_value=2)
+    def test_cancel_run(self, mock_c, capsys):
+        from cli import cancel
+        cancel.run(argparse.Namespace(job_ids=[1, 2], all_jobs=False, pending_only=False))
+        assert "Cancelled 2" in capsys.readouterr().out
+        mock_c.assert_called_once_with(job_ids=[1, 2], all_jobs=False, pending_only=False)
+
+    def test_cancel_requires_target(self):
+        from cli import cancel
+        with pytest.raises(SystemExit):
+            cancel.run(argparse.Namespace(job_ids=[], all_jobs=False, pending_only=False))
+
+    @patch("slurm_mcp.read_job_log", return_value=None)
+    def test_log_missing_exits(self, mock_l):
+        from cli import log
+        with pytest.raises(SystemExit):
+            log.run(argparse.Namespace(job_id=1, output_dir="logs", tail=100))
+
+
+# ============================================================
+# Unit Tests: TUI color layer (cli/theme.py, pure classifier)
+# ============================================================
+
+class TestTheme:
+    _LINES = [
+        "=== squeue --me ===",
+        "  JOBID PARTITION NAME USER ST TIME NODES NODELIST(REASON)",
+        "  111 rtx6000 train me R 1:00 1 node1",
+        "  222 rtx6000 eval me PD 0:00 1 (Priority)",
+        "",
+        "=== Golden Tickets (yisroel QoS) ===    === Cluster-Wide ===",
+        "  rtx_pro_6000: 0/16 free (16 running)    rtx_pro_6000: 0/16 free",
+        "    Running:",
+        "      alice: 10 GPU(s)",
+        "    Pending (next first):",
+        "      itay: 3 GPU(s)",
+        "  rtx_6000: 5/12 free",
+    ]
+
+    def test_classify_roles(self):
+        from cli.theme import classify_dashboard_lines, Role
+        roles = classify_dashboard_lines(self._LINES)
+        assert len(roles) == len(self._LINES)
+        assert roles[0] == Role.HEADER
+        assert roles[2] == Role.SQUEUE_RUNNING
+        assert roles[3] == Role.SQUEUE_PENDING
+        assert roles[5] == Role.HEADER
+        assert roles[6] == Role.CARD_FULL       # 0/16 free -> full/red
+        assert roles[7] == Role.LABEL
+        assert roles[8] == Role.ROW_RUNNING
+        assert roles[9] == Role.LABEL
+        assert roles[10] == Role.ROW_PENDING    # section carried from the Pending label
+        assert roles[11] == Role.CARD_FREE      # 5/12 free -> free/green
+
+    def test_classify_plain_fallback(self):
+        from cli.theme import classify_dashboard_lines, Role
+        assert classify_dashboard_lines(["loading…"]) == [Role.PLAIN]
+
+    def test_init_theme_no_color_returns_empty(self):
+        from cli import theme as th
+        with patch("curses.has_colors", return_value=False):
+            assert th.init_theme() == {}
 
 
 # ============================================================

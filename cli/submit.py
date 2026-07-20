@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Backing module for `slurmx submit` (also runnable as `python -m cli.submit`).
 
-Auto-selects GPU based on VRAM requirement. Golden tickets first,
-then falls back to normal QoS cluster-wide.
+Auto-selects GPU based on VRAM requirement. Golden-only by default (queues on the
+card's preemption-immune golden partition); pass --allow-main to permit the
+golden-first-then-main fallback.
 
 Usage (via slurmx):
     slurmx submit --vram 48 -- python train.py --lr 1e-4
     slurmx submit --vram 48 -j train-bert -- python train.py
     slurmx submit --gpu-type rtx_pro_6000 -- python eval.py
+    slurmx submit --vram 48 --after 12345 -- python eval.py   # wait for job 12345
+    slurmx submit --vram 48 --allow-main -- python train.py   # allow main fallback
     slurmx submit --vram 48 --dry-run -- python train.py
 """
 
@@ -40,18 +43,25 @@ def add_arguments(parser):
                         help="Number of GPUs (default: 1)")
     parser.add_argument("-q", "--qos", default=None,
                         help="Override QoS (default: auto)")
-    parser.add_argument("--golden-only", action="store_true",
-                        help="Force golden ticket (qos=yisroel on the card's "
-                             "dedicated partition, preemption-immune); never fall "
-                             "back to the preemptible main pool.")
+    parser.add_argument("--allow-main", action="store_true",
+                        help="Allow falling back to the preemptible main pool when "
+                             "the golden ticket is full. Default is golden-only "
+                             "(qos=yisroel on the card's dedicated partition, "
+                             "preemption-immune; queues on golden instead of "
+                             "dropping to main).")
     parser.add_argument("-j", "--job-name", default=None,
                         help="Job name (default: from command)")
     parser.add_argument("-w", "--workdir", default=None,
                         help="Working directory on compute node")
     parser.add_argument("-o", "--output-dir", default="logs",
                         help="Directory for SLURM log files (default: logs)")
+    parser.add_argument("--after", nargs="+", type=int, metavar="JOBID", default=None,
+                        help="Wait for these job IDs to finish successfully before "
+                             "starting (shorthand for --dependency afterok:ID[:ID...]).")
     parser.add_argument("-d", "--dependency", default=None,
-                        help="Job dependency (e.g., afterok:12345)")
+                        help="Raw SLURM dependency expression (e.g., afterok:12345, "
+                             "afterany:111:222, singleton). Use --after for the "
+                             "common 'finish first' case.")
     parser.add_argument("--no-wait", action="store_true",
                         help="Don't wait for job to reach RUNNING state (default: wait)")
     parser.add_argument("--dry-run", action="store_true",
@@ -81,6 +91,14 @@ def run(args):
         print(f"{RED}Error: Must specify either --vram or --gpu-type.{NC}", file=sys.stderr)
         sys.exit(1)
 
+    if args.after and args.dependency:
+        print(f"{RED}Error: Use either --after or --dependency, not both.{NC}",
+              file=sys.stderr)
+        sys.exit(1)
+    dependency = args.dependency
+    if args.after:
+        dependency = "afterok:" + ":".join(str(j) for j in args.after)
+
     vram_gb = args.vram if args.vram is not None else 0
     cmd = " ".join(cmd_args)
 
@@ -93,8 +111,8 @@ def run(args):
         output_dir=args.output_dir,
         gpu_type=args.gpu_type,
         qos=args.qos,
-        golden_only=args.golden_only,
-        dependency=args.dependency,
+        golden_only=not args.allow_main,
+        dependency=dependency,
         wait_until_running=not args.no_wait,
         dry_run=args.dry_run,
     )

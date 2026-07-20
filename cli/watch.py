@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 import slurm_mcp
 from cli import render
+from cli import theme as theme_mod
 
 REFRESH_INTERVAL = 5.0          # seconds between snapshots (default)
 _INPUT_POLL_MS = 100            # how often getch wakes to redraw the clock
@@ -129,11 +130,14 @@ def _worker(state: _TuiState, qos: str | None, interval: float) -> None:
 # curses loop
 # --------------------------------------------------------------------------- #
 
-def _addbar(stdscr, y: int, text: str, maxx: int) -> None:
-    """Draw a full-width reverse-video bar, safe against edge writes."""
+def _addbar(stdscr, y: int, text: str, maxx: int, attr=None) -> None:
+    """Draw a full-width status bar, safe against edge writes. `attr` defaults to
+    reverse-video (used when the terminal has no color)."""
+    if attr is None:
+        attr = curses.A_REVERSE
     bar = text[: maxx - 1].ljust(maxx - 1)
     try:
-        stdscr.addnstr(y, 0, bar, maxx - 1, curses.A_REVERSE)
+        stdscr.addnstr(y, 0, bar, maxx - 1, attr)
     except curses.error:
         pass
 
@@ -156,7 +160,11 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
             pass
     stdscr.timeout(_INPUT_POLL_MS)
 
+    # Cyan/teal color map (empty on a color-less terminal → plain fallback).
+    theme = theme_mod.init_theme()
+
     lines = ["loading…"]
+    roles: list = []
     stamp = "--:--:--"
     rendered_version = -1
     pad = None
@@ -168,7 +176,7 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
     while True:
         frame += 1
         maxy, maxx = stdscr.getmaxyx()
-        if maxy < 3 or maxx < 10:
+        if maxy < 4 or maxx < 10:
             stdscr.erase()
             try:
                 stdscr.addnstr(0, 0, "terminal too small", maxx - 1)
@@ -179,7 +187,7 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
                 break
             continue
 
-        body_h = maxy - 2  # top bar + bottom bar
+        body_h = maxy - 3  # top bar + rule + bottom bar
 
         with state.lock:
             snap = state.snapshot
@@ -199,12 +207,20 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
             dirty = True
 
         if dirty:
+            roles = theme_mod.classify_dashboard_lines(lines) if theme else []
             pad_w = max(maxx, max((len(s) for s in lines), default=0) + 1)
             pad = curses.newpad(max(len(lines) + 1, body_h), pad_w)
             pad.erase()
             for i, s in enumerate(lines):
+                role = roles[i] if i < len(roles) else None
+                attr = theme.get(role, 0)
+                # Width-preserving status glyph: swap a card line's 2-space indent
+                # for ●/○ (2 cells) so side-by-side columns stay aligned.
+                if role in (theme_mod.Role.CARD_FREE, theme_mod.Role.CARD_FULL) and s.startswith("  "):
+                    glyph = theme_mod.GLYPH_FULL if role == theme_mod.Role.CARD_FULL else theme_mod.GLYPH_FREE
+                    s = glyph + s[2:]
                 try:
-                    pad.addstr(i, 0, s)
+                    pad.addstr(i, 0, s, attr)
                 except curses.error:
                     pass
 
@@ -215,16 +231,22 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
         last = min(row + body_h, len(lines))
         spin = _SPINNER[frame % len(_SPINNER)]
         qos_note = f" · qos={qos}" if qos else ""
+        bar_attr = theme.get(theme_mod.Role.BAR, curses.A_REVERSE)
+        rule_attr = theme.get(theme_mod.Role.RULE, 0)
         _addbar(stdscr, 0,
                 f" slurmx status {spin} · data {stamp} · every {interval:g}s{qos_note}",
-                maxx)
+                maxx, bar_attr)
+        try:
+            stdscr.addnstr(1, 0, "─" * (maxx - 1), maxx - 1, rule_attr)
+        except curses.error:
+            pass
         _addbar(stdscr, maxy - 1,
                 f" ↑↓/jk PgUp/Dn g/G scroll · ←→/hl pan · q quit"
                 f"   {first}-{last}/{len(lines)} ",
-                maxx)
+                maxx, bar_attr)
         stdscr.noutrefresh()
         try:
-            pad.refresh(row, col, 1, 0, maxy - 2, maxx - 1)
+            pad.refresh(row, col, 2, 0, maxy - 2, maxx - 1)
         except curses.error:
             pass
         curses.doupdate()

@@ -109,7 +109,7 @@ def submit_remote_session_job(
     workdir=None,
     resume=None,
     gpu_type=None,
-    golden_only=False,
+    golden_only=True,
 ):
     """Submit a `claude remote-control` server as a SLURM job.
 
@@ -131,7 +131,8 @@ def submit_remote_session_job(
             "smallest-fitting, golden-preferred" logic.
         golden_only: Force qos=yisroel on the card's dedicated golden partition
             (preemption-immune); never fall back to the preemptible main pool.
-            Ignored for hardware="cpu".
+            Ignored for hardware="cpu". Default True; pass False to allow the
+            golden-first-then-main fallback.
         workdir: Working directory (default: cwd).
         resume: Session ID to resume from a previous Claude Code chat.
             None starts a fresh session. The resume path uses the
@@ -340,9 +341,11 @@ def add_arguments(parser):
     parser.add_argument("--vram-gb", type=int, default=None,
                         help="VRAM fallback when --hardware=gpu and --gpu-type "
                              "is not specified (default 24)")
-    parser.add_argument("--golden-only", action="store_true",
-                        help="Force qos=yisroel on the card's dedicated golden "
-                             "partition (preemption-immune); never fall back to main.")
+    parser.add_argument("--allow-main", action="store_true",
+                        help="Allow falling back to the preemptible main pool when "
+                             "the golden ticket is full. Default is golden-only "
+                             "(qos=yisroel on the card's dedicated partition, "
+                             "preemption-immune).")
     parser.add_argument("--permission-mode", choices=VALID_PERMISSION_MODES,
                         default=None,
                         help="default | acceptEdits | plan (prompted if omitted)")
@@ -371,7 +374,7 @@ def run(args):
         permission_mode=args.permission_mode,
         gpu_type=args.gpu_type,
         vram_gb=vram_gb,
-        golden_only=args.golden_only,
+        golden_only=not args.allow_main,
         workdir=args.workdir,
         resume=args.resume,
     )

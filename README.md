@@ -9,7 +9,7 @@ After install (`./setup.sh` or `slurmx setup`), see [WELCOME.md](WELCOME.md) for
 | Tool | Description |
 |------|-------------|
 | `cluster_summary` | Single-call dashboard: your jobs + golden tickets (per QoS) + cluster-wide GPU availability. `view="jobs"` or `"gpu"` narrows the output. |
-| `submit_job` | Submit GPU/CPU jobs (auto-selects GPU by VRAM). `golden_only=true` forces a preemption-immune golden slot. |
+| `submit_job` | Submit GPU/CPU jobs (auto-selects GPU by VRAM). Golden-only by default (preemption-immune); pass `golden_only=false` to allow the main-pool fallback. Supports `dependency` (e.g. `afterok:12345`). |
 | `select_gpu` | Recommend best GPU for a VRAM requirement |
 | `job_history` | Show recent completed/failed jobs (via sacct) |
 | `get_job_status` | Get detailed status of a specific job |
@@ -29,18 +29,19 @@ Your golden QoS (e.g. `yisroel`) runs on the per-card dedicated partitions
 `normal` jobs and nothing bumps it. A golden QoS is invalid on `main`/`gpu`, so
 "golden" always means a dedicated partition.
 
-`submit_job` / `launch_remote_session` / `slurmx submit` take a **`golden_only`**
-flag (`--golden-only` on the CLI):
+`submit_job` / `launch_remote_session` / `slurmx submit` are **golden-only by
+default**. Opt out with the **`--allow-main`** CLI flag (`golden_only=false` on the
+MCP tools):
 
-- **default (`golden_only=false`)** — golden-first on the cards you own
-  (`golden_quota > 0`), then fall back to the preemptible main pool if golden is
-  full. Unchanged behavior.
-- **`golden_only=true`** — force `qos=yisroel` on the card's dedicated partition
+- **default (golden-only)** — force `qos=yisroel` on the card's dedicated partition
   and **never** accept a preemptible slot. If the golden ticket is full the job
   waits in the golden queue and starts automatically when a slot frees (it is not
   downgraded). Works on every card, including the smaller ones the group doesn't
   own (`golden_quota=0`) — those then preempt other groups' `normal` jobs there.
-  Recommended for training you don't want evicted.
+  Recommended for training you don't want evicted. Ignored for CPU jobs.
+- **`--allow-main` / `golden_only=false`** — golden-first on the cards you own
+  (`golden_quota > 0`), then fall back to the preemptible main pool if golden is
+  full (the previous default).
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
 card's pending GPUs by user in dispatch order — like the Running block but
@@ -138,8 +139,16 @@ slurmx --help                              # list subcommands
 slurmx status                              # live scrollable dashboard (in a terminal)
 slurmx status --once                       # one-shot text snapshot (+ golden queue when full)
 slurmx status -n 2                         # live dashboard, refresh every 2s
-slurmx submit --vram 48 -- python train.py # submit a job (golden-first, main fallback)
-slurmx submit --vram 48 --golden-only -- python train.py  # preemption-immune, never main
+slurmx submit --vram 48 -- python train.py # submit a job (golden-only by default)
+slurmx submit --vram 48 --after 12345 -- python eval.py   # wait for job 12345 first
+slurmx submit --vram 48 --allow-main -- python train.py   # allow the main-pool fallback
+slurmx select-gpu --vram 48                # recommend a GPU for a VRAM need
+slurmx job-status 12345                    # status of one job (alias: slurmx job)
+slurmx wait 12345                          # block until a job finishes
+slurmx log 12345                           # read a job's SLURM log (--tail N)
+slurmx diagnose 12345                      # classify a failed job (OOM/timeout/...)
+slurmx history --days 7                    # recent finished jobs (sacct)
+slurmx cancel 12345                        # cancel jobs by ID (or --all)
 slurmx remote-session                      # interactive launch_remote_session
 slurmx rc                                  # short alias for remote-session
 slurmx setup                               # = ./setup.sh
@@ -156,6 +165,10 @@ shown side by side. It auto-refreshes (default 5s, `-n/--interval N` to change) 
 losing your scroll position.
 
 Keys: `↑/↓` or `j/k` scroll, `PgUp/PgDn` page, `g/G` top/bottom, `←/→` or `h/l` pan, `q` quit.
+
+It's colorized with a cyan/teal accent (green = free/running, yellow = pending, red = full),
+dim secondary labels, and ●/○ status glyphs when the terminal supports color; it degrades to
+plain text otherwise.
 
 Piped, redirected, or run under `watch` (any non-TTY), it prints the classic one-shot text
 and exits, so scripts are unaffected. `--once` forces the one-shot text even in a terminal.

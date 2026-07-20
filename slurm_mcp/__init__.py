@@ -30,3 +30,5 @@ from .monitoring import (
     _FINISHED_STATES, _UNRECOVERABLE_REASONS,
     _QOS_QUOTA_REASONS, _USER_QUOTA_REASONS, _QUOTA_REASONS,
 )
+from .diagnostics import diagnose_job
+from .history import job_history

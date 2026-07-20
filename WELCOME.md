@@ -12,7 +12,8 @@ MCP TOOLS (invoked by Claude in chat)
   cluster_summary          your jobs + golden + cluster-wide GPU view
                            (lists pending jobs by user, in order, when a ticket is full)
   submit_job               submit GPU/CPU jobs (auto-selects GPU by VRAM;
-                           golden_only=true forces a preemption-immune slot)
+                           golden-only by default — golden_only=false to
+                           allow the preemptible main-pool fallback)
   select_gpu               recommend a GPU for a VRAM requirement
   get_job_status           detailed status of a specific job
   wait_for_job             block until a job finishes
@@ -25,10 +26,19 @@ MCP TOOLS (invoked by Claude in chat)
 
 CLI COMMANDS
   slurmx <subcommand>      umbrella, like `git` or `aws-cli`:
-                             slurmx status                live scrollable dashboard
+                             slurmx status                live colorized dashboard
                                                           (--once for a text snapshot;
                                                            -n N sets refresh seconds)
-                             slurmx submit [opts] -- CMD  submit a job
+                             slurmx submit [opts] -- CMD  submit a job (golden-only;
+                                                          --after JOBID to chain,
+                                                          --allow-main for main pool)
+                             slurmx select-gpu --vram N   recommend a GPU
+                             slurmx job-status ID         status of one job (alias: job)
+                             slurmx wait ID               block until a job finishes
+                             slurmx log ID                read a job's SLURM log
+                             slurmx diagnose ID           classify a job failure
+                             slurmx history               recent finished jobs (sacct)
+                             slurmx cancel ID|--all       cancel jobs
                              slurmx remote-session        launch claude RC
                              slurmx setup                 = ./setup.sh
                              slurmx update                = ./update.sh
