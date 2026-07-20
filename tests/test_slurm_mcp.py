@@ -748,13 +748,34 @@ class TestMyJobsMocked:
             "gres/gpu:rtx_pro_6000:1                           "
             "2:18:55     "
             "ise-6000p-03             "
-            "rtx_pro_6000        \n"
+            "rtx_pro_6000        "
+            "None                          \n"
         )
         jobs = my_jobs()
         assert len(jobs) == 1
         assert jobs[0]["job_id"] == "15908232"
         assert jobs[0]["state"] == "RUNNING"
         assert jobs[0]["qos"] == "yisroel"
+        assert jobs[0]["partition"] == "rtx_pro_6000"
+        assert jobs[0]["reason"] == "None"
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_parses_pending_reason(self, mock_rq):
+        # A PENDING job carries a scheduler reason in the trailing Reason column.
+        mock_rq.return_value = (
+            "15908299    "
+            "attack-sweep-01                          "
+            "PENDING     "
+            "yisroel     "
+            "gres/gpu:rtx_pro_6000:2                           "
+            "0:00        "
+            "                         "
+            "rtx_pro_6000        "
+            "QOSMaxGRESPerAccount          \n"
+        )
+        jobs = my_jobs()
+        assert jobs[0]["state"] == "PENDING"
+        assert jobs[0]["reason"] == "QOSMaxGRESPerAccount"
 
     @patch("slurm_mcp.shell._run_quiet")
     def test_empty_returns_empty_list(self, mock_rq):
@@ -1388,6 +1409,85 @@ class TestRenderGoldenQueue:
         out = render.render_golden_all(avail, queues={"yisroel": rows})
         assert "and 5 more queued" in out  # 20 - QUEUE_DISPLAY_LIMIT(15)
 
+    def test_limit_none_lists_all(self):
+        # The scrollable TUI passes limit=None to show every queued row.
+        from cli import render
+        avail = self._avail_full()
+        rows = [
+            {"job_id": str(1000 + i), "user": "u", "name": f"j{i}",
+             "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100}
+            for i in range(20)
+        ]
+        out = render.render_golden_all(avail, queues={"yisroel": rows}, limit=None)
+        assert "more queued" not in out
+        assert "1019" in out  # the 20th row is present, not truncated
+
+
+class TestWatchDashboard:
+    """Pure helpers behind the live `slurmx status` TUI (cli/watch.py)."""
+
+    def _avail(self):
+        avail = Availability()
+        avail.golden_by_qos["yisroel"] = {
+            "rtx_pro_6000": GPUAvailability(
+                "rtx_pro_6000", 16, 16, 0, running=16, pending=30),
+        }
+        avail.cluster["rtx_pro_6000"] = GPUAvailability("rtx_pro_6000", 56, 56, 0)
+        return avail
+
+    def _jobs(self, n_pending=30, n_running=2):
+        jobs = [
+            {"job_id": str(1000 + i), "name": f"attack-sweep-{i:02d}",
+             "state": "PENDING", "qos": "yisroel",
+             "gpu_gres": "gres/gpu:rtx_pro_6000:1", "runtime": "0:00",
+             "node": "", "partition": "rtx_pro_6000",
+             "reason": "QOSMaxGRESPerAccount"}
+            for i in range(n_pending)
+        ]
+        jobs += [
+            {"job_id": str(900 + i), "name": f"vaccine-run-{i}",
+             "state": "RUNNING", "qos": "yisroel",
+             "gpu_gres": "gres/gpu:rtx_pro_6000:2", "runtime": "1-04:12",
+             "node": f"node04{i}", "partition": "rtx_pro_6000", "reason": "None"}
+            for i in range(n_running)
+        ]
+        return jobs
+
+    def test_all_pending_jobs_present_and_compact(self):
+        from cli import watch
+        lines = watch.build_dashboard_lines(self._avail(), self._jobs(), {}, qos=None)
+        text = "\n".join(lines)
+        for i in range(30):
+            assert str(1000 + i) in text  # none dropped
+        # one line per job (nothing truncated to a "+N more")
+        assert sum(1 for l in lines if l.strip().startswith("PEND")) == 30
+
+    def test_summary_counts_and_gpu_sum(self):
+        from cli import watch
+        lines = watch.build_dashboard_lines(self._avail(), self._jobs(), {}, qos=None)
+        assert "2 running · 30 pending · 4 GPUs" in lines[0]
+
+    def test_pending_reason_shown_running_none_hidden(self):
+        from cli import watch
+        lines = watch.build_dashboard_lines(self._avail(), self._jobs(1, 1), {}, qos=None)
+        pend = [l for l in lines if l.strip().startswith("PEND")][0]
+        run = [l for l in lines if l.strip().startswith("RUN ")][0]
+        assert "QOSMaxGRESPerAccount" in pend
+        assert "None" not in run  # the literal reason "None" is suppressed
+
+    def test_no_jobs(self):
+        from cli import watch
+        lines = watch.build_dashboard_lines(self._avail(), [], {}, qos=None)
+        assert any("No jobs." in l for l in lines)
+
+    def test_clamp_scroll_bounds(self):
+        from cli import watch
+        assert watch.clamp_scroll(-5, 100, 10) == 0     # below zero
+        assert watch.clamp_scroll(500, 100, 10) == 90   # past the end
+        assert watch.clamp_scroll(5, 100, 10) == 5      # in range
+        assert watch.clamp_scroll(7, 5, 10) == 0        # viewport >= total
+        assert watch.clamp_scroll(3, 0, 10) == 0        # empty buffer
+
 
 # ============================================================
 # Unit Tests: CLI --json output
@@ -1571,7 +1671,7 @@ class TestMyJobsLive:
         jobs = my_jobs()
         if jobs:
             expected_keys = {"job_id", "name", "state", "qos", "gpu_gres",
-                             "runtime", "node", "partition"}
+                             "runtime", "node", "partition", "reason"}
             assert set(jobs[0].keys()) == expected_keys
 
     def test_qos_filter(self):

@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_subcommand(
         subparsers, "status", status_mod,
         aliases=("s",),
-        help="One-shot SLURM dashboard.",
+        help="Live SLURM dashboard (scrollable; one-shot text when piped or --once).",
     )
     _add_subcommand(
         subparsers, "submit", submit_mod,

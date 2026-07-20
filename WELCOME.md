@@ -25,7 +25,9 @@ MCP TOOLS (invoked by Claude in chat)
 
 CLI COMMANDS
   slurmx <subcommand>      umbrella, like `git` or `aws-cli`:
-                             slurmx status                one-shot dashboard
+                             slurmx status                live scrollable dashboard
+                                                          (--once for a text snapshot;
+                                                           -n N sets refresh seconds)
                              slurmx submit [opts] -- CMD  submit a job
                              slurmx remote-session        launch claude RC
                              slurmx setup                 = ./setup.sh

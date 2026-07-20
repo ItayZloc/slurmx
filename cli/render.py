@@ -13,13 +13,18 @@ QUEUE_DISPLAY_LIMIT = 15
 
 def render_golden_all(avail: slurm_mcp.Availability,
                       qos_filter: str | None = None,
-                      queues: dict | None = None) -> str:
+                      queues: dict | None = None,
+                      limit: int | None = QUEUE_DISPLAY_LIMIT) -> str:
     """One '=== Golden Tickets ({qos} QoS) ===' section per configured QoS.
 
     Iterates avail.golden_by_qos. If qos_filter is set, only that QoS is shown.
     When a card's golden ticket is FULL (free==0) and `queues` carries that QoS's
     pending queue (from slurm_mcp.golden_queues), the waiting line is listed in
     scheduling order (position, job id, user, job name) so you can see who's ahead.
+
+    `limit` caps how many queued rows are listed per full card (default
+    QUEUE_DISPLAY_LIMIT); pass None to list all of them (the scrollable TUI does
+    this since it can page through the full queue).
     """
     queues = queues or {}
     sections = []
@@ -48,14 +53,15 @@ def render_golden_all(avail: slurm_mcp.Availability,
                     lines.append(
                         f"    Queue (ticket full — {len(waiting)} waiting, next first):"
                     )
-                    for i, r in enumerate(waiting[:QUEUE_DISPLAY_LIMIT], 1):
+                    shown = waiting if limit is None else waiting[:limit]
+                    for i, r in enumerate(shown, 1):
                         lines.append(
                             f"      {i:>3}. {r['job_id']:<11} "
                             f"{r['user']:<12} {r['name']}"
                         )
-                    if len(waiting) > QUEUE_DISPLAY_LIMIT:
+                    if limit is not None and len(waiting) > limit:
                         lines.append(
-                            f"      ... and {len(waiting) - QUEUE_DISPLAY_LIMIT} more queued"
+                            f"      ... and {len(waiting) - limit} more queued"
                         )
         sections.append("\n".join(lines))
     return "\n\n".join(sections)

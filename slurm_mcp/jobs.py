@@ -12,11 +12,13 @@ def my_jobs(qos: Optional[str] = None) -> list[dict]:
     """
     Return current user's jobs as a list of dicts.
 
-    Each dict has: job_id, name, state, qos, gpu_gres, runtime, node, partition.
+    Each dict has: job_id, name, state, qos, gpu_gres, runtime, node, partition,
+    reason. `reason` is the scheduler's pending reason (e.g. "Resources",
+    "QOSMaxGRESPerAccount", "Priority") for PENDING jobs, "None" for RUNNING ones.
     """
     user = os.environ.get("USER", "")
     cmd = ["squeue", "-u", user, "-h", "-O",
-           "JobId:12,Name:40,State:12,QOS:12,tres-per-node:50,TimeUsed:12,NodeList:25,Partition:20"]
+           "JobId:12,Name:40,State:12,QOS:12,tres-per-node:50,TimeUsed:12,NodeList:25,Partition:20,Reason:30"]
     if qos:
         cmd.extend(["--qos", qos])
 
@@ -33,7 +35,8 @@ def my_jobs(qos: Optional[str] = None) -> list[dict]:
             "gpu_gres": line[76:126].strip(),
             "runtime": line[126:138].strip(),
             "node": line[138:163].strip(),
-            "partition": line[163:].strip(),
+            "partition": line[163:183].strip(),
+            "reason": line[183:].strip(),
         }
         jobs.append(job)
     return jobs

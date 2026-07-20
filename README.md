@@ -133,7 +133,9 @@ The server embeds usage rules that Claude reads automatically. Ask naturally:
 
 ```bash
 slurmx --help                              # list subcommands
-slurmx status                              # one-shot SLURM dashboard (+ golden queue when full)
+slurmx status                              # live scrollable dashboard (in a terminal)
+slurmx status --once                       # one-shot text snapshot (+ golden queue when full)
+slurmx status -n 2                         # live dashboard, refresh every 2s
 slurmx submit --vram 48 -- python train.py # submit a job (golden-first, main fallback)
 slurmx submit --vram 48 --golden-only -- python train.py  # preemption-immune, never main
 slurmx remote-session                      # interactive launch_remote_session
@@ -143,11 +145,24 @@ slurmx update                              # = ./update.sh
 slurmx <subcommand> --help                 # per-subcommand options
 ```
 
-Pair `slurmx status` with `watch` for a refreshing dashboard:
+### Live dashboard
+
+Run in a terminal, `slurmx status` opens a **live, scrollable** dashboard: your jobs
+(compact, one line each — no truncation, so 30 queued jobs stay readable), the golden
+tickets with the full waiting queue, and cluster-wide GPU availability. It auto-refreshes
+(default 5s, `-n/--interval N` to change) without losing your scroll position.
+
+Keys: `↑/↓` or `j/k` scroll, `PgUp/PgDn` page, `g/G` top/bottom, `←/→` or `h/l` pan, `q` quit.
+
+Piped, redirected, or run under `watch` (any non-TTY), it prints the classic one-shot text
+and exits, so scripts are unaffected. `--once` forces the one-shot text even in a terminal.
 
 ```bash
-watch -n 2 slurmx status
+slurmx status                # live dashboard
+slurmx status --once | grep  # one-shot text (also happens automatically when piped)
 ```
+
+It's stdlib `curses` (no extra dependency) and works over SSH.
 
 ## Running tests
 

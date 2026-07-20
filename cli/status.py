@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Backing module for `slurmx status` (also runnable as `python -m cli.status`).
 
-Prints squeue --me + golden ticket holders (per configured QoS) + cluster-wide
-GPU availability, then exits. Pair with the unix `watch` command if you want
-periodic refresh:
+In an interactive terminal, `slurmx status` opens a live, scrollable dashboard
+(see cli/watch.py): your jobs + golden tickets + cluster-wide GPU availability,
+auto-refreshing on an interval. Piped, redirected, or run under `watch` (any
+non-TTY), it prints the classic one-shot text and exits, so scripts are
+unaffected. `--once` forces the one-shot text even in a terminal.
 
-    slurmx status                # one snapshot
-    watch -n 2 slurmx status     # refresh every 2 seconds
+    slurmx status                # live dashboard (in a terminal)
+    slurmx status --once         # one-shot text snapshot
+    slurmx status -n 2           # live dashboard, refresh every 2 seconds
+    slurmx status | grep 42      # one-shot text (non-TTY)
 """
 
 import argparse
+import curses
 import os
 import subprocess
 import sys
@@ -53,15 +58,28 @@ def render_dashboard(qos: str | None = None) -> str:
 
 def add_arguments(parser):
     parser.add_argument("--qos", help="Restrict golden-ticket sections to one QoS.")
+    parser.add_argument("--once", action="store_true",
+                        help="Print the one-shot text snapshot and exit (no live view).")
+    parser.add_argument("--interval", "-n", type=float, default=5.0,
+                        help="Live view refresh interval in seconds (default 5).")
 
 
 def run(args):
+    wants_tui = sys.stdout.isatty() and not args.once
+    if wants_tui:
+        from cli import watch
+        try:
+            watch.run_tui(interval=args.interval, qos=args.qos)
+            return
+        except curses.error:
+            # TERM unset/dumb or no usable terminal — fall back to one-shot text.
+            pass
     print(render_dashboard(qos=args.qos))
 
 
 def main():
     p = argparse.ArgumentParser(
-        description="One-shot SLURM dashboard. Use `watch slurmx status` to refresh.",
+        description="Live SLURM dashboard (one-shot text when piped or with --once).",
     )
     add_arguments(p)
     run(p.parse_args())
