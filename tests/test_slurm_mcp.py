@@ -1375,34 +1375,67 @@ class TestRenderGoldenQueue:
         }
         return avail
 
-    def test_full_card_lists_queue_in_order(self):
+    def test_full_card_lists_pending_in_order(self):
+        # Pending is the ordered queue as compact 'user: N GPU(s)' rows; the
+        # verbose jobid/jobname queue block is gone.
         from cli import render
         avail = self._avail_full()
         queues = {"yisroel": [
             {"job_id": "1001", "user": "alice", "name": "train-a",
              "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100},
             {"job_id": "1002", "user": "bob", "name": "train-b",
+             "gpu_type": "rtx_6000", "gpu_count": 2, "priority": 100},
+        ]}
+        out = render.render_golden_all(avail, queues=queues)
+        assert "Pending (2 waiting, next first):" in out
+        assert "alice: 1 GPU(s)" in out and "bob: 2 GPU(s)" in out
+        assert out.index("alice") < out.index("bob")   # dispatch order
+        assert "train-a" not in out and "1001" not in out  # no jobid/jobname
+
+    def test_repeated_user_keeps_queue_order(self):
+        # The edge case: same user at multiple positions must survive (an
+        # aggregate would collapse itay's two jobs into one).
+        from cli import render
+        avail = self._avail_full()
+        queues = {"yisroel": [
+            {"job_id": "1", "user": "itay", "name": "a",
+             "gpu_type": "rtx_6000", "gpu_count": 3, "priority": 100},
+            {"job_id": "2", "user": "doron", "name": "b",
+             "gpu_type": "rtx_6000", "gpu_count": 2, "priority": 100},
+            {"job_id": "3", "user": "itay", "name": "c",
              "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100},
         ]}
         out = render.render_golden_all(avail, queues=queues)
-        assert "Queue (ticket full" in out
-        assert "1001" in out and "alice" in out and "train-a" in out
-        assert out.index("train-a") < out.index("train-b")  # position order
+        assert out.count("itay:") == 2  # not aggregated
+        assert (out.index("itay: 3 GPU(s)") < out.index("doron: 2 GPU(s)")
+                < out.index("itay: 1 GPU(s)"))
 
-    def test_free_card_has_no_queue_section(self):
+    def test_not_full_falls_back_to_per_user_aggregate(self):
+        from cli import render
+        avail = Availability()
+        avail.golden_by_qos["yisroel"] = {
+            "rtx_6000": GPUAvailability("rtx_6000", 12, 8, 4, running=8, pending=4,
+                                        pending_users={"carol": 4}),
+        }
+        # No queue rows (not full) -> per-user aggregate under a plain "Pending:".
+        out = render.render_golden_all(avail, queues={"yisroel": []})
+        assert "    Pending:" in out and "carol: 4 GPU(s)" in out
+        assert "next first" not in out
+
+    def test_free_card_has_no_pending_section(self):
         from cli import render
         avail = Availability()
         avail.golden_by_qos["yisroel"] = {
             "rtx_6000": GPUAvailability("rtx_6000", 12, 4, 8, running=4, pending=0),
         }
         out = render.render_golden_all(avail, queues={"yisroel": []})
-        assert "Queue (ticket full" not in out
+        assert "Pending" not in out
 
     def test_overflow_truncates(self):
         from cli import render
         avail = self._avail_full()
         rows = [
-            {"job_id": str(1000 + i), "user": "u", "name": f"j{i}",
+            {"job_id": str(1000 + i), "user": f"u{i}", "name": f"j{i}",
              "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100}
             for i in range(20)
         ]
@@ -1414,13 +1447,13 @@ class TestRenderGoldenQueue:
         from cli import render
         avail = self._avail_full()
         rows = [
-            {"job_id": str(1000 + i), "user": "u", "name": f"j{i}",
+            {"job_id": str(1000 + i), "user": f"u{i}", "name": f"j{i}",
              "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100}
             for i in range(20)
         ]
         out = render.render_golden_all(avail, queues={"yisroel": rows}, limit=None)
         assert "more queued" not in out
-        assert "1019" in out  # the 20th row is present, not truncated
+        assert "u19: 1 GPU(s)" in out  # the 20th row is present, not truncated
 
 
 class TestWatchDashboard:

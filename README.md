@@ -43,8 +43,9 @@ flag (`--golden-only` on the CLI):
   Recommended for training you don't want evicted.
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
-waiting queue for that card in dispatch order (position, job id, user, job name)
-so you can see who is ahead of you.
+card's pending jobs in dispatch order — one `user: N GPU(s)` row per queued job
+(the same user can appear at several positions) — so you can see who is ahead of
+you.
 
 ## Installation
 
@@ -149,9 +150,9 @@ slurmx <subcommand> --help                 # per-subcommand options
 
 Run in a terminal, `slurmx status` opens a **live, scrollable** dashboard: your jobs in
 `squeue --me` format (full list, no truncation, so 30 queued jobs stay readable), then the
-golden tickets (with the full waiting queue) and cluster-wide GPU availability shown side
-by side. It auto-refreshes (default 5s, `-n/--interval N` to change) without losing your
-scroll position.
+golden tickets (pending listed by user in dispatch order) and cluster-wide GPU availability
+shown side by side. It auto-refreshes (default 5s, `-n/--interval N` to change) without
+losing your scroll position.
 
 Keys: `↑/↓` or `j/k` scroll, `PgUp/PgDn` page, `g/G` top/bottom, `←/→` or `h/l` pan, `q` quit.
 

@@ -18,11 +18,13 @@ def render_golden_all(avail: slurm_mcp.Availability,
     """One '=== Golden Tickets ({qos} QoS) ===' section per configured QoS.
 
     Iterates avail.golden_by_qos. If qos_filter is set, only that QoS is shown.
-    When a card's golden ticket is FULL (free==0) and `queues` carries that QoS's
-    pending queue (from slurm_mcp.golden_queues), the waiting line is listed in
-    scheduling order (position, job id, user, job name) so you can see who's ahead.
+    Each card lists Running (per user) and a single Pending block: when `queues`
+    carries that QoS's ordered waiting queue (from slurm_mcp.golden_queues, fetched
+    when the ticket is full), Pending is the queue in dispatch order, one
+    'user: N GPU(s)' row per queued job — so the same user can appear at several
+    positions. Otherwise it falls back to the per-user pending aggregate.
 
-    `limit` caps how many queued rows are listed per full card (default
+    `limit` caps how many queued rows are listed per card (default
     QUEUE_DISPLAY_LIMIT); pass None to list all of them (the scrollable TUI does
     this since it can page through the full queue).
     """
@@ -31,39 +33,43 @@ def render_golden_all(avail: slurm_mcp.Availability,
     for qos, gpus in avail.golden_by_qos.items():
         if qos_filter and qos != qos_filter:
             continue
-        lines = [f"=== Golden Tickets ({qos} QoS) ==="]
+        header = f"=== Golden Tickets ({qos} QoS) ==="
         qos_queue = queues.get(qos, [])
+        cards = []
         for name, g in gpus.items():
-            lines.append(
+            card = [
                 f"  {name}: {g.free}/{g.total} free "
                 f"({g.running} running, {g.pending} pending)"
-            )
+            ]
             if g.running_users:
-                lines.append("    Running:")
+                card.append("    Running:")
                 for user, count in sorted(g.running_users.items(), key=lambda x: -x[1]):
-                    lines.append(f"      {user}: {count} GPU(s)")
-            if g.pending_users:
-                lines.append("    Pending:")
+                    card.append(f"      {user}: {count} GPU(s)")
+            # Pending: the ordered waiting queue, one row per queued job in
+            # dispatch order (so a user can appear at several positions, e.g.
+            # itay: 3 / doron: 2 / itay: 1). Falls back to the per-user aggregate
+            # when the ordered queue isn't available (card not full, so
+            # golden_queues didn't fetch it). Never both.
+            waiting = [r for r in qos_queue if r.get("gpu_type") == name]
+            if waiting:
+                card.append(f"    Pending ({len(waiting)} waiting, next first):")
+                shown = waiting if limit is None else waiting[:limit]
+                for r in shown:
+                    card.append(f"      {r['user']}: {r['gpu_count']} GPU(s)")
+                if limit is not None and len(waiting) > limit:
+                    card.append(f"      ... and {len(waiting) - limit} more queued")
+            elif g.pending_users:
+                card.append("    Pending:")
                 for user, count in sorted(g.pending_users.items(), key=lambda x: -x[1]):
-                    lines.append(f"      {user}: {count} GPU(s)")
-            # Ticket full -> show the actual waiting line (dispatch order).
-            if g.free == 0:
-                waiting = [r for r in qos_queue if r.get("gpu_type") == name]
-                if waiting:
-                    lines.append(
-                        f"    Queue (ticket full — {len(waiting)} waiting, next first):"
-                    )
-                    shown = waiting if limit is None else waiting[:limit]
-                    for i, r in enumerate(shown, 1):
-                        lines.append(
-                            f"      {i:>3}. {r['job_id']:<11} "
-                            f"{r['user']:<12} {r['name']}"
-                        )
-                    if limit is not None and len(waiting) > limit:
-                        lines.append(
-                            f"      ... and {len(waiting) - limit} more queued"
-                        )
-        sections.append("\n".join(lines))
+                    card.append(f"      {user}: {count} GPU(s)")
+            cards.append("\n".join(card))
+        # One blank line between adjacent cards (e.g. rtx_pro_6000 vs rtx_6000)
+        # so the two ticket types read as distinct blocks under the QoS header.
+        # No blank before the first card and no trailing blank; the gap lands
+        # deep in the golden block (past the short cluster column), so the TUI's
+        # _side_by_side stays aligned.
+        body = "\n\n".join(cards)
+        sections.append(f"{header}\n{body}" if body else header)
     return "\n\n".join(sections)
 
 
