@@ -109,6 +109,7 @@ def submit_remote_session_job(
     workdir=None,
     resume=None,
     gpu_type=None,
+    golden_only=False,
 ):
     """Submit a `claude remote-control` server as a SLURM job.
 
@@ -128,6 +129,9 @@ def submit_remote_session_job(
         vram_gb: VRAM requirement when hardware="gpu" and gpu_type is None
             (default 24). Falls back to slurm_mcp.select_gpu's
             "smallest-fitting, golden-preferred" logic.
+        golden_only: Force qos=yisroel on the card's dedicated golden partition
+            (preemption-immune); never fall back to the preemptible main pool.
+            Ignored for hardware="cpu".
         workdir: Working directory (default: cwd).
         resume: Session ID to resume from a previous Claude Code chat.
             None starts a fresh session. The resume path uses the
@@ -196,14 +200,21 @@ def submit_remote_session_job(
                     f"Valid: {sorted(GPU_BY_NAME)}"
                 )
             gpu_info = GPU_BY_NAME[gpu_type]
-            if gpu_info.golden_quota > 0 and gpu_info.golden_partition:
+            if golden_only:
+                if not gpu_info.golden_partition:
+                    raise RuntimeError(
+                        f"golden_only=True but {gpu_type} has no golden partition."
+                    )
+                partition = gpu_info.golden_partition
+                qos = PRIMARY_QOS
+            elif gpu_info.golden_quota > 0 and gpu_info.golden_partition:
                 partition = gpu_info.golden_partition
                 qos = PRIMARY_QOS
             else:
                 partition = "main"
                 qos = "normal"
         else:
-            sel = selection.select_gpu(vram_gb)
+            sel = selection.select_gpu(vram_gb, golden_only=golden_only)
             if sel is None:
                 raise RuntimeError(
                     f"No GPU with >= {vram_gb}GB VRAM is currently available."
@@ -329,6 +340,9 @@ def add_arguments(parser):
     parser.add_argument("--vram-gb", type=int, default=None,
                         help="VRAM fallback when --hardware=gpu and --gpu-type "
                              "is not specified (default 24)")
+    parser.add_argument("--golden-only", action="store_true",
+                        help="Force qos=yisroel on the card's dedicated golden "
+                             "partition (preemption-immune); never fall back to main.")
     parser.add_argument("--permission-mode", choices=VALID_PERMISSION_MODES,
                         default=None,
                         help="default | acceptEdits | plan (prompted if omitted)")
@@ -357,6 +371,7 @@ def run(args):
         permission_mode=args.permission_mode,
         gpu_type=args.gpu_type,
         vram_gb=vram_gb,
+        golden_only=args.golden_only,
         workdir=args.workdir,
         resume=args.resume,
     )

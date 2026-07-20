@@ -117,7 +117,8 @@ def cluster_summary(
 
     if view in ("full", "gpu"):
         avail = slurm_mcp.check_availability()
-        golden = render.render_golden_all(avail, qos_filter=qos)
+        queues = slurm_mcp.golden_queues(avail, qos_filter=qos)
+        golden = render.render_golden_all(avail, qos_filter=qos, queues=queues)
         if golden:
             parts.append(golden)
         parts.append(render.render_cluster_wide(avail))
@@ -269,6 +270,7 @@ def submit_job(
     workdir: str | None = None,
     output_dir: str = "logs",
     gpu_type: str | None = None,
+    golden_only: bool = False,
     dependency: str | None = None,
     dry_run: bool = False,
 ) -> str:
@@ -279,6 +281,13 @@ def submit_job(
     Multi-GPU: Set num_gpus=2 for multi-GPU jobs (max 2 per cluster policy).
     Uses --gres=gpu:TYPE:N and --nodes=1 to ensure GPUs are on the same node.
     For multi-GPU training, use torchrun: 'torchrun --nproc_per_node=2 train.py'.
+
+    Golden vs main pool: by default a job is placed golden-first (qos=yisroel on
+    the card's dedicated partition, preemption-immune) then falls back to the
+    preemptible main pool if the golden ticket is full. Set golden_only=true to
+    force the golden ticket and NEVER accept a preemptible slot — the job queues
+    on the golden partition until a slot frees. Recommended for training you don't
+    want evicted.
 
     Maintenance: Job time limits are automatically capped to finish before scheduled
     maintenance windows. Submissions are blocked if <5 min remain before a window.
@@ -291,6 +300,10 @@ def submit_job(
         workdir: Working directory on compute node.
         output_dir: Directory for SLURM logs (default: 'logs').
         gpu_type: Force a specific GPU type (e.g. 'rtx_pro_6000').
+        golden_only: If true, force qos=yisroel on the card's dedicated golden
+            partition (preemption-immune) and never fall back to the preemptible
+            main pool — the job stays queued if golden is full. Ignored for CPU
+            jobs. Default false (golden-first, then main).
         dependency: Job dependency (e.g. 'afterok:12345').
         dry_run: If true, preview the script without submitting.
     """
@@ -302,6 +315,7 @@ def submit_job(
         workdir=workdir,
         output_dir=output_dir,
         gpu_type=gpu_type,
+        golden_only=golden_only,
         dependency=dependency,
         wait_until_running=not dry_run,  # don't block on dry runs
         dry_run=dry_run,
@@ -432,6 +446,7 @@ def launch_remote_session(
         "rtx_6000", "rtx_pro_6000",
     ] | None = None,
     vram_gb: int = 24,
+    golden_only: bool = False,
     workdir: str | None = None,
     resume: str | None = None,
     wait_url_seconds: int = 90,
@@ -494,6 +509,9 @@ def launch_remote_session(
             Takes precedence over vram_gb.
         vram_gb: VRAM fallback when gpu_type is None (default 24).
             Triggers "smallest fitting golden" auto-selection.
+        golden_only: If true, force qos=yisroel on the card's dedicated golden
+            partition (preemption-immune) and never fall back to the preemptible
+            main pool. Ignored for hardware="cpu". Default false.
         workdir: Working directory (default: cwd).
         resume: Optional session ID to resume from a previous Claude Code
             chat. Find session IDs in the claude.ai/code session list.
@@ -517,7 +535,8 @@ def launch_remote_session(
             name=name, hardware=hardware, days=days,
             permission_mode=permission_mode,
             gpu_type=gpu_type,
-            vram_gb=vram_gb, workdir=workdir, resume=resume,
+            vram_gb=vram_gb, golden_only=golden_only,
+            workdir=workdir, resume=resume,
         )
     except (RuntimeError, MaintenanceWindowError) as e:
         return f"Failed: {e}"

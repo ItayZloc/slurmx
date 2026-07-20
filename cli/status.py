@@ -35,7 +35,8 @@ def render_squeue_me() -> str:
 def render_dashboard(qos: str | None = None) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     avail = slurm_mcp.check_availability()
-    golden = render.render_golden_all(avail, qos_filter=qos)
+    queues = slurm_mcp.golden_queues(avail, qos_filter=qos)
+    golden = render.render_golden_all(avail, qos_filter=qos, queues=queues)
     cluster = render.render_cluster_wide(avail)
     parts = [
         f"slurmx status — {ts}",

@@ -9,7 +9,7 @@ After install (`./setup.sh` or `slurmx setup`), see [WELCOME.md](WELCOME.md) for
 | Tool | Description |
 |------|-------------|
 | `cluster_summary` | Single-call dashboard: your jobs + golden tickets (per QoS) + cluster-wide GPU availability. `view="jobs"` or `"gpu"` narrows the output. |
-| `submit_job` | Submit GPU/CPU jobs (auto-selects GPU by VRAM) |
+| `submit_job` | Submit GPU/CPU jobs (auto-selects GPU by VRAM). `golden_only=true` forces a preemption-immune golden slot. |
 | `select_gpu` | Recommend best GPU for a VRAM requirement |
 | `job_history` | Show recent completed/failed jobs (via sacct) |
 | `get_job_status` | Get detailed status of a specific job |
@@ -17,7 +17,34 @@ After install (`./setup.sh` or `slurmx setup`), see [WELCOME.md](WELCOME.md) for
 | `read_job_log` | Read SLURM log file for a job |
 | `diagnose_job` | Classify job failures (OOM, timeout, missing module, code error) |
 | `cancel_jobs` | Cancel jobs by ID or all |
-| `launch_remote_session` | Spawn `claude remote-control` as a SLURM job. Required: `hardware` (cpu/gpu), `days` (1/2/3/7), `permission_mode` (default/acceptEdits/plan). For gpu, also asks the user for `gpu_type` (gtx_1080…rtx_pro_6000). Polls the SLURM log and returns the `claude.ai/code/session_<id>` URL inline (default 90s wait; `wait_url_seconds=0` to skip). |
+| `launch_remote_session` | Spawn `claude remote-control` as a SLURM job. Required: `hardware` (cpu/gpu), `days` (1/2/3/7), `permission_mode` (default/acceptEdits/plan). For gpu, also asks the user for `gpu_type` (gtx_1080…rtx_pro_6000) and takes `golden_only`. Polls the SLURM log and returns the `claude.ai/code/session_<id>` URL inline (default 90s wait; `wait_url_seconds=0` to skip). |
+
+## Golden tickets (preemption) vs the main pool
+
+On this cluster a job's **QoS**, not its card type, decides whether it can be
+evicted. `qos=normal` (partition `main`/`gpu`) is the shared pool — everyone can
+use it, but a job there is **preemptible**: any group's golden QoS can requeue it.
+Your golden QoS (e.g. `yisroel`) runs on the per-card dedicated partitions
+(`rtx_pro_6000`, `rtx6000`, `rtx4090`, …) and is **preemption-immune** — it bumps
+`normal` jobs and nothing bumps it. A golden QoS is invalid on `main`/`gpu`, so
+"golden" always means a dedicated partition.
+
+`submit_job` / `launch_remote_session` / `slurmx submit` take a **`golden_only`**
+flag (`--golden-only` on the CLI):
+
+- **default (`golden_only=false`)** — golden-first on the cards you own
+  (`golden_quota > 0`), then fall back to the preemptible main pool if golden is
+  full. Unchanged behavior.
+- **`golden_only=true`** — force `qos=yisroel` on the card's dedicated partition
+  and **never** accept a preemptible slot. If the golden ticket is full the job
+  waits in the golden queue and starts automatically when a slot frees (it is not
+  downgraded). Works on every card, including the smaller ones the group doesn't
+  own (`golden_quota=0`) — those then preempt other groups' `normal` jobs there.
+  Recommended for training you don't want evicted.
+
+When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
+waiting queue for that card in dispatch order (position, job id, user, job name)
+so you can see who is ahead of you.
 
 ## Installation
 
@@ -106,8 +133,9 @@ The server embeds usage rules that Claude reads automatically. Ask naturally:
 
 ```bash
 slurmx --help                              # list subcommands
-slurmx status                              # one-shot SLURM dashboard
-slurmx submit --vram 48 -- python train.py # submit a job
+slurmx status                              # one-shot SLURM dashboard (+ golden queue when full)
+slurmx submit --vram 48 -- python train.py # submit a job (golden-first, main fallback)
+slurmx submit --vram 48 --golden-only -- python train.py  # preemption-immune, never main
 slurmx remote-session                      # interactive launch_remote_session
 slurmx rc                                  # short alias for remote-session
 slurmx setup                               # = ./setup.sh

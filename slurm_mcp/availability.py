@@ -149,3 +149,67 @@ def check_availability() -> Availability:
         )
 
     return avail
+
+
+def golden_queue(qos: str) -> list[dict]:
+    """Pending jobs on `qos`, in scheduling order (priority desc, then job id).
+
+    Each row: {priority, job_id, user, name, gpu_type, gpu_count}. Lets the
+    status view show who/what is ahead in line when a golden ticket is full.
+    Order matches SLURM's dispatch order: higher priority first, then lower
+    (older) job id — so row 1 is next to run.
+    """
+    raw = shell._run_quiet([
+        "squeue", "--qos", qos, "-t", "PENDING", "-h", "-o", "%Q|%i|%u|%b|%j",
+    ])
+
+    rows = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("|")
+        if len(parts) < 5:
+            continue
+        prio_s, job_id, user, gres = parts[0], parts[1], parts[2], parts[3]
+        name = "|".join(parts[4:])  # job names may themselves contain '|'
+
+        gpu_type, gpu_count = "", 0
+        m = re.search(r"gpu:([^:,]+):(\d+)", gres)
+        if m:
+            gpu_type, gpu_count = m.group(1), int(m.group(2))
+
+        try:
+            prio = int(prio_s)
+        except ValueError:
+            prio = 0
+
+        rows.append({
+            "priority": prio,
+            "job_id": job_id.strip(),
+            "user": user.strip(),
+            "name": name.strip(),
+            "gpu_type": gpu_type,
+            "gpu_count": gpu_count,
+        })
+
+    def _order_key(r):
+        # Sort by priority desc, then job id asc. Handles array ids ("123_4").
+        m = re.match(r"(\d+)(?:_(\d+))?", r["job_id"])
+        jid = (int(m.group(1)), int(m.group(2) or 0)) if m else (0, 0)
+        return (-r["priority"], jid)
+
+    rows.sort(key=_order_key)
+    return rows
+
+
+def golden_queues(avail: Availability, qos_filter: str | None = None) -> dict:
+    """{qos -> ordered pending rows} for every golden QoS with at least one FULL
+    card (free==0). Returns {} when nothing is full, so no squeue call is made
+    in the common case where golden tickets are available."""
+    result = {}
+    for qos, gpus in avail.golden_by_qos.items():
+        if qos_filter and qos != qos_filter:
+            continue
+        if any(g.free == 0 for g in gpus.values()):
+            result[qos] = golden_queue(qos)
+    return result

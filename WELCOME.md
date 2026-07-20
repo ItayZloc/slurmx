@@ -10,7 +10,9 @@ WHAT IT DOES
 
 MCP TOOLS (invoked by Claude in chat)
   cluster_summary          your jobs + golden + cluster-wide GPU view
-  submit_job               submit GPU/CPU jobs (auto-selects GPU by VRAM)
+                           (lists the waiting queue when a golden ticket is full)
+  submit_job               submit GPU/CPU jobs (auto-selects GPU by VRAM;
+                           golden_only=true forces a preemption-immune slot)
   select_gpu               recommend a GPU for a VRAM requirement
   get_job_status           detailed status of a specific job
   wait_for_job             block until a job finishes

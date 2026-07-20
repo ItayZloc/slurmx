@@ -114,6 +114,36 @@ def test_unknown_gpu_type_rejected():
 
 @patch("slurm_mcp.remote_session.os.makedirs")
 @patch("slurm_mcp.remote_session.subprocess.run", side_effect=_ok_sbatch_run)
+def test_golden_only_small_card_routes_to_dedicated_partition(mock_run, _mock_mkdir):
+    """golden_only=True on a non-owned card (rtx_4090, quota 0) still forces the
+    dedicated golden partition + primary QoS — preemption-immune."""
+    remote_session.submit_remote_session_job(
+        name="golden-small", hardware="gpu", days=1,
+        gpu_type="rtx_4090", golden_only=True,
+    )
+    args = mock_run.call_args[0][0]
+    assert "--gres=gpu:rtx_4090:1" in args
+    assert "--partition=rtx4090" in args
+    assert "--qos=yisroel" in args
+
+
+@patch("slurm_mcp.remote_session.selection.select_gpu",
+       return_value=("rtx_3090", "rtx3090", "yisroel"))
+@patch("slurm_mcp.remote_session.os.makedirs")
+@patch("slurm_mcp.remote_session.subprocess.run", side_effect=_ok_sbatch_run)
+def test_golden_only_auto_select_passes_flag(mock_run, _mock_mkdir, mock_select):
+    """golden_only propagates into select_gpu when gpu_type is omitted."""
+    remote_session.submit_remote_session_job(
+        name="golden-auto", hardware="gpu", days=1, vram_gb=24, golden_only=True,
+    )
+    mock_select.assert_called_once_with(24, golden_only=True)
+    args = mock_run.call_args[0][0]
+    assert "--partition=rtx3090" in args
+    assert "--qos=yisroel" in args
+
+
+@patch("slurm_mcp.remote_session.os.makedirs")
+@patch("slurm_mcp.remote_session.subprocess.run", side_effect=_ok_sbatch_run)
 def test_wrap_command_uses_remote_control_server_mode(mock_run, _mock_mkdir):
     remote_session.submit_remote_session_job(
         name="myproj", hardware="cpu", days=1,
@@ -250,7 +280,7 @@ def _make_cli_args(**overrides):
     import argparse
     ns = argparse.Namespace(
         name=None, hardware=None, days=None, vram_gb=None, gpu_type=None,
-        permission_mode=None, workdir=None, resume=None,
+        permission_mode=None, workdir=None, resume=None, golden_only=False,
     )
     for k, v in overrides.items():
         setattr(ns, k, v)

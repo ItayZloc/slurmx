@@ -19,7 +19,7 @@ from .gpu_catalog import (
     GPU_TYPES, GPU_BY_NAME, GPU_TYPES_BY_QOS, PRIMARY_QOS,
 )
 from .shell import _run, _run_quiet
-from .availability import check_availability
+from .availability import check_availability, golden_queue, golden_queues
 from .selection import select_gpu
 from .submission import (
     submit_job, _build_sbatch_script, _wait_for_running,

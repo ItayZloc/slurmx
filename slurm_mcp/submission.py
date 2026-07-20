@@ -98,11 +98,18 @@ def _build_sbatch_script(
     return "\n".join(lines)
 
 
-def _wait_for_running(job_result: JobResult, timeout: int) -> tuple[JobResult, str]:
+def _wait_for_running(
+    job_result: JobResult, timeout: int, golden_only: bool = False,
+) -> tuple[JobResult, str]:
     """
     Poll a submitted job until it reaches RUNNING state or hits an issue.
 
     Outcomes: "running", "finished", "fatal", "quota", "user_quota", "still_pending".
+
+    When golden_only=True, quota-limit reasons (golden partition full) do NOT
+    cancel the job — it is left queued and reported as "still_pending" so it
+    starts automatically when a golden slot frees. Unrecoverable reasons
+    (e.g. InvalidQOS) still cancel as usual.
     """
     poll_interval = 5
     start = time.time()
@@ -133,7 +140,7 @@ def _wait_for_running(job_result: JobResult, timeout: int) -> tuple[JobResult, s
             )
             return job_result, "fatal"
 
-        if status.reason in _USER_QUOTA_REASONS:
+        if status.reason in _USER_QUOTA_REASONS and not golden_only:
             shell._run_quiet(["scancel", str(job_result.job_id)])
             job_result.success = False
             job_result.message = (
@@ -144,7 +151,7 @@ def _wait_for_running(job_result: JobResult, timeout: int) -> tuple[JobResult, s
             )
             return job_result, "user_quota"
 
-        if status.reason in _QOS_QUOTA_REASONS:
+        if status.reason in _QOS_QUOTA_REASONS and not golden_only:
             shell._run_quiet(["scancel", str(job_result.job_id)])
             job_result.success = False
             job_result.message = (
@@ -216,6 +223,7 @@ def submit_job(
     output_dir: str = "logs",
     gpu_type: Optional[str] = None,
     qos: Optional[str] = None,
+    golden_only: bool = False,
     dependency: Optional[str] = None,
     wait_until_running: bool = True,
     dry_run: bool = False,
@@ -235,6 +243,12 @@ def submit_job(
         output_dir: Directory for SLURM log files (default: "logs")
         gpu_type: Override automatic GPU selection
         qos: Override automatic QoS selection
+        golden_only: If True, force the golden ticket — qos=yisroel on the card's
+            dedicated per-GPU partition (preemption-immune) — and NEVER fall back
+            to the preemptible main pool. The job is left queued if the golden
+            partition is saturated (starts automatically as slots free) instead of
+            being downgraded. Overrides `qos`. Ignored for CPU jobs (vram_gb=0).
+            (default: False = golden-first, then main.)
         dependency: Job dependency expression (e.g., "afterok:12345")
         wait_until_running: If True, poll until the job reaches RUNNING state.
             On quota limits (e.g., golden tickets full), auto-cancels and
@@ -254,8 +268,10 @@ def submit_job(
         return JobResult(False, None, "", "", "",
                          f"num_gpus={num_gpus} exceeds cluster limit of 2 GPUs per job.", "")
 
-    # CPU-only job (vram_gb=0)
-    if vram_gb == 0:
+    # CPU-only job (vram_gb=0 and no explicit GPU requested). An explicit
+    # gpu_type means the caller wants that card even if vram_gb was left at 0,
+    # so fall through to the GPU path in that case.
+    if vram_gb == 0 and not gpu_type:
         selected_gpu = ""
         selected_partition = _CPU_PARTITION
         selected_qos = _CPU_QOS
@@ -304,21 +320,29 @@ def submit_job(
                              f"{gpu_type} has {gpu_info.vram_gb}GB VRAM, "
                              f"but {vram_gb}GB requested", "")
 
-        if qos:
-            selected_qos = qos
-        elif gpu_info.golden_quota > 0:
+        if golden_only:
+            if not gpu_info.golden_partition:
+                return JobResult(False, None, gpu_type, "", "",
+                                 f"golden_only=True but {gpu_type} has no golden "
+                                 f"partition configured.", "")
             selected_qos = PRIMARY_QOS
-        else:
-            selected_qos = "normal"
-
-        if selected_qos == PRIMARY_QOS and gpu_info.golden_partition:
             selected_partition = gpu_info.golden_partition
         else:
-            selected_partition = "main"
+            if qos:
+                selected_qos = qos
+            elif gpu_info.golden_quota > 0:
+                selected_qos = PRIMARY_QOS
+            else:
+                selected_qos = "normal"
+
+            if selected_qos == PRIMARY_QOS and gpu_info.golden_partition:
+                selected_partition = gpu_info.golden_partition
+            else:
+                selected_partition = "main"
 
         selected_gpu = gpu_type
     else:
-        sel = selection.select_gpu(vram_gb)
+        sel = selection.select_gpu(vram_gb, golden_only=golden_only)
         if sel is None:
             capable_gpus = [g for g in GPU_TYPES if g.vram_gb >= vram_gb]
             if not capable_gpus:
@@ -343,7 +367,7 @@ def submit_job(
 
         selected_gpu, selected_partition, selected_qos = sel
 
-    if qos and not gpu_type:
+    if qos and not gpu_type and not golden_only:
         selected_qos = qos
         gpu_info = GPU_BY_NAME[selected_gpu]
         if selected_qos == PRIMARY_QOS and gpu_info.golden_partition:
@@ -382,12 +406,14 @@ def submit_job(
         return job_result
 
     if wait_until_running and job_result.job_id is not None:
-        job_result, outcome = _wait_for_running(job_result, START_TIMEOUT)
+        job_result, outcome = _wait_for_running(
+            job_result, START_TIMEOUT, golden_only=golden_only,
+        )
 
         if outcome == "user_quota":
             return job_result
 
-        if outcome == "quota" and selected_qos == PRIMARY_QOS:
+        if outcome == "quota" and selected_qos == PRIMARY_QOS and not golden_only:
             fallback_script = _build_sbatch_script(
                 cmd=cmd, partition="main", qos="normal",
                 gpu_type=selected_gpu, num_gpus=num_gpus,

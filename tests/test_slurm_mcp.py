@@ -113,9 +113,20 @@ class TestGPUDefinitions:
         assert GPU_BY_NAME["rtx_6000"].golden_partition == "rtx6000"
 
     def test_non_golden_have_no_quota(self):
-        for name in ("rtx_4090", "rtx_3090", "rtx_2080", "gtx_1080"):
+        # The four smaller cards are not owned (quota 0) but DO carry a dedicated
+        # golden partition so golden_only=True can still force-target them.
+        expected_partition = {
+            "rtx_4090": "rtx4090", "rtx_3090": "rtx3090",
+            "rtx_2080": "rtx2080", "gtx_1080": "gtx1080",
+        }
+        for name, part in expected_partition.items():
             assert GPU_BY_NAME[name].golden_quota == 0
-            assert GPU_BY_NAME[name].golden_partition is None
+            assert GPU_BY_NAME[name].golden_partition == part
+
+    def test_all_cards_have_golden_partition(self):
+        # Every card is golden_only-targetable.
+        for g in GPU_TYPES:
+            assert g.golden_partition, f"{g.name} missing golden_partition"
 
 
 # ============================================================
@@ -425,6 +436,35 @@ class TestSelectGPUMocked:
         assert result == ("rtx_6000", "rtx6000", "yisroel")
 
 
+class TestSelectGPUGoldenOnly:
+    """golden_only=True forces a dedicated golden partition, no availability check."""
+
+    def test_golden_only_48gb(self):
+        assert select_gpu(48, golden_only=True) == ("rtx_6000", "rtx6000", "yisroel")
+
+    def test_golden_only_96gb(self):
+        assert select_gpu(96, golden_only=True) == (
+            "rtx_pro_6000", "rtx_pro_6000", "yisroel",
+        )
+
+    def test_golden_only_24gb_targets_small_card_partition(self):
+        gpu, part, qos = select_gpu(24, golden_only=True)
+        assert gpu in ("rtx_3090", "rtx_4090")
+        assert part in ("rtx3090", "rtx4090")
+        assert qos == "yisroel"
+
+    def test_golden_only_does_not_query_availability(self):
+        # golden_only must return BEFORE calling check_availability.
+        with patch("slurm_mcp.availability.check_availability",
+                   side_effect=AssertionError("should not be called")):
+            gpu, part, qos = select_gpu(8, golden_only=True)
+        assert qos == "yisroel"
+        assert part == "gtx1080"
+
+    def test_golden_only_impossible_vram(self):
+        assert select_gpu(200, golden_only=True) is None
+
+
 # ============================================================
 # Unit Tests: _build_sbatch_script
 # ============================================================
@@ -639,6 +679,58 @@ class TestSubmitJobMocked:
         result = submit_job(cmd="echo hi", vram_gb=8, wait_until_running=False)
         assert result.success is False
         assert "invalid partition" in result.message
+
+
+# ============================================================
+# Unit Tests: submit_job golden_only (mocked)
+# ============================================================
+
+class TestSubmitJobGoldenOnly:
+    """golden_only=True: force qos=yisroel + dedicated partition, never main."""
+
+    def test_golden_only_96gb_forces_pro_partition(self):
+        result = submit_job(cmd="python train.py", vram_gb=96,
+                            golden_only=True, dry_run=True)
+        assert result.success is True
+        assert result.gpu_type == "rtx_pro_6000"
+        assert result.partition == "rtx_pro_6000"
+        assert result.qos == "yisroel"
+        assert "#SBATCH --partition rtx_pro_6000" in result.sbatch_script
+        assert "#SBATCH --qos=yisroel" in result.sbatch_script
+
+    def test_golden_only_48gb(self):
+        result = submit_job(cmd="python train.py", vram_gb=48,
+                            golden_only=True, dry_run=True)
+        assert result.partition == "rtx6000"
+        assert result.qos == "yisroel"
+
+    def test_golden_only_24gb_small_card(self):
+        result = submit_job(cmd="python train.py", vram_gb=24,
+                            golden_only=True, dry_run=True)
+        assert result.gpu_type in ("rtx_3090", "rtx_4090")
+        assert result.partition in ("rtx3090", "rtx4090")
+        assert result.qos == "yisroel"
+
+    def test_golden_only_explicit_small_card(self):
+        result = submit_job(cmd="python train.py", vram_gb=24, gpu_type="rtx_4090",
+                            golden_only=True, dry_run=True)
+        assert result.gpu_type == "rtx_4090"
+        assert result.partition == "rtx4090"
+        assert result.qos == "yisroel"
+
+    def test_golden_only_overrides_qos_arg(self):
+        # golden_only wins over an explicit qos override.
+        result = submit_job(cmd="python x.py", vram_gb=48, gpu_type="rtx_6000",
+                            qos="normal", golden_only=True, dry_run=True)
+        assert result.qos == "yisroel"
+        assert result.partition == "rtx6000"
+
+    def test_golden_only_ignored_for_cpu(self):
+        result = submit_job(cmd="echo hi", vram_gb=0,
+                            golden_only=True, dry_run=True)
+        assert result.success is True
+        assert result.partition == "cpu"
+        assert result.qos == "normal"
 
 
 # ============================================================
@@ -1134,19 +1226,182 @@ class TestWaitForRunningMocked:
         assert result.success is True
         assert result.job_id == 12345
 
+    @patch("slurm_mcp.submission.time.time")
+    @patch("slurm_mcp.submission.time.sleep")
+    @patch("slurm_mcp.monitoring.get_job_status")
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_golden_only_quota_does_not_cancel(self, mock_rq, mock_status, mock_sleep, mock_time):
+        """golden_only=True: a quota reason leaves the job queued (no scancel)."""
+        mock_time.side_effect = [0, 301]  # start, past timeout
+        mock_status.return_value = JobStatus(
+            job_id=12345, state="PENDING", reason="QOSMaxGRESPerAccount",
+        )
+        result, outcome = _wait_for_running(
+            self._make_job_result(), timeout=300, golden_only=True,
+        )
+        assert outcome == "still_pending"
+        assert result.success is True
+        mock_rq.assert_not_called()  # never scancel a golden_only job for quota
+
+    @patch("slurm_mcp.shell._run")
+    @patch("slurm_mcp.submission.time.time")
+    @patch("slurm_mcp.submission.time.sleep")
+    @patch("slurm_mcp.monitoring.get_job_status")
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_submit_job_golden_only_no_fallback(self, mock_rq, mock_status, mock_sleep, mock_time, mock_run):
+        """golden_only=True: golden quota full -> stays queued, NO normal fallback."""
+        mock_time.side_effect = [0, 301]
+        mock_run.return_value = "Submitted batch job 12345\n"
+        mock_status.return_value = JobStatus(
+            job_id=12345, state="PENDING", reason="QOSMaxGRESPerAccount",
+        )
+        result = submit_job(
+            cmd="python train.py", vram_gb=48, golden_only=True,
+            wait_until_running=True,
+        )
+        assert result.qos == "yisroel"
+        assert result.partition == "rtx6000"
+        assert result.job_id == 12345
+        assert mock_run.call_count == 1  # golden only, no fallback resubmit
+
+
+# ============================================================
+# Unit Tests: golden_queue + golden_queues + render (mocked)
+# ============================================================
+
+class TestGoldenQueue:
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_parses_and_orders(self, mock_rq):
+        # squeue -o "%Q|%i|%u|%b|%j": priority|jobid|user|gres|name
+        mock_rq.return_value = (
+            "100|20000002|alice|gres/gpu:rtx_6000:1|job-b\n"
+            "100|20000001|alice|gres/gpu:rtx_6000:1|job-a\n"
+            "200|20000005|bob|gres/gpu:rtx_pro_6000:2|big-job\n"
+        )
+        q = slurm_mcp.golden_queue("yisroel")
+        # bob (priority 200) first; then alice's two by ascending job id.
+        assert [r["job_id"] for r in q] == ["20000005", "20000001", "20000002"]
+        assert q[0]["user"] == "bob"
+        assert q[0]["gpu_type"] == "rtx_pro_6000"
+        assert q[0]["gpu_count"] == 2
+        assert q[1]["name"] == "job-a"
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_job_name_may_contain_pipe(self, mock_rq):
+        mock_rq.return_value = "100|20000001|alice|gres/gpu:rtx_6000:1|weird|name\n"
+        q = slurm_mcp.golden_queue("yisroel")
+        assert q[0]["name"] == "weird|name"
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_array_task_ids_order(self, mock_rq):
+        mock_rq.return_value = (
+            "100|123_2|u|gres/gpu:rtx_6000:1|a\n"
+            "100|123_1|u|gres/gpu:rtx_6000:1|b\n"
+        )
+        q = slurm_mcp.golden_queue("yisroel")
+        assert [r["job_id"] for r in q] == ["123_1", "123_2"]
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_empty(self, mock_rq):
+        mock_rq.return_value = ""
+        assert slurm_mcp.golden_queue("yisroel") == []
+
+
+class TestGoldenQueues:
+    def test_only_fetches_when_a_card_is_full(self):
+        avail = Availability()
+        avail.golden_by_qos["yisroel"] = {
+            "rtx_6000": GPUAvailability("rtx_6000", 12, 12, 0),          # full
+            "rtx_pro_6000": GPUAvailability("rtx_pro_6000", 16, 12, 4),  # free
+        }
+        with patch("slurm_mcp.availability.golden_queue",
+                   return_value=[{"job_id": "1"}]) as gq:
+            out = slurm_mcp.golden_queues(avail)
+        gq.assert_called_once_with("yisroel")
+        assert out["yisroel"] == [{"job_id": "1"}]
+
+    def test_no_fetch_when_nothing_full(self):
+        avail = Availability()
+        avail.golden_by_qos["yisroel"] = {
+            "rtx_6000": GPUAvailability("rtx_6000", 12, 4, 8),  # free
+        }
+        with patch("slurm_mcp.availability.golden_queue") as gq:
+            out = slurm_mcp.golden_queues(avail)
+        assert out == {}
+        gq.assert_not_called()
+
+    def test_qos_filter(self):
+        avail = Availability()
+        avail.golden_by_qos["yisroel"] = {
+            "rtx_6000": GPUAvailability("rtx_6000", 12, 12, 0),
+        }
+        avail.golden_by_qos["other"] = {
+            "rtx_6000": GPUAvailability("rtx_6000", 4, 4, 0),
+        }
+        with patch("slurm_mcp.availability.golden_queue", return_value=[]) as gq:
+            out = slurm_mcp.golden_queues(avail, qos_filter="yisroel")
+        assert set(out.keys()) == {"yisroel"}
+        gq.assert_called_once_with("yisroel")
+
+
+class TestRenderGoldenQueue:
+    def _avail_full(self):
+        avail = Availability()
+        avail.golden_by_qos["yisroel"] = {
+            "rtx_6000": GPUAvailability(
+                "rtx_6000", 12, 12, 0, running=12, pending=2,
+            ),
+        }
+        return avail
+
+    def test_full_card_lists_queue_in_order(self):
+        from cli import render
+        avail = self._avail_full()
+        queues = {"yisroel": [
+            {"job_id": "1001", "user": "alice", "name": "train-a",
+             "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100},
+            {"job_id": "1002", "user": "bob", "name": "train-b",
+             "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100},
+        ]}
+        out = render.render_golden_all(avail, queues=queues)
+        assert "Queue (ticket full" in out
+        assert "1001" in out and "alice" in out and "train-a" in out
+        assert out.index("train-a") < out.index("train-b")  # position order
+
+    def test_free_card_has_no_queue_section(self):
+        from cli import render
+        avail = Availability()
+        avail.golden_by_qos["yisroel"] = {
+            "rtx_6000": GPUAvailability("rtx_6000", 12, 4, 8, running=4, pending=0),
+        }
+        out = render.render_golden_all(avail, queues={"yisroel": []})
+        assert "Queue (ticket full" not in out
+
+    def test_overflow_truncates(self):
+        from cli import render
+        avail = self._avail_full()
+        rows = [
+            {"job_id": str(1000 + i), "user": "u", "name": f"j{i}",
+             "gpu_type": "rtx_6000", "gpu_count": 1, "priority": 100}
+            for i in range(20)
+        ]
+        out = render.render_golden_all(avail, queues={"yisroel": rows})
+        assert "and 5 more queued" in out  # 20 - QUEUE_DISPLAY_LIMIT(15)
+
 
 # ============================================================
 # Unit Tests: CLI --json output
 # ============================================================
 
 class TestCLIJsonOutput:
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_json_dry_run(self, mock_select):
-        mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
+    def test_json_dry_run(self):
+        # Pin --gpu-type so the result is deterministic — the subprocess can't
+        # see a mocked select_gpu, and live golden availability shifts underfoot.
         import subprocess
         result = subprocess.run(
             [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--vram", "48", "--dry-run", "--json", "--", "python", "train.py"],
+             "--gpu-type", "rtx_6000", "--vram", "48", "--dry-run", "--json",
+             "--", "python", "train.py"],
             capture_output=True, text=True, timeout=10,
         )
         assert result.returncode == 0
@@ -1155,6 +1410,21 @@ class TestCLIJsonOutput:
         assert data["success"] is True
         assert data["gpu_type"] == "rtx_6000"
         assert "sbatch_script" in data
+
+    def test_json_golden_only(self):
+        """--golden-only forces the dedicated partition + yisroel QoS."""
+        import subprocess, json
+        result = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
+             "--gpu-type", "rtx_4090", "--vram", "24", "--golden-only",
+             "--dry-run", "--json", "--", "python", "train.py"],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert data["success"] is True
+        assert data["partition"] == "rtx4090"
+        assert data["qos"] == "yisroel"
 
 
 # ============================================================

@@ -7,18 +7,27 @@ import re
 
 import slurm_mcp
 
+# How many queued jobs to list per full card before collapsing into a "+N more".
+QUEUE_DISPLAY_LIMIT = 15
+
 
 def render_golden_all(avail: slurm_mcp.Availability,
-                      qos_filter: str | None = None) -> str:
+                      qos_filter: str | None = None,
+                      queues: dict | None = None) -> str:
     """One '=== Golden Tickets ({qos} QoS) ===' section per configured QoS.
 
     Iterates avail.golden_by_qos. If qos_filter is set, only that QoS is shown.
+    When a card's golden ticket is FULL (free==0) and `queues` carries that QoS's
+    pending queue (from slurm_mcp.golden_queues), the waiting line is listed in
+    scheduling order (position, job id, user, job name) so you can see who's ahead.
     """
+    queues = queues or {}
     sections = []
     for qos, gpus in avail.golden_by_qos.items():
         if qos_filter and qos != qos_filter:
             continue
         lines = [f"=== Golden Tickets ({qos} QoS) ==="]
+        qos_queue = queues.get(qos, [])
         for name, g in gpus.items():
             lines.append(
                 f"  {name}: {g.free}/{g.total} free "
@@ -32,6 +41,22 @@ def render_golden_all(avail: slurm_mcp.Availability,
                 lines.append("    Pending:")
                 for user, count in sorted(g.pending_users.items(), key=lambda x: -x[1]):
                     lines.append(f"      {user}: {count} GPU(s)")
+            # Ticket full -> show the actual waiting line (dispatch order).
+            if g.free == 0:
+                waiting = [r for r in qos_queue if r.get("gpu_type") == name]
+                if waiting:
+                    lines.append(
+                        f"    Queue (ticket full — {len(waiting)} waiting, next first):"
+                    )
+                    for i, r in enumerate(waiting[:QUEUE_DISPLAY_LIMIT], 1):
+                        lines.append(
+                            f"      {i:>3}. {r['job_id']:<11} "
+                            f"{r['user']:<12} {r['name']}"
+                        )
+                    if len(waiting) > QUEUE_DISPLAY_LIMIT:
+                        lines.append(
+                            f"      ... and {len(waiting) - QUEUE_DISPLAY_LIMIT} more queued"
+                        )
         sections.append("\n".join(lines))
     return "\n\n".join(sections)
 

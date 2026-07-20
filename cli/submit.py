@@ -40,6 +40,10 @@ def add_arguments(parser):
                         help="Number of GPUs (default: 1)")
     parser.add_argument("-q", "--qos", default=None,
                         help="Override QoS (default: auto)")
+    parser.add_argument("--golden-only", action="store_true",
+                        help="Force golden ticket (qos=yisroel on the card's "
+                             "dedicated partition, preemption-immune); never fall "
+                             "back to the preemptible main pool.")
     parser.add_argument("-j", "--job-name", default=None,
                         help="Job name (default: from command)")
     parser.add_argument("-w", "--workdir", default=None,
@@ -89,6 +93,7 @@ def run(args):
         output_dir=args.output_dir,
         gpu_type=args.gpu_type,
         qos=args.qos,
+        golden_only=args.golden_only,
         dependency=args.dependency,
         wait_until_running=not args.no_wait,
         dry_run=args.dry_run,
