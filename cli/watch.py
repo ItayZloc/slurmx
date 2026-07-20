@@ -141,7 +141,15 @@ def _addbar(stdscr, y: int, text: str, maxx: int) -> None:
 def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
     for setup in (lambda: curses.curs_set(0),
                   curses.use_default_colors,
-                  lambda: curses.mousemask(curses.ALL_MOUSE_EVENTS)):
+                  # Shrink the escape-disambiguation window from the ~1000ms
+                  # default to 25ms. With keypad(True), a stray ESC / "\x1bO" /
+                  # "\x1b[" prefix (e.g. a split arrow/function-key sequence)
+                  # would otherwise glue a following 'q' into a key sequence for
+                  # up to a second, so the keypress got swallowed instead of
+                  # quitting. Mouse is intentionally NOT enabled: any mouse mask
+                  # leaves ncurses parsing "\x1b[<…" mouse reports, and a partial
+                  # one eats the next 'q'. Keyboard scroll covers navigation.
+                  lambda: curses.set_escdelay(25)):
         try:
             setup()
         except (curses.error, AttributeError):
@@ -242,15 +250,6 @@ def _loop(stdscr, state: _TuiState, interval: float, qos: str | None) -> None:
             col -= _H_STEP
         elif ch in (curses.KEY_HOME, ord("0")):
             col = 0
-        elif ch == curses.KEY_MOUSE:
-            try:
-                _, _, _, _, bstate = curses.getmouse()
-                if bstate & curses.BUTTON4_PRESSED:
-                    row -= 3
-                elif bstate & getattr(curses, "BUTTON5_PRESSED", 0):
-                    row += 3
-            except curses.error:
-                pass
         # ch == -1 (timeout) or KEY_RESIZE: fall through, redraw next iteration.
 
 
@@ -265,6 +264,8 @@ def run_tui(interval: float = REFRESH_INTERVAL, qos: str | None = None) -> None:
     worker.start()
     try:
         curses.wrapper(_loop, state, interval, qos)
+    except KeyboardInterrupt:
+        pass  # Ctrl-C quits cleanly, same as 'q'
     finally:
         state.stop.set()
 
