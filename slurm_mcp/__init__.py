@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from config import (
     MAIL_USER, MAX_MEM_GB, TIME_LIMIT, START_TIMEOUT,
-    CPU_PARTITION, CPU_QOS, CPU_MEM, CPU_CPUS,
+    CPU_PARTITION, CPU_QOS, CPU_MEM, CPU_CPUS, MAIN_PARTITION,
     GOLDEN_QOS, EXCLUDE_NODES,
 )
 

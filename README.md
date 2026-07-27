@@ -180,6 +180,26 @@ slurmx status --once | grep  # one-shot text (also happens automatically when pi
 
 It's stdlib `curses` (no extra dependency) and works over SSH.
 
+### What "cluster-wide free" counts
+
+The Cluster-Wide totals count GPUs a job could actually land on, so they line up with
+`sres`. A node is skipped when:
+
+- **it can't take work** — `down`, `drain*`, `fail*`, `inval`, `unknown`, `future`,
+  `maint`, `reboot*`, or one of the flags `*` (slurmctld can't reach slurmd), `$`
+  (maintenance reservation), `@`/`^` (reboot pending/issued). Slurm renders the same
+  condition as a word or a flag depending on the base state — an idle maintenance node
+  prints `maint`, a busy one prints `mixed$` — so both forms are filtered together.
+  Those GPUs are reported as `(N offline: <nodes>)` next to the card, so a total that
+  drops overnight has a visible reason. Flags that still allow scheduling stay counted:
+  `-` (earmarked by the backfill scheduler) and the power-save states.
+- **we can't submit to it** — the node is only reachable through a partition that isn't
+  `MAIN_PARTITION` or one of the configured golden partitions. That capacity belongs to
+  someone else, so it isn't listed at all (not even as offline).
+
+Nodes carrying more than one card type (`gpu:rtx_3090:1,gpu:gtx_1080:1`) count under
+both.
+
 ## Running tests
 
 ```bash

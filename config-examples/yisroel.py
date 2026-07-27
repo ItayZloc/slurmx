@@ -17,6 +17,9 @@ MAIL_USER = ""  # e.g. "username@post.bgu.ac.il"
 GOLDEN_QOS = ["yisroel"]
 CPU_PARTITION = "cpu"
 CPU_QOS = "normal"
+# Shared, preemptible GPU pool — where non-golden jobs land, and (together with
+# the golden partitions below) what counts as reachable capacity.
+MAIN_PARTITION = "main"
 
 # --- Excluded nodes ---
 # Nodes to exclude from job placement (sbatch --exclude). Override via

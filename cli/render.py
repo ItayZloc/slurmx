@@ -10,6 +10,12 @@ import slurm_mcp
 # How many pending rows to list per full card before collapsing into a "+N more".
 QUEUE_DISPLAY_LIMIT = 15
 
+# How many offline node names to name per card before collapsing into a "+N more".
+# Deliberately small: the TUI puts this block in the right-hand column, so every
+# extra name pushes the whole dashboard row wider. One name answers the common
+# case ("a node vanished, which one?"); past that the count carries the meaning.
+OFFLINE_NODE_DISPLAY_LIMIT = 2
+
 
 def _merge_consecutive_users(rows: list[dict]) -> list[tuple[str, int]]:
     """Merge consecutive same-user queue rows into (user, total_gpus), keeping
@@ -94,12 +100,26 @@ def render_golden_all(avail: slurm_mcp.Availability,
     return "\n\n".join(sections)
 
 
+def _offline_note(c: slurm_mcp.GPUAvailability) -> str:
+    """' (8 offline: ise-6000p-07)' for a card with unreachable nodes, '' otherwise.
+
+    The totals only count GPUs a job could actually land on, so a card can lose
+    capacity overnight when a node stops responding or gets drained. Naming the
+    nodes turns a confusing number into an obvious one."""
+    if not c.offline:
+        return ""
+    shown = c.offline_nodes[:OFFLINE_NODE_DISPLAY_LIMIT]
+    rest = len(c.offline_nodes) - len(shown)
+    names = ", ".join(shown) + (f", +{rest} more" if rest > 0 else "")
+    return f" ({c.offline} offline: {names})" if names else f" ({c.offline} offline)"
+
+
 def render_cluster_wide(avail: slurm_mcp.Availability) -> str:
-    """=== Cluster-Wide === section. Skips GPU types with total=0."""
+    """=== Cluster-Wide === section. Skips GPU types the cluster doesn't have."""
     lines = ["=== Cluster-Wide ==="]
     for name, c in avail.cluster.items():
-        if c.total > 0:
-            lines.append(f"  {name}: {c.free}/{c.total} free")
+        if c.total > 0 or c.offline > 0:
+            lines.append(f"  {name}: {c.free}/{c.total} free{_offline_note(c)}")
     return "\n".join(lines)
 
 

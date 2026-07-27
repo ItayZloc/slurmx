@@ -32,6 +32,7 @@ from slurm_mcp import (
     _FINISHED_STATES, _UNRECOVERABLE_REASONS, _QUOTA_REASONS,
     _QOS_QUOTA_REASONS, _USER_QUOTA_REASONS,
 )
+from slurm_mcp.availability import _SINFO_FIELDS, _node_is_usable
 
 
 # ============================================================
@@ -48,27 +49,64 @@ gressel             gres/gpu:rtx_pro_6000:2                                     
 itayzloc            gres/gpu:rtx_pro_6000:1                                     N/A                                                         PENDING
 """
 
-# Simulated sinfo output (fixed-width, 20+40+40+20 chars)
-MOCK_SINFO = """\
-cs-1080-01          gpu:gtx_1080:4                          gpu:gtx_1080:2(IDX:0-1)                 mixed
-cs-1080-02          gpu:gtx_1080:4                          gpu:gtx_1080:0                          idle
-ise-6000p-01        gpu:rtx_pro_6000:8(S:0-1)               gpu:rtx_pro_6000:6(IDX:0-5)             mixed
-ise-6000p-02        gpu:rtx_pro_6000:8(S:0-1)               gpu:rtx_pro_6000:8(IDX:0-7)             allocated
-ise-6000-01         gpu:rtx_6000:4                          gpu:rtx_6000:4(IDX:0-3)                 allocated
-ise-6000-02         gpu:rtx_6000:4                          gpu:rtx_6000:1(IDX:0)                   mixed
-cs-4090-01          gpu:rtx_4090:3(S:0)                     gpu:rtx_4090:3(IDX:0-2)                 allocated
-cs-4090-02          gpu:rtx_4090:3(S:0)                     gpu:rtx_4090:0                          idle
-cs-3090-01          gpu:rtx_3090:8(S:0)                     gpu:rtx_3090:2(IDX:0-1)                 mixed
-cs-2080-01          gpu:rtx_2080:4                          gpu:rtx_2080:0                          idle
-node-down-01        gpu:rtx_4090:4                          gpu:rtx_4090:0                          down
-node-drain-01       gpu:rtx_3090:8                          gpu:rtx_3090:0                          drained
-"""
+# Simulated sinfo output. Rows are built from the real field widths rather than
+# hand-padded, so the mocks can't drift out of sync with _SINFO_FORMAT.
+def _sinfo_row(node, gres, gres_used, partition="main", state="idle") -> str:
+    """One fixed-width `sinfo -N -h -O` row, padded/truncated exactly like sinfo."""
+    values = [node, gres, gres_used, partition, state]
+    return "".join(v.ljust(w)[:w] for v, (_, w) in zip(values, _SINFO_FIELDS))
 
-# Duplicate line (same node appearing in multiple partitions)
-MOCK_SINFO_WITH_DUPES = MOCK_SINFO + """\
-cs-1080-01          gpu:gtx_1080:4                          gpu:gtx_1080:2(IDX:0-1)                 mixed
-ise-6000p-01        gpu:rtx_pro_6000:8(S:0-1)               gpu:rtx_pro_6000:6(IDX:0-5)             mixed
-"""
+
+# Node inventory the cluster assertions below are built on:
+#   usable   gtx_1080     4 + 4 + 1 (cs-pheno-01) = 9 total, 3 used
+#   usable   rtx_pro_6000 8 + 8 + 4 (golden-only partition) = 20 total, 14 used
+#   usable   rtx_6000     4 + 4 = 8 total, 5 used
+#   usable   rtx_4090     3 + 3 + 2 (backfill-planned) = 8 total, 3 used
+#   usable   rtx_3090     8 + 1 (cs-pheno-01) = 9 total, 3 used
+#   usable   rtx_2080     4 total, 0 used
+#   offline  rtx_pro_6000 8 (not responding), rtx_4090 4 (down),
+#            rtx_3090 8 (drained) + 4 (invalid registration)
+#   ignored  rtx_2080     2 on a node only reachable via slurm-bridge
+MOCK_SINFO = "\n".join([
+    _sinfo_row("cs-1080-01", "gpu:gtx_1080:4", "gpu:gtx_1080:2(IDX:0-1)", state="mixed"),
+    _sinfo_row("cs-1080-02", "gpu:gtx_1080:4", "gpu:gtx_1080:0"),
+    _sinfo_row("ise-6000p-01", "gpu:rtx_pro_6000:8(S:0-1)", "gpu:rtx_pro_6000:6(IDX:0-5)", state="mixed"),
+    _sinfo_row("ise-6000p-02", "gpu:rtx_pro_6000:8(S:0-1)", "gpu:rtx_pro_6000:8(IDX:0-7)", state="allocated"),
+    _sinfo_row("ise-6000-01", "gpu:rtx_6000:4", "gpu:rtx_6000:4(IDX:0-3)", state="allocated"),
+    _sinfo_row("ise-6000-02", "gpu:rtx_6000:4", "gpu:rtx_6000:1(IDX:0)", state="mixed"),
+    _sinfo_row("cs-4090-01", "gpu:rtx_4090:3(S:0)", "gpu:rtx_4090:3(IDX:0-2)", state="allocated"),
+    _sinfo_row("cs-4090-02", "gpu:rtx_4090:3(S:0)", "gpu:rtx_4090:0"),
+    _sinfo_row("cs-3090-01", "gpu:rtx_3090:8(S:0)", "gpu:rtx_3090:2(IDX:0-1)", state="mixed"),
+    _sinfo_row("cs-2080-01", "gpu:rtx_2080:4", "gpu:rtx_2080:0"),
+    _sinfo_row("node-down-01", "gpu:rtx_4090:4", "gpu:rtx_4090:0", state="down"),
+    _sinfo_row("node-drain-01", "gpu:rtx_3090:8", "gpu:rtx_3090:0", state="drained"),
+    # slurmctld can't reach it — its 8 cards are unschedulable even though one
+    # is still held by a job that hasn't finished cleaning up.
+    _sinfo_row("node-noresp-01", "gpu:rtx_pro_6000:8", "gpu:rtx_pro_6000:1(IDX:1)",
+               state="completing*"),
+    # Registered with a config slurmctld rejects.
+    _sinfo_row("node-inval-01", "gpu:rtx_3090:4", "gpu:rtx_3090:0", state="inval"),
+    # '-' = earmarked by the backfill scheduler. Still allocatable.
+    _sinfo_row("node-planned-01", "gpu:rtx_4090:2", "gpu:rtx_4090:0", state="mixed-"),
+    # Two card types on one node — both have to be counted.
+    _sinfo_row("cs-pheno-01", "gpu:rtx_3090:1(S:0),gpu:gtx_1080:1(S:0)",
+               "gpu:rtx_3090:1(IDX:0),gpu:gtx_1080:1(IDX:1)", state="allocated"),
+    # Reachable only through a golden partition, never through main.
+    _sinfo_row("node-golden-01", "gpu:rtx_pro_6000:4", "gpu:rtx_pro_6000:0",
+               partition="rtx_pro_6000"),
+    # Reachable only through a queue we never submit to — not our capacity.
+    _sinfo_row("node-bridge-01", "gpu:rtx_2080:2", "gpu:rtx_2080:0",
+               partition="slurm-bridge"),
+]) + "\n"
+
+# Same node listed again under a second partition — sinfo -N does this for every
+# multi-partition node, and the two rows must fold into one.
+MOCK_SINFO_WITH_DUPES = MOCK_SINFO + "\n".join([
+    _sinfo_row("cs-1080-01", "gpu:gtx_1080:4", "gpu:gtx_1080:2(IDX:0-1)",
+               partition="gpu", state="mixed"),
+    _sinfo_row("ise-6000p-01", "gpu:rtx_pro_6000:8(S:0-1)", "gpu:rtx_pro_6000:6(IDX:0-5)",
+               partition="gpu", state="mixed"),
+]) + "\n"
 
 
 def mock_run_quiet_factory(squeue_output="", sinfo_output=""):
@@ -198,17 +236,17 @@ class TestCheckAvailabilityMocked:
         )
         avail = check_availability()
 
-        # gtx_1080: 4 + 4 = 8 total
-        assert avail.cluster["gtx_1080"].total == 8
-        # rtx_pro_6000: 8 + 8 = 16
-        assert avail.cluster["rtx_pro_6000"].total == 16
-        # rtx_6000: 4 + 4 = 8
+        # gtx_1080: 4 + 4 + 1 (cs-pheno-01's second card)
+        assert avail.cluster["gtx_1080"].total == 9
+        # rtx_pro_6000: 8 + 8 + 4 (golden-only node); not-responding node excluded
+        assert avail.cluster["rtx_pro_6000"].total == 20
+        # rtx_6000: 4 + 4
         assert avail.cluster["rtx_6000"].total == 8
-        # rtx_4090: 3 + 3 = 6 (down node excluded)
-        assert avail.cluster["rtx_4090"].total == 6
-        # rtx_3090: 8 (drained node excluded)
-        assert avail.cluster["rtx_3090"].total == 8
-        # rtx_2080: 4
+        # rtx_4090: 3 + 3 + 2 (backfill-planned); down node excluded
+        assert avail.cluster["rtx_4090"].total == 8
+        # rtx_3090: 8 + 1 (cs-pheno-01); drained and inval nodes excluded
+        assert avail.cluster["rtx_3090"].total == 9
+        # rtx_2080: 4; the slurm-bridge-only node is not capacity we can use
         assert avail.cluster["rtx_2080"].total == 4
 
     @patch("slurm_mcp.shell._run_quiet")
@@ -218,11 +256,11 @@ class TestCheckAvailabilityMocked:
         )
         avail = check_availability()
 
-        assert avail.cluster["gtx_1080"].used == 2    # 2 + 0
-        assert avail.cluster["rtx_pro_6000"].used == 14  # 6 + 8
+        assert avail.cluster["gtx_1080"].used == 3     # 2 + 0 + 1 (cs-pheno-01)
+        assert avail.cluster["rtx_pro_6000"].used == 14  # 6 + 8 + 0 (not-responding excluded)
         assert avail.cluster["rtx_6000"].used == 5     # 4 + 1
-        assert avail.cluster["rtx_4090"].used == 3     # 3 + 0 (down excluded)
-        assert avail.cluster["rtx_3090"].used == 2     # 2 (drained excluded)
+        assert avail.cluster["rtx_4090"].used == 3     # 3 + 0 + 0 (down excluded)
+        assert avail.cluster["rtx_3090"].used == 3     # 2 + 1 (drained + inval excluded)
         assert avail.cluster["rtx_2080"].used == 0
 
     @patch("slurm_mcp.shell._run_quiet")
@@ -232,11 +270,11 @@ class TestCheckAvailabilityMocked:
         )
         avail = check_availability()
 
-        assert avail.cluster["gtx_1080"].free == 6     # 8 - 2
-        assert avail.cluster["rtx_pro_6000"].free == 2  # 16 - 14
+        assert avail.cluster["gtx_1080"].free == 6     # 9 - 3
+        assert avail.cluster["rtx_pro_6000"].free == 6  # 20 - 14
         assert avail.cluster["rtx_6000"].free == 3      # 8 - 5
-        assert avail.cluster["rtx_4090"].free == 3      # 6 - 3
-        assert avail.cluster["rtx_3090"].free == 6      # 8 - 2
+        assert avail.cluster["rtx_4090"].free == 5      # 8 - 3
+        assert avail.cluster["rtx_3090"].free == 6      # 9 - 3
         assert avail.cluster["rtx_2080"].free == 4      # 4 - 0
 
     @patch("slurm_mcp.shell._run_quiet")
@@ -245,10 +283,89 @@ class TestCheckAvailabilityMocked:
             squeue_output="", sinfo_output=MOCK_SINFO
         )
         avail = check_availability()
-        # node-down-01 has 4 rtx_4090, node-drain-01 has 8 rtx_3090
-        # These should NOT appear in totals
-        assert avail.cluster["rtx_4090"].total == 6    # only the 2 alive nodes
-        assert avail.cluster["rtx_3090"].total == 8    # only cs-3090-01
+        # node-down-01 has 4 rtx_4090, node-drain-01 has 8 rtx_3090.
+        # Neither is capacity, so neither lands in `total`.
+        assert "node-down-01" in avail.cluster["rtx_4090"].offline_nodes
+        assert "node-drain-01" in avail.cluster["rtx_3090"].offline_nodes
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_not_responding_node_excluded(self, mock_rq):
+        """A node slurmctld can't reach can't run anything, whatever its base
+        state says. sinfo flags that with a trailing '*' — this is the case that
+        made slurmx report 18 free rtx_pro_6000 while sres reported 11."""
+        mock_rq.side_effect = mock_run_quiet_factory(
+            squeue_output="", sinfo_output=MOCK_SINFO
+        )
+        avail = check_availability()
+        pro = avail.cluster["rtx_pro_6000"]
+        assert pro.total == 20                     # node-noresp-01's 8 are not here
+        assert pro.offline == 8
+        assert pro.offline_nodes == ["node-noresp-01"]
+        # Its 1 in-use card must not inflate `used` either.
+        assert pro.used == 14
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_invalid_registration_node_excluded(self, mock_rq):
+        mock_rq.side_effect = mock_run_quiet_factory(
+            squeue_output="", sinfo_output=MOCK_SINFO
+        )
+        avail = check_availability()
+        assert "node-inval-01" in avail.cluster["rtx_3090"].offline_nodes
+        assert avail.cluster["rtx_3090"].offline == 12   # 8 drained + 4 inval
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_backfill_planned_node_still_counted(self, mock_rq):
+        """'-' means the backfill scheduler has earmarked the node for a future
+        job. It still accepts work, so it stays in the total."""
+        mock_rq.side_effect = mock_run_quiet_factory(
+            squeue_output="", sinfo_output=MOCK_SINFO
+        )
+        avail = check_availability()
+        assert avail.cluster["rtx_4090"].total == 8      # includes node-planned-01
+        assert "node-planned-01" not in avail.cluster["rtx_4090"].offline_nodes
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_unsubmittable_partition_excluded(self, mock_rq):
+        """A node we can only reach through some other group's queue is not our
+        capacity — and it isn't 'offline' either, it's just not ours."""
+        mock_rq.side_effect = mock_run_quiet_factory(
+            squeue_output="", sinfo_output=MOCK_SINFO
+        )
+        avail = check_availability()
+        assert avail.cluster["rtx_2080"].total == 4      # node-bridge-01's 2 excluded
+        assert avail.cluster["rtx_2080"].offline == 0
+        assert avail.cluster["rtx_2080"].offline_nodes == []
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_golden_partition_only_node_counted(self, mock_rq):
+        """Golden partitions are ours too, so a node reachable only there counts."""
+        mock_rq.side_effect = mock_run_quiet_factory(
+            squeue_output="", sinfo_output=MOCK_SINFO
+        )
+        avail = check_availability()
+        assert avail.cluster["rtx_pro_6000"].total == 20  # 8 + 8 + node-golden-01's 4
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_multi_gres_node_counts_every_card_type(self, mock_rq):
+        """cs-pheno-01 carries one rtx_3090 AND one gtx_1080. Matching only the
+        first entry hid 24 real gtx_1080s on this cluster."""
+        mock_rq.side_effect = mock_run_quiet_factory(
+            squeue_output="", sinfo_output=MOCK_SINFO
+        )
+        avail = check_availability()
+        assert avail.cluster["gtx_1080"].total == 9      # 4 + 4 + 1
+        assert avail.cluster["gtx_1080"].used == 3       # 2 + 0 + 1
+        assert avail.cluster["rtx_3090"].total == 9      # 8 + 1
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_healthy_cards_report_no_offline(self, mock_rq):
+        mock_rq.side_effect = mock_run_quiet_factory(
+            squeue_output="", sinfo_output=MOCK_SINFO
+        )
+        avail = check_availability()
+        for name in ("rtx_6000", "rtx_2080", "gtx_1080"):
+            assert avail.cluster[name].offline == 0
+            assert avail.cluster[name].offline_nodes == []
 
     @patch("slurm_mcp.shell._run_quiet")
     def test_node_deduplication(self, mock_rq):
@@ -256,9 +373,9 @@ class TestCheckAvailabilityMocked:
             squeue_output="", sinfo_output=MOCK_SINFO_WITH_DUPES
         )
         avail = check_availability()
-        # cs-1080-01 appears twice — should only count once
-        assert avail.cluster["gtx_1080"].total == 8  # still 4+4, not 4+4+4
-        assert avail.cluster["rtx_pro_6000"].total == 16  # still 8+8, not 8+8+8
+        # cs-1080-01 and ise-6000p-01 each appear under a second partition
+        assert avail.cluster["gtx_1080"].total == 9        # not 4+4+4+1
+        assert avail.cluster["rtx_pro_6000"].total == 20   # not 8+8+8+4
 
     @patch("slurm_mcp.shell._run_quiet")
     def test_empty_squeue_output(self, mock_rq):
@@ -341,6 +458,54 @@ class TestCheckAvailabilityMocked:
         assert set(avail.golden_by_qos.keys()) == {
             slurm_mcp.PRIMARY_QOS, extra_qos,
         }
+
+
+# ============================================================
+# Unit Tests: node usability predicate
+# ============================================================
+
+class TestNodeIsUsable:
+    """`sinfo` StateLong strings, and whether that node can take a new job."""
+
+    @pytest.mark.parametrize("state", [
+        "idle", "mixed", "allocated", "completing", "reserved",
+        "mixed-",       # earmarked by the backfill scheduler
+        "idle~",        # powered down for power save, resumes on demand
+        "idle#",        # powering up
+        "ALLOCATED",    # casing shouldn't matter
+    ])
+    def test_usable_states(self, state):
+        assert _node_is_usable(state) is True
+
+    @pytest.mark.parametrize("state", [
+        "down", "down*", "drained", "draining",
+        "inval", "invalid_reg",
+        "fail", "failing",
+        "unknown", "unk",
+        "future",
+        "maint",
+        "reboot", "reboot_issued", "reboot_requested",
+        "powering_down", "powered_down", "power_down",
+        "completing*",  # base state fine, but slurmctld can't reach it
+        "mixed*",
+        "idle*",
+    ])
+    def test_unusable_states(self, state):
+        assert _node_is_usable(state) is False
+
+    @pytest.mark.parametrize("word,flag", [
+        ("maint", "mixed$"),            # busy node in a maintenance reservation
+        ("maint", "allocated$"),
+        ("reboot", "idle@"),            # reboot requested
+        ("reboot^", "mixed^"),          # reboot issued
+    ])
+    def test_flag_form_matches_word_form(self, word, flag):
+        """Slurm renders the same condition as a word or a trailing flag
+        depending on the base state — 'maint' when idle, 'mixed$' when busy.
+        Both have to be rejected, or the answer would depend on whether a job
+        happened to be running on the node."""
+        assert _node_is_usable(word) is False
+        assert _node_is_usable(flag) is False
 
 
 # ============================================================
@@ -1474,6 +1639,55 @@ class TestRenderGoldenQueue:
         out = render.render_golden_all(avail, queues={"yisroel": rows}, limit=None)
         assert "more GPU(s) queued" not in out
         assert "u19: 1 GPU(s)" in out  # the 20th row is present, not truncated
+
+
+class TestRenderClusterWide:
+    """The Cluster-Wide section, including the offline-capacity annotation."""
+
+    def _avail(self, **kwargs):
+        avail = Availability()
+        avail.cluster = {
+            "rtx_pro_6000": GPUAvailability(
+                gpu_type="rtx_pro_6000", total=48, used=37, free=11, **kwargs
+            ),
+        }
+        return avail
+
+    def test_healthy_card_has_no_annotation(self):
+        from cli import render
+        out = render.render_cluster_wide(self._avail())
+        assert "  rtx_pro_6000: 11/48 free" in out
+        assert "offline" not in out
+
+    def test_offline_capacity_is_named(self):
+        """The whole point: a total that shrank has a visible reason attached."""
+        from cli import render
+        out = render.render_cluster_wide(
+            self._avail(offline=8, offline_nodes=["ise-6000p-07"])
+        )
+        assert "  rtx_pro_6000: 11/48 free (8 offline: ise-6000p-07)" in out
+
+    def test_long_offline_node_list_collapses(self):
+        """The TUI puts this block in the right-hand column, so the name list is
+        capped hard — a long one would push the whole dashboard row off-screen."""
+        from cli import render
+        nodes = [f"node-{i:02d}" for i in range(9)]
+        out = render.render_cluster_wide(self._avail(offline=9, offline_nodes=nodes))
+        assert "9 offline: node-00, node-01, +7 more" in out
+
+    def test_fully_offline_card_still_listed(self):
+        """total=0 with offline>0 means every card of that type is unreachable —
+        worth showing, unlike a card the cluster simply doesn't have."""
+        from cli import render
+        avail = Availability()
+        avail.cluster = {
+            "rtx_2080": GPUAvailability(gpu_type="rtx_2080", total=0, used=0, free=0),
+            "gtx_1080": GPUAvailability(gpu_type="gtx_1080", total=0, used=0, free=0,
+                                        offline=4, offline_nodes=["cs-1080-01"]),
+        }
+        out = render.render_cluster_wide(avail)
+        assert "rtx_2080" not in out
+        assert "  gtx_1080: 0/0 free (4 offline: cs-1080-01)" in out
 
 
 class TestWatchDashboard:

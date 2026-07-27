@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from config import MAIN_PARTITION
+
 from . import availability
 from .gpu_catalog import GPU_TYPES, PRIMARY_QOS
 
@@ -51,6 +53,6 @@ def select_gpu(vram_gb: int, golden_only: bool = False) -> Optional[tuple[str, s
     for gpu in candidates:
         cluster = avail.cluster.get(gpu.name)
         if cluster and cluster.free > 0:
-            return (gpu.name, "main", "normal")
+            return (gpu.name, MAIN_PARTITION, "normal")
 
     return None

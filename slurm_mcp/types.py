@@ -19,7 +19,7 @@ class GPUType:
 @dataclass
 class GPUAvailability:
     gpu_type: str
-    total: int
+    total: int                                      # cluster-wide: GPUs a job can actually land on
     used: int                                       # alias: running (kept for back-compat)
     free: int                                       # quota - running (pending is informational)
     users: dict = field(default_factory=dict)       # alias: running_users (kept for back-compat)
@@ -27,6 +27,8 @@ class GPUAvailability:
     pending: int = 0
     running_users: dict = field(default_factory=dict)
     pending_users: dict = field(default_factory=dict)
+    offline: int = 0                                # GPUs excluded from total (node down/drain/unreachable)
+    offline_nodes: list = field(default_factory=list)
 
 
 @dataclass

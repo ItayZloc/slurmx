@@ -23,7 +23,9 @@ import subprocess
 import sys
 import time
 
-from config import CPU_PARTITION, CPU_QOS, CPU_CPUS, CPU_MEM, CLAUDE_LOG_DIR
+from config import (
+    CPU_PARTITION, CPU_QOS, CPU_CPUS, CPU_MEM, CLAUDE_LOG_DIR, MAIN_PARTITION,
+)
 from maintenance import cap_time_limit
 
 from . import selection
@@ -212,7 +214,7 @@ def submit_remote_session_job(
                 partition = gpu_info.golden_partition
                 qos = PRIMARY_QOS
             else:
-                partition = "main"
+                partition = MAIN_PARTITION
                 qos = "normal"
         else:
             sel = selection.select_gpu(vram_gb, golden_only=golden_only)
