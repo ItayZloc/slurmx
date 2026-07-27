@@ -11,6 +11,52 @@ from .gpu_catalog import GPU_TYPES, GPU_TYPES_BY_QOS, PRIMARY_QOS
 from .types import Availability, GPUAvailability
 
 
+def _parse_row(line: str, fields: tuple) -> tuple:
+    """Split one fixed-width `-O` row into stripped values.
+
+    `fields` is a ((sinfo/squeue field name, width), ...) spec; the last field
+    takes the rest of the line so a long tail can't be clipped by its width.
+    """
+    out, pos = [], 0
+    for i, (_, width) in enumerate(fields):
+        last = i == len(fields) - 1
+        out.append((line[pos:] if last else line[pos:pos + width]).strip())
+        pos += width
+    return tuple(out)
+
+
+def _fmt(fields: tuple) -> str:
+    """The `-O` format string for a field spec."""
+    return ",".join(f"{name}:{width}" for name, width in fields)
+
+
+_TRES_GPU_RE = re.compile(r"gres/gpu:([^:,]+):(\d+)")
+
+
+def _gres_from_tres(tres_job: str, tres_node: str) -> tuple:
+    """(gpu_type, count) from a job's two TRES fields; ('', 0) if it wants no GPU.
+
+    A job can ask for GPUs at job scope (--gpus / --gres, which lands in
+    tres-per-job) or per node (--gpus-per-node, which lands in tres-per-node).
+    Both spellings are common, so reading only one of the two silently drops
+    every job that used the other.
+    """
+    for field in (tres_job, tres_node):
+        if field and field != "N/A":
+            m = _TRES_GPU_RE.search(field)
+            if m:
+                return m.group(1), int(m.group(2))
+    return "", 0
+
+
+_GOLDEN_FIELDS = (
+    ("UserName", 20),
+    ("tres-per-job", 60),
+    ("tres-per-node", 60),
+    ("State", 12),
+)
+
+
 def _golden_availability_for_qos(qos: str) -> dict:
     """Build {gpu_type -> GPUAvailability} for one QoS by parsing squeue."""
     qos_gpu_types = GPU_TYPES_BY_QOS.get(qos, [])
@@ -23,36 +69,21 @@ def _golden_availability_for_qos(qos: str) -> dict:
     pending_users = {}
 
     raw = shell._run_quiet([
-        "squeue", "--qos", qos, "-h", "-O",
-        "UserName:20,tres-per-job:60,tres-per-node:60,State:12"
+        "squeue", "--qos", qos, "-h", "-O", _fmt(_GOLDEN_FIELDS),
     ])
 
     for line in raw.splitlines():
         if not line.strip():
             continue
 
-        user = line[0:20].strip()
-        tres_job = line[20:80].strip()
-        tres_node = line[80:140].strip()
-        state = line[140:152].strip()
+        user, tres_job, tres_node, state = _parse_row(line, _GOLDEN_FIELDS)
 
         if state not in ("RUNNING", "PENDING"):
             continue
 
-        gres_field = ""
-        for f in (tres_job, tres_node):
-            if f != "N/A" and "gres/gpu:" in f:
-                gres_field = f
-                break
-        if not gres_field:
+        gpu_type, gpu_count = _gres_from_tres(tres_job, tres_node)
+        if not gpu_type:
             continue
-
-        m = re.search(r"gres/gpu:([^:,]+):(\d+)", gres_field)
-        if not m:
-            continue
-
-        gpu_type = m.group(1)
-        gpu_count = int(m.group(2))
 
         if state == "RUNNING":
             running[gpu_type] = running.get(gpu_type, 0) + gpu_count
@@ -98,7 +129,6 @@ _SINFO_FIELDS = (
     ("Partition", 24),
     ("StateLong", 24),
 )
-_SINFO_FORMAT = ",".join(f"{name}:{width}" for name, width in _SINFO_FIELDS)
 
 _GRES_RE = re.compile(r"gpu:([A-Za-z0-9_]+):(\d+)")
 
@@ -160,16 +190,6 @@ def _count_gpus(gres: str) -> dict:
     return counts
 
 
-def _parse_sinfo_row(line: str) -> tuple:
-    """(node, gres, gres_used, partition, state) from one fixed-width row."""
-    out, pos = [], 0
-    for i, (_, width) in enumerate(_SINFO_FIELDS):
-        last = i == len(_SINFO_FIELDS) - 1
-        out.append((line[pos:] if last else line[pos:pos + width]).strip())
-        pos += width
-    return tuple(out)
-
-
 def _cluster_availability() -> dict:
     """{gpu_type -> GPUAvailability} for the cluster.
 
@@ -179,14 +199,14 @@ def _cluster_availability() -> dict:
     total that drops overnight is explainable rather than mysterious.
     """
     allowed = _submittable_partitions()
-    raw = shell._run_quiet(["sinfo", "-N", "-h", "-O", _SINFO_FORMAT])
+    raw = shell._run_quiet(["sinfo", "-N", "-h", "-O", _fmt(_SINFO_FIELDS)])
 
     # One node spans several rows (one per partition); fold them into one entry.
     nodes = {}
     for line in raw.splitlines():
         if not line.strip():
             continue
-        node, gres, gres_used, partition, state = _parse_sinfo_row(line)
+        node, gres, gres_used, partition, state = _parse_row(line, _SINFO_FIELDS)
         if not node:
             continue
         entry = nodes.setdefault(
@@ -249,6 +269,23 @@ def check_availability() -> Availability:
     return avail
 
 
+# Deliberately carries BOTH TRES fields, like _GOLDEN_FIELDS. This query feeds the
+# per-user "Pending (next first)" list while _golden_availability_for_qos feeds the
+# "(N pending)" counter beside it, so the two have to read GPU requests the same
+# way. They didn't: this one used `-o %b`, which is tres-per-node only, so a job
+# submitted with --gpus instead of --gpus-per-node was counted but never listed —
+# the card read "13 pending" above a list adding up to 11.
+# PriorityLong is the integer priority (`-O Priority` returns a normalized float).
+_QUEUE_FIELDS = (
+    ("PriorityLong", 12),
+    ("JobArrayID", 26),   # room for a throttled array id: "12345678_[1-10000%5]"
+    ("UserName", 20),
+    ("tres-per-job", 60),
+    ("tres-per-node", 60),
+    ("Name", 60),
+)
+
+
 def golden_queue(qos: str) -> list[dict]:
     """Pending jobs on `qos`, in scheduling order (priority desc, then job id).
 
@@ -258,23 +295,18 @@ def golden_queue(qos: str) -> list[dict]:
     (older) job id — so row 1 is next to run.
     """
     raw = shell._run_quiet([
-        "squeue", "--qos", qos, "-t", "PENDING", "-h", "-o", "%Q|%i|%u|%b|%j",
+        "squeue", "--qos", qos, "-t", "PENDING", "-h", "-O", _fmt(_QUEUE_FIELDS),
     ])
 
     rows = []
     for line in raw.splitlines():
         if not line.strip():
             continue
-        parts = line.split("|")
-        if len(parts) < 5:
+        prio_s, job_id, user, tres_job, tres_node, name = _parse_row(line, _QUEUE_FIELDS)
+        if not job_id:
             continue
-        prio_s, job_id, user, gres = parts[0], parts[1], parts[2], parts[3]
-        name = "|".join(parts[4:])  # job names may themselves contain '|'
 
-        gpu_type, gpu_count = "", 0
-        m = re.search(r"gpu:([^:,]+):(\d+)", gres)
-        if m:
-            gpu_type, gpu_count = m.group(1), int(m.group(2))
+        gpu_type, gpu_count = _gres_from_tres(tres_job, tres_node)
 
         try:
             prio = int(prio_s)

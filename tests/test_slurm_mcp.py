@@ -32,7 +32,16 @@ from slurm_mcp import (
     _FINISHED_STATES, _UNRECOVERABLE_REASONS, _QUOTA_REASONS,
     _QOS_QUOTA_REASONS, _USER_QUOTA_REASONS,
 )
-from slurm_mcp.availability import _SINFO_FIELDS, _node_is_usable
+from slurm_mcp.availability import (
+    _SINFO_FIELDS, _GOLDEN_FIELDS, _QUEUE_FIELDS, _node_is_usable,
+)
+
+
+def _fixed_width_row(values, fields) -> str:
+    """Build one fixed-width `-O` row, padded/truncated exactly like sinfo/squeue.
+    Rows are built from the real field widths so the mocks can't drift out of sync
+    with the format strings the code actually sends."""
+    return "".join(str(v).ljust(w)[:w] for v, (_, w) in zip(values, fields))
 
 
 # ============================================================
@@ -49,12 +58,21 @@ gressel             gres/gpu:rtx_pro_6000:2                                     
 itayzloc            gres/gpu:rtx_pro_6000:1                                     N/A                                                         PENDING
 """
 
-# Simulated sinfo output. Rows are built from the real field widths rather than
-# hand-padded, so the mocks can't drift out of sync with _SINFO_FORMAT.
 def _sinfo_row(node, gres, gres_used, partition="main", state="idle") -> str:
-    """One fixed-width `sinfo -N -h -O` row, padded/truncated exactly like sinfo."""
-    values = [node, gres, gres_used, partition, state]
-    return "".join(v.ljust(w)[:w] for v, (_, w) in zip(values, _SINFO_FIELDS))
+    """One fixed-width `sinfo -N -h -O` row."""
+    return _fixed_width_row([node, gres, gres_used, partition, state], _SINFO_FIELDS)
+
+
+def _golden_row(user, state, tres_job="N/A", tres_node="N/A") -> str:
+    """One fixed-width `squeue --qos X -h -O` row (the pending/running counter)."""
+    return _fixed_width_row([user, tres_job, tres_node, state], _GOLDEN_FIELDS)
+
+
+def _queue_row(priority, job_id, user, tres_job="N/A", tres_node="N/A", name="job") -> str:
+    """One fixed-width `squeue --qos X -t PENDING -h -O` row (the ordered queue)."""
+    return _fixed_width_row(
+        [priority, job_id, user, tres_job, tres_node, name], _QUEUE_FIELDS
+    )
 
 
 # Node inventory the cluster assertions below are built on:
@@ -1463,12 +1481,11 @@ class TestWaitForRunningMocked:
 class TestGoldenQueue:
     @patch("slurm_mcp.shell._run_quiet")
     def test_parses_and_orders(self, mock_rq):
-        # squeue -o "%Q|%i|%u|%b|%j": priority|jobid|user|gres|name
-        mock_rq.return_value = (
-            "100|20000002|alice|gres/gpu:rtx_6000:1|job-b\n"
-            "100|20000001|alice|gres/gpu:rtx_6000:1|job-a\n"
-            "200|20000005|bob|gres/gpu:rtx_pro_6000:2|big-job\n"
-        )
+        mock_rq.return_value = "\n".join([
+            _queue_row(100, "20000002", "alice", tres_node="gres/gpu:rtx_6000:1", name="job-b"),
+            _queue_row(100, "20000001", "alice", tres_node="gres/gpu:rtx_6000:1", name="job-a"),
+            _queue_row(200, "20000005", "bob", tres_node="gres/gpu:rtx_pro_6000:2", name="big-job"),
+        ]) + "\n"
         q = slurm_mcp.golden_queue("yisroel")
         # bob (priority 200) first; then alice's two by ascending job id.
         assert [r["job_id"] for r in q] == ["20000005", "20000001", "20000002"]
@@ -1478,17 +1495,33 @@ class TestGoldenQueue:
         assert q[1]["name"] == "job-a"
 
     @patch("slurm_mcp.shell._run_quiet")
-    def test_job_name_may_contain_pipe(self, mock_rq):
-        mock_rq.return_value = "100|20000001|alice|gres/gpu:rtx_6000:1|weird|name\n"
+    def test_job_scoped_gpu_request_is_listed(self, mock_rq):
+        """--gpus / --gres put the request in tres-per-job, --gpus-per-node puts it
+        in tres-per-node. Reading only tres-per-node dropped the former from the
+        queue list while the counter beside it still counted them."""
+        mock_rq.return_value = "\n".join([
+            _queue_row(100, "1", "alice", tres_job="gres/gpu:rtx_pro_6000:1"),
+            _queue_row(100, "2", "bob", tres_node="gres/gpu:rtx_pro_6000:1"),
+        ]) + "\n"
         q = slurm_mcp.golden_queue("yisroel")
-        assert q[0]["name"] == "weird|name"
+        assert [(r["user"], r["gpu_type"], r["gpu_count"]) for r in q] == [
+            ("alice", "rtx_pro_6000", 1),
+            ("bob", "rtx_pro_6000", 1),
+        ]
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_cpu_only_job_carries_no_gpu_type(self, mock_rq):
+        mock_rq.return_value = _queue_row(100, "1", "alice") + "\n"
+        q = slurm_mcp.golden_queue("yisroel")
+        assert q[0]["gpu_type"] == ""
+        assert q[0]["gpu_count"] == 0
 
     @patch("slurm_mcp.shell._run_quiet")
     def test_array_task_ids_order(self, mock_rq):
-        mock_rq.return_value = (
-            "100|123_2|u|gres/gpu:rtx_6000:1|a\n"
-            "100|123_1|u|gres/gpu:rtx_6000:1|b\n"
-        )
+        mock_rq.return_value = "\n".join([
+            _queue_row(100, "123_2", "u", tres_node="gres/gpu:rtx_6000:1"),
+            _queue_row(100, "123_1", "u", tres_node="gres/gpu:rtx_6000:1"),
+        ]) + "\n"
         q = slurm_mcp.golden_queue("yisroel")
         assert [r["job_id"] for r in q] == ["123_1", "123_2"]
 
@@ -1496,6 +1529,60 @@ class TestGoldenQueue:
     def test_empty(self, mock_rq):
         mock_rq.return_value = ""
         assert slurm_mcp.golden_queue("yisroel") == []
+
+
+class TestPendingCounterMatchesQueue:
+    """The '(N pending)' counter and the 'Pending (next first)' list below it come
+    from two separate squeue calls. They must agree, whichever way a job spelled
+    its GPU request."""
+
+    def _mock(self, rows):
+        """Serve the counter query and the ordered-queue query from one job list."""
+        def run_quiet(cmd):
+            if cmd[0] != "squeue":
+                return ""
+            if "-t" in cmd:  # the ordered PENDING queue
+                return "\n".join(
+                    _queue_row(100, str(i), u, tj, tn)
+                    for i, (u, tj, tn, st) in enumerate(rows) if st == "PENDING"
+                ) + "\n"
+            return "\n".join(_golden_row(u, st, tj, tn) for u, tj, tn, st in rows) + "\n"
+        return run_quiet
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_counter_equals_listed_gpus(self, mock_rq):
+        # 11 via --gpus-per-node, 2 via --gpus: the exact shape that read
+        # "13 pending" above a list adding up to 11.
+        rows = [("lenga", "N/A", "gres/gpu:rtx_pro_6000:1", "PENDING")] * 11
+        rows += [
+            ("benchayi", "gres/gpu:rtx_pro_6000:1", "N/A", "PENDING"),
+            ("amonfadi", "gres/gpu:rtx_pro_6000:1", "N/A", "PENDING"),
+        ]
+        mock_rq.side_effect = self._mock(rows)
+
+        avail = check_availability()
+        queue = slurm_mcp.golden_queue("yisroel")
+
+        counted = avail.golden["rtx_pro_6000"].pending
+        listed = sum(r["gpu_count"] for r in queue if r["gpu_type"] == "rtx_pro_6000")
+        assert counted == 13
+        assert listed == counted
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_rendered_card_and_list_agree(self, mock_rq):
+        from cli import render
+        rows = [
+            ("alice", "N/A", "gres/gpu:rtx_pro_6000:2", "PENDING"),
+            ("bob", "gres/gpu:rtx_pro_6000:3", "N/A", "PENDING"),
+        ]
+        mock_rq.side_effect = self._mock(rows)
+        avail = check_availability()
+        out = render.render_golden_all(
+            avail, queues={"yisroel": slurm_mcp.golden_queue("yisroel")}
+        )
+        assert "5 pending" in out
+        assert "alice: 2 GPU(s)" in out
+        assert "bob: 3 GPU(s)" in out
 
 
 class TestGoldenQueues:
