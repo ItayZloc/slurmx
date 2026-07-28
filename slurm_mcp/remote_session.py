@@ -24,8 +24,9 @@ import sys
 import time
 
 from config import (
-    CPU_PARTITION, CPU_QOS, CPU_CPUS, CPU_MEM, CLAUDE_LOG_DIR, MAIN_PARTITION,
+    CPU_PARTITION, CPU_QOS, CPU_CPUS, CPU_MEM, CLAUDE_LOG_DIR,
 )
+from config_defaults import MAIN_PARTITION
 from maintenance import cap_time_limit
 
 from . import selection

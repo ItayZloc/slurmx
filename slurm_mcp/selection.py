@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from config import MAIN_PARTITION
+from config_defaults import MAIN_PARTITION
 
 from . import availability
 from .gpu_catalog import GPU_TYPES, PRIMARY_QOS

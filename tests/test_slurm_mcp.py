@@ -2096,6 +2096,106 @@ class TestDashboardSegments:
         assert flat == _side_by_side(left, right)
 
 
+# Keys every config.py has carried since the first release, so importing them
+# straight from `config` is safe. Anything added later must go through
+# config_defaults.py with a fallback — a user's config.py is gitignored and
+# never updated by `slurmx update`, so a new hard import breaks their CLI.
+_BASELINE_CONFIG_KEYS = {
+    "USERNAME", "MAIL_USER", "GOLDEN_QOS", "CPU_PARTITION", "CPU_QOS",
+    "CPU_CPUS", "CPU_MEM", "EXCLUDE_NODES", "MAX_MEM_GB", "TIME_LIMIT",
+    "START_TIMEOUT", "GPU_DEFINITIONS", "GPU_DEFINITIONS_BY_QOS",
+    "CLAUDE_LOG_DIR",
+}
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _repo_python_files():
+    for sub in (".", "slurm_mcp", "cli", "tests", "bin"):
+        d = os.path.join(_REPO_ROOT, sub)
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if fn.endswith(".py"):
+                yield os.path.join(d, fn)
+
+
+class TestConfigDefaults:
+    """A key added to the config templates is still absent from every config.py
+    already on disk (it's gitignored). MAIN_PARTITION shipped as a hard
+    `from config import ...` and broke `slurmx status` on every older clone."""
+
+    def test_stale_config_still_resolves_main_partition(self):
+        import importlib
+        import types as _types
+        import config as real_config
+
+        stale = _types.ModuleType("config")   # a config.py predating the key
+        assert not hasattr(stale, "MAIN_PARTITION")
+        try:
+            with patch.dict(sys.modules, {"config": stale}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.MAIN_PARTITION == "main"
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
+    def test_stale_config_honours_env_override(self):
+        import importlib
+        import types as _types
+        import config as real_config
+
+        stale = _types.ModuleType("config")
+        try:
+            with patch.dict(sys.modules, {"config": stale}), \
+                 patch.dict(os.environ, {"SLURM_MAIN_PARTITION": "gpu"}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.MAIN_PARTITION == "gpu"
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
+    def test_real_config_wins_over_the_default(self):
+        import config
+        if hasattr(config, "MAIN_PARTITION"):
+            import config_defaults
+            assert config_defaults.MAIN_PARTITION == config.MAIN_PARTITION
+
+    def test_no_module_hard_imports_a_post_release_config_key(self):
+        import ast
+
+        offenders = []
+        for path in _repo_python_files():
+            with open(path) as fh:
+                tree = ast.parse(fh.read(), filename=path)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == "config":
+                    for alias in node.names:
+                        if alias.name not in _BASELINE_CONFIG_KEYS:
+                            offenders.append(
+                                f"{os.path.relpath(path, _REPO_ROOT)}: {alias.name}"
+                            )
+        assert not offenders, (
+            "these names are imported straight from `config` but are not in the "
+            "baseline every existing config.py has; give them a default in "
+            f"config_defaults.py instead: {offenders}"
+        )
+
+    def test_templates_carry_every_baseline_key(self):
+        import ast
+
+        for name in ("default.py", "yisroel.py"):
+            path = os.path.join(_REPO_ROOT, "config-examples", name)
+            tree = ast.parse(open(path).read(), filename=path)
+            assigned = {
+                t.id
+                for node in tree.body if isinstance(node, ast.Assign)
+                for t in node.targets if isinstance(t, ast.Name)
+            }
+            missing = _BASELINE_CONFIG_KEYS - assigned
+            assert not missing, f"config-examples/{name} is missing {missing}"
+
+
 # ============================================================
 # Live Integration Tests (run on actual cluster)
 # ============================================================

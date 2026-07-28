@@ -108,6 +108,12 @@ Edit `config.py` (copied from one of the templates in `config-examples/`):
 
 `CLAUDE_LOG_DIR` and other paths are auto-populated from `$USER`. You can also set `SLURM_GOLDEN_QOS="a,b"` in your shell to override the list at runtime.
 
+`config.py` is gitignored, so `slurmx update` never touches it — your copy keeps
+whatever template it was created from, and updating never requires editing it. Any
+key added to the templates later is therefore missing from every `config.py` already
+on disk, so new keys live in `config_defaults.py` with a fallback rather than being
+imported straight from `config`.
+
 ## Maintenance windows
 
 When cluster maintenance is announced, update the `WINDOWS` list in `maintenance.py`:

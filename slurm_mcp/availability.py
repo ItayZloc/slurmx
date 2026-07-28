@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 
-from config import GOLDEN_QOS, MAIN_PARTITION
+from config import GOLDEN_QOS
+from config_defaults import MAIN_PARTITION
 
 from . import shell
 from .gpu_catalog import GPU_TYPES, GPU_TYPES_BY_QOS, PRIMARY_QOS
