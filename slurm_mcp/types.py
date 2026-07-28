@@ -24,7 +24,8 @@ class GPUAvailability:
     free: int                                       # quota - running (pending is informational)
     users: dict = field(default_factory=dict)       # alias: running_users (kept for back-compat)
     running: int = 0
-    pending: int = 0
+    pending: int = 0                                 # waiting for a slot — these are the ones ahead of you
+    blocked: int = 0                                 # pending on something other than a slot (see _BLOCKED_REASONS)
     running_users: dict = field(default_factory=dict)
     pending_users: dict = field(default_factory=dict)
     offline: int = 0                                # GPUs excluded from total (node down/drain/unreachable)

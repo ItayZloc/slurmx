@@ -55,7 +55,32 @@ _GOLDEN_FIELDS = (
     ("tres-per-job", 60),
     ("tres-per-node", 60),
     ("State", 12),
+    ("Reason", 32),
 )
+
+# Pending reasons that mean "not waiting for a GPU". A job blocked on one of
+# these keeps its place in the priority order but the scheduler skips it, so it
+# will NOT take the next card that frees — counting it as queued overstates how
+# many GPUs are ahead of you. Spellings verified against this cluster's own
+# slurm_job_state_reason_string() (libslurm 25.11, reason codes 2/8/9/16/39/71).
+#
+# Deliberately NOT here: JobArrayTaskLimit (a throttled array still wants the
+# card, it just paces itself) and every quota reason — QOSMaxGRESPerUser,
+# MaxGRESPerAccount and friends clear when someone's *running* job ends, which
+# is exactly "waiting for a free slot".
+_BLOCKED_REASONS = frozenset({
+    "Dependency",                # waiting on another job
+    "DependencyNeverSatisfied",  # that job failed; this one never runs
+    "JobHeldUser",               # scontrol hold
+    "JobHeldAdmin",
+    "JobHoldMaxRequeue",
+    "BeginTime",                 # --begin=<future time>
+})
+
+
+def _is_blocked(reason: str) -> bool:
+    """True when a pending job is gated on something other than free capacity."""
+    return reason.strip() in _BLOCKED_REASONS
 
 
 def _golden_availability_for_qos(qos: str) -> dict:
@@ -66,6 +91,7 @@ def _golden_availability_for_qos(qos: str) -> dict:
 
     running = {}
     pending = {}
+    blocked = {}
     running_users = {}
     pending_users = {}
 
@@ -77,7 +103,7 @@ def _golden_availability_for_qos(qos: str) -> dict:
         if not line.strip():
             continue
 
-        user, tres_job, tres_node, state = _parse_row(line, _GOLDEN_FIELDS)
+        user, tres_job, tres_node, state, reason = _parse_row(line, _GOLDEN_FIELDS)
 
         if state not in ("RUNNING", "PENDING"):
             continue
@@ -89,6 +115,10 @@ def _golden_availability_for_qos(qos: str) -> dict:
         if state == "RUNNING":
             running[gpu_type] = running.get(gpu_type, 0) + gpu_count
             users_map = running_users.setdefault(gpu_type, {})
+        elif _is_blocked(reason):
+            # Counted separately, not as queue depth: it won't take a free card.
+            blocked[gpu_type] = blocked.get(gpu_type, 0) + gpu_count
+            continue
         else:
             pending[gpu_type] = pending.get(gpu_type, 0) + gpu_count
             users_map = pending_users.setdefault(gpu_type, {})
@@ -108,6 +138,7 @@ def _golden_availability_for_qos(qos: str) -> dict:
             users=running_users.get(gpu.name, {}),
             running=r,
             pending=p,
+            blocked=blocked.get(gpu.name, 0),
             running_users=running_users.get(gpu.name, {}),
             pending_users=pending_users.get(gpu.name, {}),
         )
@@ -283,17 +314,26 @@ _QUEUE_FIELDS = (
     ("UserName", 20),
     ("tres-per-job", 60),
     ("tres-per-node", 60),
+    ("Reason", 32),
     ("Name", 60),
 )
 
 
 def golden_queue(qos: str) -> list[dict]:
-    """Pending jobs on `qos`, in scheduling order (priority desc, then job id).
+    """Pending jobs on `qos` that are waiting for a GPU, in scheduling order
+    (priority desc, then job id).
 
     Each row: {priority, job_id, user, name, gpu_type, gpu_count}. Lets the
     status view show who/what is ahead in line when a golden ticket is full.
     Order matches SLURM's dispatch order: higher priority first, then lower
     (older) job id — so row 1 is next to run.
+
+    Jobs blocked on a dependency or a hold are left out (see _BLOCKED_REASONS):
+    they hold a priority slot but the scheduler skips them, so listing them
+    would put jobs "ahead of you" that aren't actually racing you for a card.
+    They surface as the card's separate `blocked` count instead. The same filter
+    runs in _golden_availability_for_qos, so the '(N pending)' header and this
+    list stay in agreement.
     """
     raw = shell._run_quiet([
         "squeue", "--qos", qos, "-t", "PENDING", "-h", "-O", _fmt(_QUEUE_FIELDS),
@@ -303,8 +343,9 @@ def golden_queue(qos: str) -> list[dict]:
     for line in raw.splitlines():
         if not line.strip():
             continue
-        prio_s, job_id, user, tres_job, tres_node, name = _parse_row(line, _QUEUE_FIELDS)
-        if not job_id:
+        (prio_s, job_id, user, tres_job,
+         tres_node, reason, name) = _parse_row(line, _QUEUE_FIELDS)
+        if not job_id or _is_blocked(reason):
             continue
 
         gpu_type, gpu_count = _gres_from_tres(tres_job, tres_node)

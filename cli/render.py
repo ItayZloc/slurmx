@@ -60,9 +60,13 @@ def render_golden_all(avail: slurm_mcp.Availability,
         qos_queue = queues.get(qos, [])
         cards = []
         for name, g in gpus.items():
+            # 'blocked' = pending on a dependency or a hold, so it isn't queue
+            # depth — shown only when non-zero to keep the card narrow (the TUI
+            # puts this column beside the cluster-wide one).
+            blocked = f", {g.blocked} blocked" if g.blocked else ""
             card = [
                 f"  {name}: {g.free}/{g.total} free "
-                f"({g.running} running, {g.pending} pending)"
+                f"({g.running} running, {g.pending} pending{blocked})"
             ]
             if g.running_users:
                 card.append("    Running:")

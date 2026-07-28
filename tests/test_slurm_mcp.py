@@ -63,15 +63,18 @@ def _sinfo_row(node, gres, gres_used, partition="main", state="idle") -> str:
     return _fixed_width_row([node, gres, gres_used, partition, state], _SINFO_FIELDS)
 
 
-def _golden_row(user, state, tres_job="N/A", tres_node="N/A") -> str:
+def _golden_row(user, state, tres_job="N/A", tres_node="N/A", reason="") -> str:
     """One fixed-width `squeue --qos X -h -O` row (the pending/running counter)."""
-    return _fixed_width_row([user, tres_job, tres_node, state], _GOLDEN_FIELDS)
+    return _fixed_width_row(
+        [user, tres_job, tres_node, state, reason], _GOLDEN_FIELDS
+    )
 
 
-def _queue_row(priority, job_id, user, tres_job="N/A", tres_node="N/A", name="job") -> str:
+def _queue_row(priority, job_id, user, tres_job="N/A", tres_node="N/A",
+               name="job", reason="") -> str:
     """One fixed-width `squeue --qos X -t PENDING -h -O` row (the ordered queue)."""
     return _fixed_width_row(
-        [priority, job_id, user, tres_job, tres_node, name], _QUEUE_FIELDS
+        [priority, job_id, user, tres_job, tres_node, reason, name], _QUEUE_FIELDS
     )
 
 
@@ -1537,16 +1540,22 @@ class TestPendingCounterMatchesQueue:
     its GPU request."""
 
     def _mock(self, rows):
-        """Serve the counter query and the ordered-queue query from one job list."""
+        """Serve the counter query and the ordered-queue query from one job list.
+
+        Rows are (user, tres_job, tres_node, state) or (..., state, reason)."""
+        rows = [r if len(r) == 5 else (*r, "") for r in rows]
+
         def run_quiet(cmd):
             if cmd[0] != "squeue":
                 return ""
             if "-t" in cmd:  # the ordered PENDING queue
                 return "\n".join(
-                    _queue_row(100, str(i), u, tj, tn)
-                    for i, (u, tj, tn, st) in enumerate(rows) if st == "PENDING"
+                    _queue_row(100, str(i), u, tj, tn, reason=rsn)
+                    for i, (u, tj, tn, st, rsn) in enumerate(rows) if st == "PENDING"
                 ) + "\n"
-            return "\n".join(_golden_row(u, st, tj, tn) for u, tj, tn, st in rows) + "\n"
+            return "\n".join(
+                _golden_row(u, st, tj, tn, rsn) for u, tj, tn, st, rsn in rows
+            ) + "\n"
         return run_quiet
 
     @patch("slurm_mcp.shell._run_quiet")
@@ -1583,6 +1592,108 @@ class TestPendingCounterMatchesQueue:
         assert "5 pending" in out
         assert "alice: 2 GPU(s)" in out
         assert "bob: 3 GPU(s)" in out
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_they_still_agree_with_a_dependency_in_the_mix(self, mock_rq):
+        rows = [
+            ("alice", "N/A", "gres/gpu:rtx_pro_6000:2", "PENDING", "Priority"),
+            ("lenga", "N/A", "gres/gpu:rtx_pro_6000:1", "PENDING", "Dependency"),
+        ]
+        mock_rq.side_effect = self._mock(rows)
+
+        avail = check_availability()
+        queue = slurm_mcp.golden_queue("yisroel")
+
+        card = avail.golden["rtx_pro_6000"]
+        listed = sum(r["gpu_count"] for r in queue if r["gpu_type"] == "rtx_pro_6000")
+        assert (card.pending, card.blocked) == (2, 1)
+        assert listed == card.pending
+
+
+class TestBlockedPendingJobs:
+    """A job pending on a dependency (or a hold) keeps its priority slot but the
+    scheduler skips it, so it will not take the next card that frees. Counting it
+    as queue depth overstates how many GPUs are ahead of you."""
+
+    def _mock(self, rows):
+        def run_quiet(cmd):
+            if cmd[0] != "squeue":
+                return ""
+            if "-t" in cmd:
+                return "\n".join(
+                    _queue_row(100, str(i), u, tres_node=tn, reason=rsn, name=f"j{i}")
+                    for i, (u, tn, st, rsn) in enumerate(rows) if st == "PENDING"
+                ) + "\n"
+            return "\n".join(
+                _golden_row(u, st, tres_node=tn, reason=rsn) for u, tn, st, rsn in rows
+            ) + "\n"
+        return run_quiet
+
+    @pytest.mark.parametrize("reason", [
+        "Dependency", "DependencyNeverSatisfied",
+        "JobHeldUser", "JobHeldAdmin", "JobHoldMaxRequeue", "BeginTime",
+    ])
+    def test_blocked_reasons_are_not_queue_depth(self, reason):
+        assert slurm_mcp.availability._is_blocked(reason)
+
+    @pytest.mark.parametrize("reason", [
+        # These clear when someone's *running* job ends — that IS waiting for a
+        # slot, so they stay in the count.
+        "Priority", "Resources", "None", "",
+        "QOSMaxGRESPerUser", "MaxGRESPerAccount", "QOSMaxMemoryPerUser",
+        "JobArrayTaskLimit",   # a throttled array still wants the card
+    ])
+    def test_capacity_reasons_still_count(self, reason):
+        assert not slurm_mcp.availability._is_blocked(reason)
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_counter_splits_pending_from_blocked(self, mock_rq):
+        rows = [
+            ("alice", "gres/gpu:rtx_pro_6000:1", "PENDING", "Priority"),
+            ("bob",   "gres/gpu:rtx_pro_6000:3", "PENDING", "Dependency"),
+            ("carol", "gres/gpu:rtx_pro_6000:2", "RUNNING", "None"),
+        ]
+        mock_rq.side_effect = self._mock(rows)
+        card = check_availability().golden["rtx_pro_6000"]
+        assert (card.running, card.pending, card.blocked) == (2, 1, 3)
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_blocked_job_is_not_an_extra_user_row(self, mock_rq):
+        rows = [("bob", "gres/gpu:rtx_pro_6000:3", "PENDING", "Dependency")]
+        mock_rq.side_effect = self._mock(rows)
+        card = check_availability().golden["rtx_pro_6000"]
+        assert card.pending_users == {}
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_queue_list_skips_blocked_jobs(self, mock_rq):
+        rows = [
+            ("alice", "gres/gpu:rtx_pro_6000:1", "PENDING", "Priority"),
+            ("bob",   "gres/gpu:rtx_pro_6000:1", "PENDING", "Dependency"),
+        ]
+        mock_rq.side_effect = self._mock(rows)
+        assert [r["user"] for r in slurm_mcp.golden_queue("yisroel")] == ["alice"]
+
+    @patch("slurm_mcp.shell._run_quiet")
+    def test_card_shows_blocked_count(self, mock_rq):
+        from cli import render
+        rows = [
+            ("alice", "gres/gpu:rtx_pro_6000:1", "PENDING", "Priority"),
+            ("bob",   "gres/gpu:rtx_pro_6000:2", "PENDING", "Dependency"),
+        ]
+        mock_rq.side_effect = self._mock(rows)
+        avail = check_availability()
+        out = render.render_golden_all(avail)
+        assert "1 pending, 2 blocked" in out
+
+    def test_no_blocked_suffix_when_zero(self):
+        from cli import render
+        avail = Availability()
+        avail.golden_by_qos["yisroel"] = {
+            "rtx_6000": GPUAvailability("rtx_6000", 12, 12, 0, running=12, pending=4),
+        }
+        out = render.render_golden_all(avail)
+        assert "(12 running, 4 pending)" in out
+        assert "blocked" not in out
 
 
 class TestGoldenQueues:

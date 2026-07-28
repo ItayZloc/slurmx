@@ -49,6 +49,20 @@ ordered: consecutive jobs from the same user merge into one `user: N GPU(s)` row
 (GPUs summed), and a user split by another user shows at each position — so you
 can see who is ahead of you.
 
+`pending` counts only jobs waiting for a **free GPU**. A job pending on a
+dependency (`--after`/`--dependency`), a `scontrol hold`, or a future `--begin`
+time keeps its place in the priority order, but the scheduler skips it, so it
+won't take the next card that frees. Those are reported separately as
+`N blocked` and left out of the ordered list:
+
+```
+  rtx_pro_6000: 2/16 free (14 running, 0 pending, 1 blocked)
+```
+
+Quota waits (`QOSMaxGRESPerUser`, `MaxGRESPerAccount`, …) still count as pending:
+they clear when someone's running job ends, which is exactly waiting for a slot.
+Same for a `%N`-throttled job array.
+
 ## Installation
 
 ```bash
