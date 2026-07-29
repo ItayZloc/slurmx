@@ -9,14 +9,19 @@ After install (`./setup.sh` or `slurmx setup`), see [WELCOME.md](WELCOME.md) for
 | Tool | Description |
 |------|-------------|
 | `cluster_summary` | Single-call dashboard: your jobs + golden tickets (per QoS) + cluster-wide GPU availability. `view="jobs"` or `"gpu"` narrows the output. |
-| `submit_job` | Submit GPU/CPU jobs (auto-selects GPU by VRAM). Golden-only by default (preemption-immune); pass `golden_only=false` to allow the main-pool fallback. Supports `dependency` (e.g. `afterok:12345`). |
-| `select_gpu` | Recommend best GPU for a VRAM requirement |
-| `job_history` | Show recent completed/failed jobs (via sacct) |
-| `get_job_status` | Get detailed status of a specific job |
-| `wait_for_job` | Block until a job finishes |
-| `read_job_log` | Read SLURM log file for a job |
-| `diagnose_job` | Classify job failures (OOM, timeout, missing module, code error) |
-| `cancel_jobs` | Cancel jobs by ID or all |
+| `submit_job` | Submit GPU/CPU jobs (auto-selects GPU by VRAM). Golden-only by default (preemption-immune); pass `golden_only=false` to allow the main-pool fallback. Supports `dependency` (e.g. `afterok:12345`). Blocks until the job is RUNNING. |
+| `select_gpu` | Recommend a GPU for a VRAM requirement, with current availability. Advisory — it always reports the non-golden selection, so it can disagree with what a default `submit_job` picks. |
+| `job_history` | Recent jobs from sacct, finished ones included. Yours only, newest first. |
+| `get_job_status` | One job's status as JSON (squeue, falling back to sacct). Carries the pending reason; branch on `state`, not `exit_code`. |
+| `wait_for_job` | Block until a job reaches a terminal state. Returns the last polled status on timeout rather than raising. |
+| `read_job_log` | Read a job's SLURM log. `output_dir` must be the exact directory the job's `--output` points at — no recursion. |
+| `diagnose_job` | Classify a *finished* job's failure (OOM, timeout, missing module, dependency, killed, code error) and show the log tail. Running/pending jobs short-circuit. |
+| `cancel_jobs` | Cancel by ID, or every job you own. The count returned is cancels requested, not confirmed. |
+
+Every tool reports failure in its return value instead of raising, so a call that
+returned isn't necessarily a call that worked. Each docstring spells out its own
+failure strings; the common ones are `success: false` from `submit_job`, `No log
+file found ...` from `read_job_log`, and state `UNKNOWN` from `get_job_status`.
 
 ## Golden tickets (preemption) vs the main pool
 

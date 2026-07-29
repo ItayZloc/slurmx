@@ -2060,6 +2060,30 @@ class TestDiagnoseAndHistoryRefactor:
         out = slurm_mcp.job_history(days=2)
         assert "No jobs found" in out
 
+    @pytest.mark.parametrize("alloc_tres,expected", [
+        # sacct's own spelling — '=' between type and count. This is what the
+        # cluster actually emits; a ':'-only pattern left the column blank.
+        ("billing=10,cpu=10,gres/gpu:rtx_6000=1,gres/gpu=1,mem=80G,node=1",
+         "rtx_6000:1"),
+        # squeue's tres-per-node spelling, in case a caller passes that through.
+        ("cpu=10,gres/gpu:rtx_pro_6000:2,mem=80G", "rtx_pro_6000:2"),
+        # untyped request: no card name to show.
+        ("billing=1,cpu=1,gres/gpu=1,mem=4G,node=1", ""),
+        # CPU job.
+        ("billing=1,cpu=4,mem=8G,node=1", ""),
+    ])
+    @patch("slurm_mcp.history.subprocess.run")
+    def test_history_parses_gpu_from_alloctres(self, mock_run, alloc_tres, expected):
+        row = "|".join(["12345", "train", "COMPLETED", "0:0", "01:02:03",
+                        alloc_tres, "ise-001", "2026-07-29T10:00:00"])
+        mock_run.return_value = SimpleNamespace(returncode=0, stdout=row + "\n", stderr="")
+        out = slurm_mcp.job_history(days=2)
+        assert "12345" in out
+        if expected:
+            assert expected in out
+        else:
+            assert "gres/gpu" not in out
+
 
 # ============================================================
 # Unit Tests: the 7 new CLI subcommands (parity with MCP tools)

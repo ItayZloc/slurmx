@@ -13,14 +13,20 @@ MCP TOOLS (invoked by Claude in chat)
                            (lists pending jobs by user, in order, when a ticket is full)
   submit_job               submit GPU/CPU jobs (auto-selects GPU by VRAM;
                            golden-only by default — golden_only=false to
-                           allow the preemptible main-pool fallback)
-  select_gpu               recommend a GPU for a VRAM requirement
-  get_job_status           detailed status of a specific job
-  wait_for_job             block until a job finishes
-  read_job_log             read a job's SLURM log
-  diagnose_job             classify failures (OOM/timeout/missing module/etc)
+                           allow the preemptible main-pool fallback;
+                           blocks until the job is RUNNING)
+  select_gpu               recommend a GPU for a VRAM requirement (advisory;
+                           reports the non-golden pick, so it can differ
+                           from what a default submit_job uses)
+  get_job_status           one job's status as JSON, incl. the pending reason
+  wait_for_job             block until a job reaches a terminal state
+  read_job_log             read a job's SLURM log (output_dir must be the
+                           exact directory the job logs to)
+  diagnose_job             classify a finished job's failure + log tail
   cancel_jobs              cancel by ID, all, or pending-only
-  job_history              recent finished jobs from sacct
+  job_history              recent jobs from sacct, finished ones included
+
+  None of them raise on failure — they return it. Read what comes back.
 
 CLI COMMANDS
   slurmx <subcommand>      umbrella, like `git` or `aws-cli`:
