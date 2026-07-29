@@ -50,9 +50,12 @@ def job_history(days: int = 3, state: Optional[str] = None, limit: int = 30) -> 
         if not parts[0].isdigit():
             continue
         gpu = ""
-        m = re.search(r"gres/gpu:([^:,]+:\d+)", parts[5])
+        # sacct writes AllocTRES with '=' (gres/gpu:rtx_6000=1) where squeue's
+        # tres-per-node uses ':' (gres/gpu:rtx_6000:1). Accept both, or the
+        # column silently stays blank for every GPU job.
+        m = re.search(r"gres/gpu:([^:,=]+)[:=](\d+)", parts[5])
         if m:
-            gpu = m.group(1)
+            gpu = f"{m.group(1)}:{m.group(2)}"
         rows.append({
             "job_id": parts[0],
             "name": parts[1],
