@@ -63,6 +63,3 @@ GPU_DEFINITIONS_BY_QOS = {
 
 # Back-compat: flat list = primary QoS's definitions.
 GPU_DEFINITIONS = GPU_DEFINITIONS_BY_QOS[GOLDEN_QOS[0]]
-
-# --- Claude Job Defaults (auto-populated from USERNAME) ---
-CLAUDE_LOG_DIR = f"/home/{USERNAME}/.claude/logs"

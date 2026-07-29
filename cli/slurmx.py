@@ -24,7 +24,6 @@ from cli import wait as wait_mod
 from cli import log as log_mod
 from cli import diagnose as diagnose_mod
 from cli import cancel as cancel_mod
-from slurm_mcp import remote_session
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -57,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slurmx",
         description=(
-            "Cluster CLI: SLURM job management + Claude Code remote sessions. "
+            "Cluster CLI: submit, monitor, and manage SLURM jobs. "
             "Use `slurmx <subcommand> --help` for per-command options."
         ),
     )
@@ -75,11 +74,6 @@ def build_parser() -> argparse.ArgumentParser:
     _add_subcommand(
         subparsers, "submit", submit_mod,
         help="Submit a GPU/CPU job (auto-selects GPU by VRAM).",
-    )
-    _add_subcommand(
-        subparsers, "remote-session", remote_session,
-        aliases=("rc", "claude"),
-        help="Launch `claude remote-control` as a SLURM job.",
     )
     _add_subcommand(
         subparsers, "select-gpu", select_gpu_mod,

@@ -27,7 +27,7 @@ Check with MCP cluster_summary or squeue, not ps aux.
 ### Key Rules
 - Always use dry_run=true first to preview the sbatch script before submitting.
 - For submit_job: always specify vram_gb — never pick GPU types manually unless
-  the user asks. (For launch_remote_session use gpu_type instead — see below.)
+  the user asks.
 - Default to 1 GPU. Use num_gpus=2 only when the user explicitly requests multi-GPU
   or the workload requires it (e.g. model too large for a single card).
   Max 2 GPUs per cluster policy — requesting more raises an error.
@@ -42,12 +42,6 @@ Check with MCP cluster_summary or squeue, not ps aux.
 - Use cluster_summary as the single dashboard tool: it covers jobs AND GPU availability.
   Use view="jobs" or view="gpu" to narrow the output.
 - Use diagnose_job to classify failures (OOM, timeout, missing module, code error).
-- Before calling launch_remote_session, ASK the user for hardware (cpu/gpu),
-  time limit (1/2/3/7 days), AND permission_mode (default/acceptEdits/plan).
-  All three are required — do not guess. If they pick gpu, ALSO ask for
-  gpu_type (gtx_1080/rtx_2080/rtx_3090/rtx_4090/rtx_6000/rtx_pro_6000).
-  Do not use vram_gb — gpu_type is the exact selection. The tool
-  docstring has the option descriptions to present.
 """)
 
 
@@ -283,144 +277,6 @@ def job_history(days: int = 3, state: str | None = None, limit: int = 30) -> str
         limit: Max jobs to return (default: 30).
     """
     return slurm_mcp.job_history(days=days, state=state, limit=limit)
-
-
-@mcp.tool()
-def launch_remote_session(
-    hardware: Literal["cpu", "gpu"],
-    days: Literal[1, 2, 3, 7],
-    permission_mode: Literal["default", "acceptEdits", "plan"],
-    name: str | None = None,
-    gpu_type: Literal[
-        "gtx_1080", "rtx_2080", "rtx_3090", "rtx_4090",
-        "rtx_6000", "rtx_pro_6000",
-    ] | None = None,
-    vram_gb: int = 24,
-    golden_only: bool = True,
-    workdir: str | None = None,
-    resume: str | None = None,
-    wait_url_seconds: int = 90,
-) -> str:
-    """Launch a Claude Code remote-control server as a SLURM job.
-
-    Starts `claude remote-control` in server mode on a compute node. By
-    default the tool polls the SLURM log for the
-    `https://claude.ai/code/session_<id>` URL and returns it inline in
-    the response (so the user just clicks). Set wait_url_seconds=0 to
-    skip the wait and use read_job_log later.
-
-    Connect via claude.ai/code or the Claude mobile app.
-
-    REQUIRED — the assistant MUST ASK the user before calling. Present
-    each option to the user verbatim and wait for their choice:
-
-      1. hardware: "cpu" or "gpu"?
-           - cpu: editor-only sessions (Claude reading/writing code, no
-             local GPU work). Cheapest, no idle-GPU cancellation risk.
-           - gpu: only if you'll run GPU code IN the session. The cluster
-             cancels GPU jobs whose GPU sits idle.
-
-      2. days: 1, 2, 3, or 7?
-           Job time limit. Pick the shortest that covers your work.
-
-      3. permission_mode: which level of approval prompts?
-           - "default":     Claude asks before every edit, bash command, or
-                            tool call. Most safety, most clicks.
-           - "acceptEdits": Auto-approves file edits and routine filesystem
-                            bash (mkdir / touch / cp / mv / rm / sed) inside
-                            the working directory. Still asks before
-                            arbitrary bash. Recommended balance.
-           - "plan":        Read-only. Claude researches and writes a plan
-                            but won't touch files. For exploring a codebase.
-
-           NOTE: "auto" and "bypassPermissions" are NOT available in
-           remote-control sessions per Anthropic policy.
-
-      4. ONLY IF hardware="gpu", ALSO ASK: gpu_type?
-           Pick the EXACT GPU class (passed as gpu_type=...).
-             - gtx_1080      8GB  — small inference
-             - rtx_2080      11GB — small training
-             - rtx_3090      24GB — medium models
-             - rtx_4090      24GB — medium models (newer)
-             - rtx_6000      48GB — large models (golden ticket)
-             - rtx_pro_6000  96GB — very large (golden ticket)
-           Do NOT pass vram_gb instead — that triggers a "smallest
-           fitting golden" fallback that may upgrade an 8GB request to
-           a 48GB card. Always ask the user for their GPU class
-           explicitly.
-
-    Args:
-        hardware: "cpu" or "gpu".
-        days: 1, 2, 3, or 7.
-        permission_mode: "default" | "acceptEdits" | "plan".
-        name: Session title shown at claude.ai/code (default: auto).
-        gpu_type: Exact GPU type when hardware="gpu". One of gtx_1080,
-            rtx_2080, rtx_3090, rtx_4090, rtx_6000, rtx_pro_6000.
-            Takes precedence over vram_gb.
-        vram_gb: VRAM fallback when gpu_type is None (default 24).
-            Triggers "smallest fitting golden" auto-selection.
-        golden_only: Force qos=yisroel on the card's dedicated golden partition
-            (preemption-immune) and never fall back to the preemptible main pool.
-            Ignored for hardware="cpu". Default true; pass false to allow the
-            golden-first-then-main fallback.
-        workdir: Working directory (default: cwd).
-        resume: Optional session ID to resume from a previous Claude Code
-            chat. Find session IDs in the claude.ai/code session list.
-            None starts a fresh session.
-        wait_url_seconds: Block this many seconds polling the SLURM log
-            for the `claude.ai/code/session_<id>` URL, returning it in
-            the response when found. Default 90 — covers typical
-            sbatch-schedule + claude-startup time. Set to 0 to return
-            immediately without waiting (the agent must then call
-            read_job_log itself).
-
-    Notes:
-        - Remote-control sessions time out after ~10 min of network outage.
-          Reconnect by submitting a fresh session.
-    """
-    from slurm_mcp.remote_session import submit_remote_session_job, extract_session_url
-    from maintenance import MaintenanceWindowError
-
-    try:
-        job_id, log_path = submit_remote_session_job(
-            name=name, hardware=hardware, days=days,
-            permission_mode=permission_mode,
-            gpu_type=gpu_type,
-            vram_gb=vram_gb, golden_only=golden_only,
-            workdir=workdir, resume=resume,
-        )
-    except (RuntimeError, MaintenanceWindowError) as e:
-        return f"Failed: {e}"
-
-    lines = [
-        "Remote-control session job submitted!",
-        f"  Job ID: {job_id}",
-        f"  Log: {log_path}",
-        f"  Hardware: {hardware}",
-        f"  Time limit: {days} day(s)",
-        f"  Permission mode: {permission_mode}",
-    ]
-    if resume:
-        lines.append(f"  Resuming session: {resume}")
-
-    if wait_url_seconds > 0:
-        url = extract_session_url(log_path, timeout=wait_url_seconds)
-        if url:
-            lines.append(f"  Session URL: {url}")
-        else:
-            lines.append(
-                f"  Session URL: pending — not in log after {wait_url_seconds}s. "
-                f"Retry with read_job_log({job_id})."
-            )
-    else:
-        lines.append(f"  Check log for connection URL: read_job_log({job_id})")
-    if hardware == "gpu":
-        lines.append("")
-        lines.append("  WARNING: GPU jobs are cancelled by the cluster if the GPU")
-        lines.append("  sits idle. Keep the session actively running GPU code, or")
-        lines.append("  switch to hardware='cpu' if you only need the editor.")
-
-    return "\n".join(lines)
 
 
 if __name__ == "__main__":

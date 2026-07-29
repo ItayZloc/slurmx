@@ -1,6 +1,6 @@
 # slurmx
 
-MCP server and unified CLI that lets you (and Claude Code) submit, monitor, and manage SLURM GPU jobs. Auto-selects the smallest GPU that fits your VRAM needs, tries golden tickets first, falls back to cluster-wide. Also spawns `claude remote-control` as a SLURM job so you can keep coding from your phone or another machine.
+MCP server and unified CLI that lets you (and Claude Code) submit, monitor, and manage SLURM GPU jobs. Auto-selects the smallest GPU that fits your VRAM needs, tries golden tickets first, falls back to cluster-wide.
 
 After install (`./setup.sh` or `slurmx setup`), see [WELCOME.md](WELCOME.md) for a one-page summary of what's available and how to drive it from a Claude Code chat. The setup script prints the same content at the end of `uv sync`.
 
@@ -17,7 +17,6 @@ After install (`./setup.sh` or `slurmx setup`), see [WELCOME.md](WELCOME.md) for
 | `read_job_log` | Read SLURM log file for a job |
 | `diagnose_job` | Classify job failures (OOM, timeout, missing module, code error) |
 | `cancel_jobs` | Cancel jobs by ID or all |
-| `launch_remote_session` | Spawn `claude remote-control` as a SLURM job. Required: `hardware` (cpu/gpu), `days` (1/2/3/7), `permission_mode` (default/acceptEdits/plan). For gpu, also asks the user for `gpu_type` (gtx_1080…rtx_pro_6000) and takes `golden_only`. Polls the SLURM log and returns the `claude.ai/code/session_<id>` URL inline (default 90s wait; `wait_url_seconds=0` to skip). |
 
 ## Golden tickets (preemption) vs the main pool
 
@@ -29,9 +28,8 @@ Your golden QoS (e.g. `yisroel`) runs on the per-card dedicated partitions
 `normal` jobs and nothing bumps it. A golden QoS is invalid on `main`/`gpu`, so
 "golden" always means a dedicated partition.
 
-`submit_job` / `launch_remote_session` / `slurmx submit` are **golden-only by
-default**. Opt out with the **`--allow-main`** CLI flag (`golden_only=false` on the
-MCP tools):
+`submit_job` and `slurmx submit` are **golden-only by default**. Opt out with the
+**`--allow-main`** CLI flag (`golden_only=false` on the MCP tool):
 
 - **default (golden-only)** — force `qos=yisroel` on the card's dedicated partition
   and **never** accept a preemptible slot. If the golden ticket is full the job
@@ -91,25 +89,6 @@ claude mcp list
 
 To pull updates later: `slurmx update` (or `./update.sh`) — fast-forward `git pull`, re-runs `uv sync` if dependencies changed.
 
-## Before using `launch_remote_session`
-
-This step is **only required if you plan to use `launch_remote_session`** (the tool that spawns `claude remote-control` as a SLURM job). The other tools work without it.
-
-Remote Control requires a **full-scope OAuth session token**, not a long-lived API token. Run this once on a node that mounts your home directory (your login node is fine — `~/.claude/` is NFS-shared):
-
-```bash
-claude auth login        # interactive browser OAuth flow
-```
-
-If you previously authenticated via `claude setup-token` (which writes an inference-only token), swap it for an OAuth token:
-
-```bash
-claude auth logout
-claude auth login
-```
-
-**Gotcha:** `claude auth status` reports both token types as `authMethod: "claude.ai"`, so you can't tell them apart from the status output. The symptom that you're on the wrong token is `Remote Control requires a full-scope login token` in the SLURM log of a failed `launch_remote_session` job. If you see that, run `claude auth logout && claude auth login`.
-
 ## Configuration
 
 Edit `config.py` (copied from one of the templates in `config-examples/`):
@@ -120,7 +99,7 @@ Edit `config.py` (copied from one of the templates in `config-examples/`):
 | `GOLDEN_QOS` | List of your QoS, e.g. `["yisroel"]` or `["yisroel", "shared"]`. First entry is primary for job submission. |
 | `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_quota, golden_partition)` tuples for that QoS. |
 
-`CLAUDE_LOG_DIR` and other paths are auto-populated from `$USER`. You can also set `SLURM_GOLDEN_QOS="a,b"` in your shell to override the list at runtime.
+Paths are auto-populated from `$USER`. You can also set `SLURM_GOLDEN_QOS="a,b"` in your shell to override the list at runtime.
 
 `config.py` is gitignored, so `slurmx update` never touches it — your copy keeps
 whatever template it was created from, and updating never requires editing it. Any
@@ -148,7 +127,6 @@ The server embeds usage rules that Claude reads automatically. Ask naturally:
 - "Submit a training job needing 48GB VRAM"
 - "What happened to job 12345?"
 - "Show me a cluster summary"
-- "Launch a remote-control session on CPU for 1 day"
 
 ## CLI (`slurmx`)
 
@@ -169,8 +147,6 @@ slurmx log 12345                           # read a job's SLURM log (--tail N)
 slurmx diagnose 12345                      # classify a failed job (OOM/timeout/...)
 slurmx history --days 7                    # recent finished jobs (sacct)
 slurmx cancel 12345                        # cancel jobs by ID (or --all)
-slurmx remote-session                      # interactive launch_remote_session
-slurmx rc                                  # short alias for remote-session
 slurmx setup                               # = ./setup.sh
 slurmx update                              # = ./update.sh
 slurmx <subcommand> --help                 # per-subcommand options

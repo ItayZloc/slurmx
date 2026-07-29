@@ -111,9 +111,9 @@ def read_job_log(
     patterns = [
         os.path.join(output_dir, f"slurm-*-{job_id}.out"),
         os.path.join(output_dir, f"slurm-{job_id}.out"),
-        # Generic prefix — matches e.g. claude-<name>-<id>.out written by
-        # launch_remote_session. The trailing `.out` anchor keeps short
-        # job IDs from matching longer ones (12345 vs 123456789).
+        # Generic prefix — matches e.g. train-<name>-<id>.out from a job whose
+        # --output template isn't slurm-prefixed. The trailing `.out` anchor
+        # keeps short job IDs from matching longer ones (12345 vs 123456789).
         os.path.join(output_dir, f"*-{job_id}.out"),
     ]
     if job_name:

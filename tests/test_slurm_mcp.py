@@ -1175,13 +1175,13 @@ class TestReadJobLog:
         assert content == "simple log\n"
 
     def test_reads_non_slurm_prefix_log(self, tmp_path):
-        """Tests that logs with prefixes other than 'slurm-' are found
-        (e.g. `claude-<name>-<id>.out` written by launch_remote_session)."""
-        log_file = tmp_path / "claude-myproj-88888.out"
-        log_file.write_text("Remote control session URL: https://claude.ai/code/abc\n")
+        """Tests that logs with prefixes other than 'slurm-' are found —
+        a job named by --job-name gets `<name>-<id>.out`, not `slurm-<id>.out`."""
+        log_file = tmp_path / "train-myproj-88888.out"
+        log_file.write_text("epoch 1 loss 0.42\n")
         content = read_job_log(88888, output_dir=str(tmp_path))
         assert content is not None
-        assert "claude.ai/code" in content
+        assert "epoch 1" in content
 
     def test_job_id_substring_does_not_match(self, tmp_path):
         """A file whose id-portion is a substring of the requested id must
@@ -2215,7 +2215,6 @@ _BASELINE_CONFIG_KEYS = {
     "USERNAME", "MAIL_USER", "GOLDEN_QOS", "CPU_PARTITION", "CPU_QOS",
     "CPU_CPUS", "CPU_MEM", "EXCLUDE_NODES", "MAX_MEM_GB", "TIME_LIMIT",
     "START_TIMEOUT", "GPU_DEFINITIONS", "GPU_DEFINITIONS_BY_QOS",
-    "CLAUDE_LOG_DIR",
 }
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
