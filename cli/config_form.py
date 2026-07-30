@@ -8,6 +8,7 @@ goes through cli/config_model.ConfigDoc.
 
 from __future__ import annotations
 
+import curses
 from dataclasses import dataclass, field as dataclass_field
 
 from cli import config_model as cm
@@ -117,3 +118,157 @@ def build_rows(state: FormState) -> list[Row]:
                         qos=qos, selectable=True))
         rows.append(Row("blank", spans=[("", Role.PLAIN)]))
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# Key handling (pure reducer)
+# --------------------------------------------------------------------------- #
+
+SAVE_KEYS = (ord("s"), ord("S"))
+QUIT_KEYS = (ord("q"), ord("Q"))
+_UP = (curses.KEY_UP, ord("k"))
+_DOWN = (curses.KEY_DOWN, ord("j"))
+_ENTER = (ord("\n"), ord("\r"), curses.KEY_ENTER)
+_BACKSPACE = (curses.KEY_BACKSPACE, 127, 8)
+_ESC = 27
+
+SAVED_HINT = ("saved · config.py.bak written · a running Claude Code session "
+              "keeps the old config until you restart it or reconnect with /mcp")
+
+
+def _selectable(rows) -> list[int]:
+    return [i for i, r in enumerate(rows) if r.selectable]
+
+
+def move(state: FormState, key: int) -> FormState:
+    """Cursor movement over selectable rows only."""
+    rows = build_rows(state)
+    idx = _selectable(rows)
+    if not idx:
+        return state
+    here = min(range(len(idx)), key=lambda i: abs(idx[i] - state.cursor))
+    if key in _DOWN:
+        here = min(here + 1, len(idx) - 1)
+    elif key in _UP:
+        here = max(here - 1, 0)
+    elif key == curses.KEY_NPAGE:
+        here = min(here + 10, len(idx) - 1)
+    elif key == curses.KEY_PPAGE:
+        here = max(here - 10, 0)
+    elif key == ord("G"):
+        here = len(idx) - 1
+    elif key == ord("g"):
+        here = 0
+    state.cursor = idx[here]
+    state.cell = 0
+    return state
+
+
+def _begin_edit(state: FormState, rows) -> None:
+    row = rows[state.cursor]
+    if row.kind == "field":
+        state.editing = state.doc.text_value(row.field)
+    else:
+        card = dict(state.doc.groups())[row.qos][row.index]
+        state.editing = str(card[state.cell])
+    state.edit_pos = len(state.editing)
+
+
+def _commit_edit(state: FormState, rows) -> None:
+    row = rows[state.cursor]
+    buf = state.editing or ""
+    if row.kind == "field":
+        err = state.doc.set(row.field, buf)
+    else:
+        err = state.doc.set_card(row.qos, row.index, state.cell, buf)
+    if err:
+        state.status = err
+        return
+    state.editing = None
+    state.status = ""
+
+
+def _edit_key(state: FormState, key: int, rows) -> FormState:
+    if key in _ENTER:
+        _commit_edit(state, rows)
+    elif key == _ESC:
+        state.editing = None
+        state.status = ""
+    elif key in _BACKSPACE:
+        if state.edit_pos:
+            state.editing = (state.editing[:state.edit_pos - 1]
+                             + state.editing[state.edit_pos:])
+            state.edit_pos -= 1
+    elif key == curses.KEY_DC:
+        state.editing = (state.editing[:state.edit_pos]
+                         + state.editing[state.edit_pos + 1:])
+    elif key == curses.KEY_LEFT:
+        state.edit_pos = max(0, state.edit_pos - 1)
+    elif key == curses.KEY_RIGHT:
+        state.edit_pos = min(len(state.editing), state.edit_pos + 1)
+    elif key == curses.KEY_HOME:
+        state.edit_pos = 0
+    elif key == curses.KEY_END:
+        state.edit_pos = len(state.editing)
+    elif 32 <= key < 127:
+        state.editing = (state.editing[:state.edit_pos] + chr(key)
+                         + state.editing[state.edit_pos:])
+        state.edit_pos += 1
+    return state
+
+
+def dispatch(state: FormState, key: int) -> FormState:
+    """Apply one keypress. Mutates and returns `state`.
+
+    Save is performed here rather than in the loop so the whole key contract is
+    testable in one place; the loop only draws and reads keys.
+    """
+    rows = build_rows(state)
+    if state.editing is not None:
+        return _edit_key(state, key, rows)
+
+    if key != ord("d") and state.confirm == "delete":
+        state.confirm = None
+        state.status = ""
+    if key not in QUIT_KEYS and state.confirm == "quit":
+        state.confirm = None
+        state.status = ""
+
+    row = rows[state.cursor] if state.cursor < len(rows) else None
+
+    if key in QUIT_KEYS:
+        if state.doc.dirty and state.confirm != "quit":
+            state.confirm = "quit"
+            state.status = "unsaved changes — q again to discard, s to save"
+        else:
+            state.done = True
+    elif key in SAVE_KEYS:
+        err = state.doc.save()
+        state.status = f"cannot save: {err}" if err else SAVED_HINT
+    elif key in _ENTER and row is not None:
+        if row.kind == "group":
+            state.folds.symmetric_difference_update({row.qos})
+        elif row.kind == "add":
+            state.doc.add_card(row.qos)
+        elif row.kind in ("field", "card"):
+            _begin_edit(state, rows)
+    elif key == ord("a") and row is not None and row.qos:
+        state.doc.add_card(row.qos)
+    elif key == ord("d") and row is not None and row.kind == "card":
+        if state.confirm == "delete":
+            state.doc.delete_card(row.qos, row.index)
+            state.confirm = None
+            state.status = ""
+        else:
+            state.confirm = "delete"
+            state.status = f"delete {row.qos} card {row.index + 1}? d again to confirm"
+    elif key == ord("r") and row is not None and row.kind == "field":
+        state.doc.revert(row.field)
+        state.status = f"{row.field} reverted"
+    elif key == curses.KEY_RIGHT and row is not None and row.kind == "card":
+        state.cell = min(state.cell + 1, len(cm.CARD_CELLS) - 1)
+    elif key == curses.KEY_LEFT and row is not None and row.kind == "card":
+        state.cell = max(state.cell - 1, 0)
+    else:
+        move(state, key)
+    return state

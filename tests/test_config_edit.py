@@ -489,3 +489,167 @@ class TestRows:
         for name in ("CFG_NAME", "CFG_VALUE", "CFG_TAG", "CFG_EDITED",
                      "CFG_THEAD", "CFG_ERROR"):
             assert hasattr(theme.Role, name)
+
+
+import curses
+
+
+class TestDispatch:
+    def cursor_field(self, st, name):
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st)) if r.field == name)
+        return st
+
+    def test_down_skips_unselectable_rows(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = 0
+        cf.dispatch(st, curses.KEY_DOWN)
+        assert cf.build_rows(st)[st.cursor].selectable is True
+
+    def test_down_then_up_returns(self, tmp_path):
+        st = self.cursor_field(state_for(tmp_path), "MAX_MEM_GB")
+        start = st.cursor
+        cf.dispatch(st, ord("j"))
+        cf.dispatch(st, ord("k"))
+        assert st.cursor == start
+
+    def test_g_and_shift_g_jump(self, tmp_path):
+        st = state_for(tmp_path)
+        cf.dispatch(st, ord("G"))
+        rows = cf.build_rows(st)
+        assert rows[st.cursor].selectable is True
+        assert st.cursor == max(i for i, r in enumerate(rows) if r.selectable)
+        cf.dispatch(st, ord("g"))
+        # USERNAME is derived and unselectable, so the top is MAIL_USER.
+        assert cf.build_rows(st)[st.cursor].field == "MAIL_USER"
+
+    def test_enter_on_a_field_starts_editing_prefilled(self, tmp_path):
+        st = self.cursor_field(state_for(tmp_path), "MAX_MEM_GB")
+        cf.dispatch(st, ord("\n"))
+        assert st.editing == "80"
+        assert st.edit_pos == 2
+
+    def test_typing_then_enter_stages_the_value(self, tmp_path):
+        st = self.cursor_field(state_for(tmp_path), "MAX_MEM_GB")
+        cf.dispatch(st, ord("\n"))
+        for _ in range(2):
+            cf.dispatch(st, curses.KEY_BACKSPACE)
+        for ch in "64":
+            cf.dispatch(st, ord(ch))
+        cf.dispatch(st, ord("\n"))
+        assert st.editing is None
+        assert st.doc.value("MAX_MEM_GB") == 64
+
+    def test_invalid_value_keeps_the_editor_open_with_a_reason(self, tmp_path):
+        st = self.cursor_field(state_for(tmp_path), "MAX_MEM_GB")
+        cf.dispatch(st, ord("\n"))
+        st.editing, st.edit_pos = "huge", 4
+        cf.dispatch(st, ord("\n"))
+        assert st.editing == "huge"
+        assert "integer" in st.status
+        assert st.doc.dirty is False
+
+    def test_escape_cancels_the_edit(self, tmp_path):
+        st = self.cursor_field(state_for(tmp_path), "MAX_MEM_GB")
+        cf.dispatch(st, ord("\n"))
+        st.editing = "64"
+        cf.dispatch(st, 27)
+        assert st.editing is None
+        assert st.doc.dirty is False
+
+    def test_r_reverts_one_field(self, tmp_path):
+        st = self.cursor_field(state_for(tmp_path), "MAX_MEM_GB")
+        st.doc.set("MAX_MEM_GB", "64")
+        cf.dispatch(st, ord("r"))
+        assert st.doc.dirty is False
+        assert st.doc.value("MAX_MEM_GB") == 80
+
+    def test_enter_on_a_group_toggles_the_fold(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st)) if r.kind == "group")
+        cf.dispatch(st, ord("\n"))
+        assert "alpha" in st.folds
+        cf.dispatch(st, ord("\n"))
+        assert "alpha" not in st.folds
+
+    def test_left_right_move_the_card_cell(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st)) if r.kind == "card")
+        cf.dispatch(st, curses.KEY_RIGHT)
+        assert st.cell == 1
+        for _ in range(10):
+            cf.dispatch(st, curses.KEY_RIGHT)
+        assert st.cell == len(cm.CARD_CELLS) - 1
+        for _ in range(10):
+            cf.dispatch(st, curses.KEY_LEFT)
+        assert st.cell == 0
+
+    def test_enter_on_a_card_edits_the_selected_cell(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st)) if r.kind == "card")
+        st.cell = 2
+        cf.dispatch(st, ord("\n"))
+        assert st.editing == "96"
+        st.editing, st.edit_pos = "48", 2
+        cf.dispatch(st, ord("\n"))
+        assert dict(st.doc.groups())["alpha"][0][2] == 48
+
+    def test_a_adds_a_card_to_the_group_under_the_cursor(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st)) if r.kind == "card")
+        cf.dispatch(st, ord("a"))
+        assert len(dict(st.doc.groups())["alpha"]) == 2
+
+    def test_enter_on_add_row_adds_a_card(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st))
+                         if r.kind == "add" and r.qos == "beta")
+        cf.dispatch(st, ord("\n"))
+        assert dict(st.doc.groups())["beta"] == [cm.NEW_CARD]
+
+    def test_delete_needs_two_presses(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st)) if r.kind == "card")
+        cf.dispatch(st, ord("d"))
+        assert st.confirm == "delete"
+        assert len(dict(st.doc.groups())["alpha"]) == 1
+        cf.dispatch(st, ord("d"))
+        assert dict(st.doc.groups())["alpha"] == []
+        assert st.confirm is None
+
+    def test_any_other_key_clears_the_delete_latch(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st)) if r.kind == "card")
+        cf.dispatch(st, ord("d"))
+        cf.dispatch(st, ord("j"))
+        assert st.confirm is None
+        cf.dispatch(st, ord("d"))
+        assert len(dict(st.doc.groups())["alpha"]) == 1
+
+    def test_quit_when_clean_is_immediate(self, tmp_path):
+        st = state_for(tmp_path)
+        cf.dispatch(st, ord("q"))
+        assert st.done is True
+
+    def test_quit_when_dirty_needs_two_presses(self, tmp_path):
+        st = self.cursor_field(state_for(tmp_path), "MAX_MEM_GB")
+        st.doc.set("MAX_MEM_GB", "64")
+        cf.dispatch(st, ord("q"))
+        assert st.done is False and st.confirm == "quit"
+        cf.dispatch(st, ord("q"))
+        assert st.done is True
+
+    def test_s_saves_and_reports(self, tmp_path):
+        st = self.cursor_field(state_for(tmp_path), "MAX_MEM_GB")
+        st.doc.set("MAX_MEM_GB", "64")
+        cf.dispatch(st, ord("s"))
+        assert "saved" in st.status
+        assert "/mcp" in st.status
+        assert "MAX_MEM_GB = 64" in open(st.path).read()
+        assert st.doc.dirty is False
+
+    def test_s_refuses_a_blocked_config(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.set("GOLDEN_QOS", "gamma")
+        cf.dispatch(st, ord("s"))
+        assert "gamma" in st.status
+        assert not os.path.exists(st.path + ".bak")
