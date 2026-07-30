@@ -229,3 +229,63 @@ class TestSet:
         doc = self.doc(tmp_path)
         err = doc.set(name, raw)
         assert (err is None) is ok, err
+
+
+class TestTable:
+    def doc(self, tmp_path):
+        return cm.load(write(tmp_path, MANGLED))
+
+    def test_groups_follow_golden_qos_order(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert [q for q, _ in doc.groups()] == ["alpha", "beta"]
+        assert doc.groups()[0][1] == [("a_card", "A Card", 96, 16, "a_part")]
+        assert doc.groups()[1][1] == []
+
+    def test_qos_without_a_group_shows_as_empty(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.set("GOLDEN_QOS", "alpha, gamma")
+        assert dict(doc.groups())["gamma"] == []
+
+    def test_group_not_in_golden_qos_still_listed(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.set("GOLDEN_QOS", "alpha")
+        assert [q for q, _ in doc.groups()] == ["alpha", "beta"]
+
+    def test_edit_a_cell_rewrites_the_dict_only(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.set_card("alpha", 0, 2, "48") is None
+        out = doc.render()
+        assert '("a_card", "A Card", 48, 16, "a_part"),' in out
+        assert "GPU_DEFINITIONS = GPU_DEFINITIONS_BY_QOS[GOLDEN_QOS[0]]" in out
+        assert out.count("GPU_DEFINITIONS_BY_QOS = {") == 1
+
+    def test_cell_validators_reject_and_do_not_stage(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert "integer" in doc.set_card("alpha", 0, 2, "lots")
+        assert "whitespace" in doc.set_card("alpha", 0, 0, "two words")
+        assert doc.dirty is False
+
+    def test_quota_zero_is_allowed_vram_zero_is_not(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.set_card("alpha", 0, 3, "0") is None
+        assert doc.set_card("alpha", 0, 2, "0") is not None
+
+    def test_add_card_appends_a_placeholder(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.add_card("beta")
+        assert dict(doc.groups())["beta"] == [cm.NEW_CARD]
+        assert '"beta": [' in doc.render()
+
+    def test_delete_card(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.delete_card("alpha", 0)
+        assert dict(doc.groups())["alpha"] == []
+        assert doc.dirty is True
+
+    def test_table_stays_loadable_after_a_rewrite(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.set_card("alpha", 0, 4, "new_part")
+        doc.add_card("beta")
+        reloaded = cm.ConfigDoc(doc.path, doc.render())
+        assert dict(reloaded.groups())["alpha"][0][4] == "new_part"
+        assert dict(reloaded.groups())["beta"] == [cm.NEW_CARD]

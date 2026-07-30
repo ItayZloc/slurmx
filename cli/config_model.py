@@ -143,6 +143,37 @@ FIELDS: tuple[Field, ...] = (
 FIELD_BY_NAME = {f.name: f for f in FIELDS}
 
 
+CARD_CELLS = (
+    ("name", _v_word),
+    ("display", _v_text),
+    ("vram", _v_posint),
+    ("quota", _v_nonneg),
+    ("partition", _v_word),
+)
+NEW_CARD = ("new_card", "New card", 24, 0, "new_partition")
+_INT_CELLS = (2, 3)
+
+
+def _table_literal(table: dict[str, list[list]]) -> str:
+    """Re-render the whole GPU_DEFINITIONS_BY_QOS dict, columns aligned.
+
+    Only called when a card edit is staged; an untouched table keeps its
+    original bytes like every other field.
+    """
+    out = ["{"]
+    for qos, cards in table.items():
+        out.append(f"    {json.dumps(qos)}: [")
+        w0 = max((len(json.dumps(c[0])) for c in cards), default=0)
+        w1 = max((len(json.dumps(c[1])) for c in cards), default=0)
+        for c in cards:
+            name = (json.dumps(c[0]) + ",").ljust(w0 + 2)
+            disp = (json.dumps(c[1]) + ",").ljust(w1 + 2)
+            out.append(f"        ({name}{disp}{c[2]}, {c[3]}, {json.dumps(c[4])}),")
+        out.append("    ],")
+    out.append("}")
+    return "\n".join(out)
+
+
 def _parse_raw(f: Field, raw: str):
     if f.kind == "int":
         return int(raw.strip())
@@ -336,6 +367,60 @@ class ConfigDoc:
         self._values.pop(name, None)
         self._appends = [a for a in self._appends
                          if not a.startswith(f"{name} =")]
+
+    # -- GPU card table --------------------------------------------------- #
+
+    def groups(self) -> list[tuple[str, list[tuple]]]:
+        """(qos, cards) in GOLDEN_QOS order, then any extra keys in the table.
+
+        A QoS named in GOLDEN_QOS with no entry in the table yields an empty
+        list, so the form can show it with an `+ add card` row.
+        """
+        table = self._table if self._table is not None else \
+            (self.slots["GPU_DEFINITIONS_BY_QOS"].value or {})
+        order: list[str] = []
+        for q in (self.value("GOLDEN_QOS") or []):
+            if q not in order:
+                order.append(q)
+        for q in table:
+            if q not in order:
+                order.append(q)
+        return [(q, [tuple(c) for c in table.get(q, [])]) for q in order]
+
+    def _mutable_table(self) -> dict[str, list[list]]:
+        if self._table is None:
+            base = self.slots["GPU_DEFINITIONS_BY_QOS"].value or {}
+            self._table = {q: [list(c) for c in cards] for q, cards in base.items()}
+        return self._table
+
+    def _stage_table(self) -> None:
+        literal = _table_literal(self._table)
+        slot = self.slots["GPU_DEFINITIONS_BY_QOS"]
+        if slot.span is None:
+            self._appends = [a for a in self._appends
+                             if not a.startswith("GPU_DEFINITIONS_BY_QOS =")]
+            self._appends.append(f"GPU_DEFINITIONS_BY_QOS = {literal}\n")
+        else:
+            self._staged["GPU_DEFINITIONS_BY_QOS"] = literal
+
+    def set_card(self, qos: str, index: int, cell: int, raw: str) -> str | None:
+        cell_name, validator = CARD_CELLS[cell]
+        err = validator(raw)
+        if err:
+            return f"{cell_name} {err}"
+        table = self._mutable_table()
+        table.setdefault(qos, [])
+        table[qos][index][cell] = int(raw.strip()) if cell in _INT_CELLS else raw.strip()
+        self._stage_table()
+        return None
+
+    def add_card(self, qos: str) -> None:
+        self._mutable_table().setdefault(qos, []).append(list(NEW_CARD))
+        self._stage_table()
+
+    def delete_card(self, qos: str, index: int) -> None:
+        del self._mutable_table()[qos][index]
+        self._stage_table()
 
 
 def load(path: str = CONFIG_PATH) -> ConfigDoc:
