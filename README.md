@@ -72,14 +72,12 @@ Same for a `%N`-throttled job array.
 # 1. Clone
 git clone https://github.com/ItayZloc/slurmx.git ~/.claude/mcp-servers/slurmx
 
-# 2. Configure
+# 2. Bootstrap: create venv, install deps, symlink `slurmx` into ~/.local/bin/
 cd ~/.claude/mcp-servers/slurmx
-cp config-examples/default.py config.py
-# Or pre-filled: cp config-examples/yisroel.py config.py
-# Edit config.py — fill in MAIL_USER (CLAUDE_LOG_DIR is auto-detected)
-
-# 3. Bootstrap: create venv, install deps, symlink `slurmx` into ~/.local/bin/
 ./setup.sh
+
+# 3. Configure: pick a template, then edit it in the form
+slurmx config
 
 # 4. Register the MCP server with Claude Code
 claude mcp add slurmx \
@@ -96,13 +94,22 @@ To pull updates later: `slurmx update` (or `./update.sh`) — fast-forward `git 
 
 ## Configuration
 
-Edit `config.py` (copied from one of the templates in `config-examples/`):
+Run `slurmx config` — a terminal form over `config.py`. It creates the file from
+a template on first run, validates every field before it writes, and keeps your
+comments and `os.environ.get` fallbacks intact (it replaces one literal, not the
+file). `slurmx config --show` prints the resolved values instead, and that is
+what you get automatically when the output is piped.
 
 | Field | What to fill in |
 |-------|----------------|
-| `MAIL_USER` | Your cluster email (for SLURM mail notifications) |
+| `MAIL_USER` | Your cluster email for SLURM notifications. Defaults to `$USER@post.bgu.ac.il`. |
 | `GOLDEN_QOS` | List of your QoS, e.g. `["yisroel"]` or `["yisroel", "shared"]`. First entry is primary for job submission. |
 | `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_quota, golden_partition)` tuples for that QoS. |
+
+A save writes `config.py.bak` first, so the previous version is always one `mv`
+away. The form refuses to write a config whose primary QoS has no GPU cards:
+`GPU_DEFINITIONS = GPU_DEFINITIONS_BY_QOS[GOLDEN_QOS[0]]` would raise at import
+and take down every subcommand.
 
 Paths are auto-populated from `$USER`. You can also set `SLURM_GOLDEN_QOS="a,b"` in your shell to override the list at runtime.
 
@@ -152,6 +159,8 @@ slurmx log 12345                           # read a job's SLURM log (--tail N)
 slurmx diagnose 12345                      # classify a failed job (OOM/timeout/...)
 slurmx history --days 7                    # recent finished jobs (sacct)
 slurmx cancel 12345                        # cancel jobs by ID (or --all)
+slurmx config                              # edit config.py in a terminal form
+slurmx config --show                       # print the resolved config as text
 slurmx setup                               # = ./setup.sh
 slurmx update                              # = ./update.sh
 slurmx <subcommand> --help                 # per-subcommand options

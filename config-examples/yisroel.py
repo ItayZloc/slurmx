@@ -1,7 +1,7 @@
 """Cluster-specific configuration — Yisroel's lab.
 
 Pre-filled with Yisroel's QoS and golden ticket quotas.
-Copy to config.py and fill in MAIL_USER.
+Copy to config.py — MAIL_USER defaults to $USER@post.bgu.ac.il.
 """
 
 import os
@@ -9,8 +9,9 @@ import os
 # --- Auto-detected ---
 USERNAME = os.environ.get("USER", "")
 
-# --- Personal (TODO: fill in your email) ---
-MAIL_USER = ""  # e.g. "username@post.bgu.ac.il"
+# --- Personal ---
+# Defaults to $USER@post.bgu.ac.il; override per-shell with SLURM_MAIL_USER.
+MAIL_USER = os.environ.get("SLURM_MAIL_USER", f"{USERNAME}@post.bgu.ac.il")
 
 # --- QoS / Partitions ---
 # Golden-ticket QoS list. First entry is primary for job submission.

@@ -43,6 +43,9 @@ CLI COMMANDS
                              slurmx diagnose ID           classify a job failure
                              slurmx history               recent finished jobs (sacct)
                              slurmx cancel ID|--all       cancel jobs
+                             slurmx config                edit config.py in a form
+                                                          (--show prints it as text;
+                                                           creates it on first run)
                              slurmx setup                 = ./setup.sh
                              slurmx update                = ./update.sh
                              slurmx --help                list subcommands
@@ -58,7 +61,7 @@ HOW TO USE WITH AGENTS
       "Cancel my pending jobs."
 
 NEXT STEPS
-  1. Verify config.py has your MAIL_USER and the right GOLDEN_QOS list.
+  1. Run `slurmx config` to check MAIL_USER and your GOLDEN_QOS list.
   2. Register the MCP server with Claude Code:
        claude mcp add slurmx \
          "$(pwd)/.venv/bin/python" "$(pwd)/server.py"

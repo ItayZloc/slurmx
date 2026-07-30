@@ -741,3 +741,24 @@ class TestDegradedParser:
         parser = slurmx_cli.build_parser()
         names = set(parser._subparsers._group_actions[0].choices)
         assert {"status", "submit", "config", "cancel", "setup", "update"} <= names
+
+
+class TestTemplateDefaults:
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_mail_user_defaults_to_the_bgu_address(self, path, monkeypatch):
+        monkeypatch.setenv("USER", "someone")
+        monkeypatch.delenv("SLURM_MAIL_USER", raising=False)
+        ns = {}
+        exec(compile(open(path).read(), path, "exec"), ns)
+        assert ns["MAIL_USER"] == "someone@post.bgu.ac.il"
+
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_env_still_overrides_mail_user(self, path, monkeypatch):
+        monkeypatch.setenv("SLURM_MAIL_USER", "other@example.com")
+        ns = {}
+        exec(compile(open(path).read(), path, "exec"), ns)
+        assert ns["MAIL_USER"] == "other@example.com"
+
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_no_template_hardcodes_a_personal_address(self, path):
+        assert "itayzloc" not in open(path).read()

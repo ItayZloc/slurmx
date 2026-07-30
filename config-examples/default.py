@@ -11,8 +11,9 @@ import os
 # --- Auto-detected ---
 USERNAME = os.environ.get("USER", "")
 
-# --- Personal (from env) ---
-MAIL_USER = os.environ.get("SLURM_MAIL_USER", "")
+# --- Personal ---
+# Defaults to $USER@post.bgu.ac.il; override per-shell with SLURM_MAIL_USER.
+MAIL_USER = os.environ.get("SLURM_MAIL_USER", f"{USERNAME}@post.bgu.ac.il")
 
 # --- QoS / Partitions ---
 # Golden-ticket QoS list. First entry is treated as the primary for job
