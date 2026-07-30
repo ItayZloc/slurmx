@@ -407,3 +407,85 @@ class TestParser:
         args = parser.parse_args(["config", "--show"])
         assert args.show is True
         assert args._run is config_cmd.run
+
+
+from cli import config_form as cf
+
+
+def state_for(tmp_path, text=MANGLED):
+    path = write(tmp_path, text)
+    return cf.FormState(doc=cm.load(path), path=path)
+
+
+def flat(rows):
+    return ["".join(t for t, _ in r.spans) for r in rows]
+
+
+class TestRows:
+    def test_every_scalar_field_gets_a_row(self, tmp_path):
+        rows = cf.build_rows(state_for(tmp_path))
+        fields = [r.field for r in rows if r.kind == "field"]
+        assert fields == [f.name for f in cm.FIELDS if f.kind != "table"]
+
+    def test_table_renders_a_group_header_per_qos(self, tmp_path):
+        rows = cf.build_rows(state_for(tmp_path))
+        groups = [r for r in rows if r.kind == "group"]
+        assert [g.qos for g in groups] == ["alpha", "beta"]
+        assert "GPU cards · alpha (1)" in "".join(t for t, _ in groups[0].spans)
+
+    def test_single_qos_header_omits_the_qos_name(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.set("GOLDEN_QOS", "alpha")
+        st.doc._table = {"alpha": [list(cm.NEW_CARD)]}
+        rows = [r for r in cf.build_rows(st) if r.kind == "group"]
+        assert "GPU cards (1)" in "".join(t for t, _ in rows[0].spans)
+
+    def test_unfolded_group_shows_a_header_cards_and_add(self, tmp_path):
+        rows = cf.build_rows(state_for(tmp_path))
+        kinds = [r.kind for r in rows if r.qos == "alpha"]
+        assert kinds == ["group", "thead", "card", "add"]
+
+    def test_folded_group_hides_its_cards(self, tmp_path):
+        st = state_for(tmp_path)
+        st.folds.add("alpha")
+        rows = [r for r in cf.build_rows(st) if r.qos == "alpha"]
+        assert [r.kind for r in rows] == ["group"]
+        assert "▸" in "".join(t for t, _ in rows[0].spans)
+
+    def test_empty_group_still_offers_add(self, tmp_path):
+        rows = cf.build_rows(state_for(tmp_path))
+        assert [r.kind for r in rows if r.qos == "beta"] == ["group", "thead", "add"]
+
+    def test_derived_rows_are_not_selectable_and_are_tagged(self, tmp_path):
+        rows = {r.field: r for r in cf.build_rows(state_for(tmp_path)) if r.kind == "field"}
+        assert rows["GPU_DEFINITIONS"].selectable is False
+        assert "derived" in "".join(t for t, _ in rows["GPU_DEFINITIONS"].spans)
+
+    def test_staged_field_is_tagged_edited(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.set("MAX_MEM_GB", "64")
+        row = next(r for r in cf.build_rows(st) if r.field == "MAX_MEM_GB")
+        assert "edited" in "".join(t for t, _ in row.spans)
+        assert "64" in "".join(t for t, _ in row.spans)
+
+    def test_editing_row_shows_the_buffer_and_a_caret(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st))
+                         if r.field == "MAX_MEM_GB")
+        st.editing = "12"
+        st.edit_pos = 2
+        row = cf.build_rows(st)[st.cursor]
+        assert "12▏" in "".join(t for t, _ in row.spans)
+
+    def test_selected_card_cell_is_marked(self, tmp_path):
+        st = state_for(tmp_path)
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st)) if r.kind == "card")
+        st.cell = 2
+        spans = cf.build_rows(st)[st.cursor].spans
+        assert any(role is cf.Role.CFG_EDITED and "96" in t for t, role in spans)
+
+    def test_theme_roles_exist_and_map(self):
+        from cli import theme
+        for name in ("CFG_NAME", "CFG_VALUE", "CFG_TAG", "CFG_EDITED",
+                     "CFG_THEAD", "CFG_ERROR"):
+            assert hasattr(theme.Role, name)

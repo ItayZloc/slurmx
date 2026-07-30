@@ -32,6 +32,13 @@ class Role(Enum):
     SQUEUE_PENDING = auto()
     BAR = auto()            # top/bottom status bars (not emitted by classify)
     RULE = auto()           # thin rule under the top bar (not emitted by classify)
+    # `slurmx config` form (cli/config_form.py) — not emitted by classify either.
+    CFG_NAME = auto()       # field name column
+    CFG_VALUE = auto()      # field value column
+    CFG_TAG = auto()        # derived / default / env tag, table column header
+    CFG_EDITED = auto()     # staged value, or the selected card cell
+    CFG_THEAD = auto()      # group header
+    CFG_ERROR = auto()      # blocking error in the status bar
 
 
 _CARD_RE = re.compile(r"  \S+:\s+(\d+)/\d+\s+free")
@@ -134,4 +141,10 @@ def init_theme() -> dict:
         Role.PLAIN: 0,
         Role.BAR: cp(1) | curses.A_REVERSE,
         Role.RULE: cp(5),
+        Role.CFG_NAME: cp(6),
+        Role.CFG_VALUE: 0,
+        Role.CFG_TAG: cp(5),
+        Role.CFG_EDITED: cp(3) | soften,
+        Role.CFG_THEAD: cp(1) | soften,
+        Role.CFG_ERROR: cp(4) | soften,
     }
