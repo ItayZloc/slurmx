@@ -51,4 +51,9 @@ MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")
 # SLURM mail events, passed through to `#SBATCH --mail-type`. An empty list or
 # ["NONE"] drops both mail lines from the script. Added 2026-07-30; before that
 # the script hardcoded ALL, which mailed on BEGIN and REQUEUE too.
-MAIL_TYPE = _from_config("MAIL_TYPE", ["END", "FAIL"])
+# MAIL_TYPE_DEFAULT is exported separately so `slurmx config` can show a
+# config.py that predates the key as having these ticked — which is what such a
+# config actually gets at submit time — without reading the editing user's own
+# config.py to find out.
+MAIL_TYPE_DEFAULT = ["END", "FAIL"]
+MAIL_TYPE = _from_config("MAIL_TYPE", list(MAIL_TYPE_DEFAULT))

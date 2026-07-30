@@ -30,20 +30,38 @@ if REPO not in sys.path:
 
 from maintenance import _parse_slurm_time  # stdlib-only module; safe to import
 # config_defaults tolerates a missing config.py, so this stays importable on a
-# fresh clone. It is the ONLY source of the fixed cluster facts below.
-from config_defaults import CPU_PARTITION, CPU_QOS, MAIN_PARTITION
+# fresh clone.
+from config_defaults import (
+    CPU_PARTITION, CPU_QOS, MAIL_TYPE_DEFAULT, MAIN_PARTITION,
+)
+
+# What a key that is absent from config.py resolves to at submit time. Shown
+# instead of a blank, so a config.py predating the key doesn't read as "off".
+ABSENT_DEFAULTS = {"MAIL_TYPE": list(MAIL_TYPE_DEFAULT)}
 
 DEFAULT_MAIL_DOMAIN = "post.bgu.ac.il"
 
-# Cluster facts, shown read-only. Not config.py keys: config.py is gitignored
-# and personal (your address, your QoS, your cards), while a partition name is
-# the same for everyone and lives in tracked code.
-FIXED_FACTS = (
-    ("CPU_PARTITION", CPU_PARTITION, "partition for CPU-only jobs"),
-    ("CPU_QOS", CPU_QOS, "QoS for CPU-only jobs"),
-    ("MAIN_PARTITION", MAIN_PARTITION, "shared preemptible GPU pool"),
-)
-FIXED_SOURCE = "config_defaults.py"
+# Cluster facts that used to be config.py keys and moved to config_defaults.py
+# on 2026-07-30. They are not part of the schema any more, so they are neither
+# shown nor editable. This map exists for one reason: a config.py written
+# before the move may still assign one, and if the value it assigns differs
+# from the fixed one, that user's behaviour changes silently on upgrade. So we
+# read them back and warn.
+RETIRED_KEYS = {
+    "CPU_PARTITION": CPU_PARTITION,
+    "CPU_QOS": CPU_QOS,
+    "MAIN_PARTITION": MAIN_PARTITION,
+}
+RETIRED_SOURCE = "config_defaults.py"
+
+# How a slot's provenance reads in the UI. "file" is the ordinary case and
+# shows nothing at all.
+PROVENANCE_LABEL = {
+    "derived": "derived",
+    "absent": "default",
+    "env-default": "env",
+    "unsupported": "read-only",
+}
 
 
 def default_mail_user() -> str:
@@ -359,6 +377,17 @@ class ConfigDoc:
                     and isinstance(node.targets[0], ast.Name)):
                 assigns[node.targets[0].id] = node
         self.slots = {f.name: self._slot(f, assigns) for f in FIELDS}
+        self._retired = {}
+        for name in RETIRED_KEYS:
+            node = assigns.get(name)
+            if node is None:
+                continue
+            value = _literal_eval(node.value)
+            if value is _UNREADABLE:
+                env = _find_env_get(node.value)
+                value = _literal_eval(env[1]) if env else _UNREADABLE
+            if value is not _UNREADABLE:
+                self._retired[name] = value
         self._staged: dict[str, str] = {}      # field -> replacement literal source
         self._values: dict[str, object] = {}   # field -> staged parsed value
         self._appends: list[str] = []          # new assignments for absent keys
@@ -443,7 +472,10 @@ class ConfigDoc:
     def value(self, name: str):
         if name in self._values:
             return self._values[name]
-        return self.slots[name].value
+        slot = self.slots[name]
+        if slot.provenance == "absent" and name in ABSENT_DEFAULTS:
+            return ABSENT_DEFAULTS[name]
+        return slot.value
 
     def text_value(self, name: str) -> str:
         v = self.value(name)
@@ -604,7 +636,16 @@ class ConfigDoc:
         """Non-blocking: the file still imports."""
         groups = dict(self.groups())
         qos = self.value("GOLDEN_QOS") or []
-        return [f"QoS '{q}' has no GPU cards" for q in qos[1:] if not groups.get(q)]
+        warns = [f"QoS '{q}' has no GPU cards" for q in qos[1:] if not groups.get(q)]
+        for name, stale in sorted(self._retired.items()):
+            fixed = RETIRED_KEYS[name]
+            if stale != fixed:
+                warns.append(
+                    f"{name} = {stale!r} in config.py is ignored — it is fixed at "
+                    f"{fixed!r} in {RETIRED_SOURCE}. Set SLURM_{name}={stale} to "
+                    "keep the old behaviour."
+                )
+        return warns
 
     def save(self) -> str | None:
         """Validate, back up, replace. Error string on failure, None on success.

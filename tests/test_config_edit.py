@@ -399,7 +399,7 @@ class TestShow:
         out = config_cmd.show_text(doc)
         assert "MAIL_USER" in out and "someone@example.com" in out
         assert "MAIL_TYPE" in out and "END, FAIL" in out
-        assert "EXCLUDE_NODES" in out and "env-default" in out
+        assert "EXCLUDE_NODES" in out and "env" in out
         assert "GPU_DEFINITIONS" in out and "derived" in out
         assert "alpha" in out and "a_card" in out and "96" in out
 
@@ -810,26 +810,27 @@ class TestTicketsAndFixed:
         assert "tickets" in out
         assert "quota" not in out
 
-    def test_fixed_facts_are_shown_but_not_config_keys(self, tmp_path):
-        names = {n for n, _v, _h in cm.FIXED_FACTS}
+    def test_retired_keys_are_not_in_the_schema(self, tmp_path):
+        names = set(cm.RETIRED_KEYS)
         assert names == {"CPU_PARTITION", "CPU_QOS", "MAIN_PARTITION"}
-        # Not in the schema at all, so they can never be staged or written.
         assert not (names & {f.name for f in cm.FIELDS})
         doc = cm.load(write(tmp_path, MANGLED))
         assert names.isdisjoint(doc.slots)
 
-    def test_fixed_rows_render_unselectable(self, tmp_path):
-        rows = cf.build_rows(state_for(tmp_path))
-        fixed = [r for r in rows if r.kind == "fixed"]
-        assert [r.field for r in fixed] == ["CPU_PARTITION", "CPU_QOS", "MAIN_PARTITION"]
-        assert all(r.selectable is False for r in fixed)
-        head = next(r for r in rows if r.kind == "fixed_head")
-        assert "config_defaults.py" in "".join(t for t, _ in head.spans)
-        assert "not part of config.py" in "".join(t for t, _ in head.spans)
+    def test_retired_keys_are_shown_nowhere(self, tmp_path):
+        """They are cluster facts, not settings — the form and --show don't
+        mention them at all."""
+        st = state_for(tmp_path)
+        rendered = "\n".join("".join(t for t, _ in r.spans)
+                              for r in cf.build_rows(st))
+        text = config_cmd.show_text(st.doc)
+        for name in cm.RETIRED_KEYS:
+            assert name not in rendered
+            assert name not in text
 
-    def test_fixed_values_come_from_config_defaults(self):
+    def test_retired_values_come_from_config_defaults(self):
         import config_defaults
-        assert dict((n, v) for n, v, _h in cm.FIXED_FACTS) == {
+        assert cm.RETIRED_KEYS == {
             "CPU_PARTITION": config_defaults.CPU_PARTITION,
             "CPU_QOS": config_defaults.CPU_QOS,
             "MAIN_PARTITION": config_defaults.MAIN_PARTITION,
@@ -1064,3 +1065,148 @@ class TestCursorSnap:
         group = next("".join(t for t, _ in r.spans)
                      for r in rows if r.kind == "mailgroup")
         assert field.index("MAIL_USER") == group.index("MAIL_TYPE")
+
+
+class TestUpgradeFromOldConfig:
+    """A config.py written before 2026-07-30 still assigns CPU_PARTITION,
+    CPU_QOS and MAIN_PARTITION and has no MAIL_TYPE. It has to keep working."""
+
+    OLD = '''\
+import os
+USERNAME = os.environ.get("USER", "")
+MAIL_USER = "someone@example.com"
+GOLDEN_QOS = ["alpha"]
+CPU_PARTITION = "cpu"
+CPU_QOS = "normal"
+MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")
+_EXCLUDE_NODES_DEFAULT = ""
+EXCLUDE_NODES = [
+    n.strip()
+    for n in os.environ.get("SLURM_EXCLUDE_NODES", _EXCLUDE_NODES_DEFAULT).split(",")
+    if n.strip()
+]
+MAX_MEM_GB = 80
+CPU_CPUS = 4
+CPU_MEM = "16G"
+TIME_LIMIT = "7-0:00:00"
+START_TIMEOUT = 300
+GPU_DEFINITIONS_BY_QOS = {
+    "alpha": [
+        ("a_card", "A Card", 96, 16, "a_part"),
+    ],
+}
+GPU_DEFINITIONS = GPU_DEFINITIONS_BY_QOS[GOLDEN_QOS[0]]
+'''
+
+    def test_an_old_config_still_loads_and_validates(self, tmp_path):
+        path = write(tmp_path, self.OLD)
+        assert cm.validate_file(path) is None
+        doc = cm.load(path)
+        assert doc.cross_field_errors() == []
+        assert doc.render() == self.OLD
+
+    def test_missing_mail_type_shows_what_it_actually_resolves_to(self, tmp_path):
+        """The key is absent, but submit_job still mails on END and FAIL. An
+        empty checklist would read as "no mail", which is the opposite."""
+        doc = cm.load(write(tmp_path, self.OLD))
+        assert doc.slots["MAIL_TYPE"].provenance == "absent"
+        assert doc.mail_events() == ["END", "FAIL"]
+        import config_defaults
+        assert doc.mail_events() == config_defaults.MAIL_TYPE_DEFAULT
+
+    def test_the_checklist_ticks_the_resolved_default(self, tmp_path):
+        st = state_for(tmp_path, self.OLD)
+        st.mail_open = True
+        boxes = {r.field: "".join(t for t, _ in r.spans)
+                 for r in cf.build_rows(st) if r.kind == "mailopt"}
+        assert "[x]" in boxes["END"] and "[x]" in boxes["FAIL"]
+        assert "[ ]" in boxes["BEGIN"]
+
+    def test_toggling_from_absent_writes_the_whole_resolved_list(self, tmp_path):
+        doc = cm.load(write(tmp_path, self.OLD))
+        doc.toggle_mail_event("BEGIN")
+        assert doc.mail_events() == ["BEGIN", "END", "FAIL"]
+
+    def test_ticking_an_event_appends_mail_type(self, tmp_path):
+        doc = cm.load(write(tmp_path, self.OLD))
+        assert doc.toggle_mail_event("BEGIN") is None
+        assert doc.save() is None
+        saved = cm.load(doc.path)
+        assert saved.slots["MAIL_TYPE"].provenance == "file"
+        assert saved.mail_events() == ["BEGIN", "END", "FAIL"]
+
+    def test_leftover_retired_keys_at_the_default_are_silent(self, tmp_path):
+        doc = cm.load(write(tmp_path, self.OLD))
+        assert doc.warnings() == []
+
+    def test_a_customised_retired_key_warns_instead_of_changing_silently(self, tmp_path):
+        text = self.OLD.replace('CPU_PARTITION = "cpu"', 'CPU_PARTITION = "bigcpu"')
+        doc = cm.load(write(tmp_path, text))
+        warns = doc.warnings()
+        assert len(warns) == 1
+        assert "CPU_PARTITION" in warns[0] and "bigcpu" in warns[0]
+        assert "ignored" in warns[0]
+        assert "SLURM_CPU_PARTITION=bigcpu" in warns[0]
+        assert "warn:" in config_cmd.show_text(doc)
+
+    def test_a_customised_env_wrapped_retired_key_also_warns(self, tmp_path):
+        text = self.OLD.replace('os.environ.get("SLURM_MAIN_PARTITION", "main")',
+                                'os.environ.get("SLURM_MAIN_PARTITION", "gpu")')
+        doc = cm.load(write(tmp_path, text))
+        assert any("MAIN_PARTITION" in w and "gpu" in w for w in doc.warnings())
+
+    def test_the_warning_never_blocks_a_save(self, tmp_path):
+        text = self.OLD.replace('CPU_PARTITION = "cpu"', 'CPU_PARTITION = "bigcpu"')
+        doc = cm.load(write(tmp_path, text))
+        doc.set("MAX_MEM_GB", "64")
+        assert doc.save() is None
+
+    def test_a_none_partition_prints_blank_not_the_word_none(self, tmp_path):
+        text = MANGLED.replace('("a_card", "A Card", 96, 16, "a_part"),',
+                               '("a_card", "A Card", 96, 16, None),')
+        out = config_cmd.show_text(cm.load(write(tmp_path, text)))
+        assert "None" not in out
+
+
+class TestMailUserIsAutomatic:
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_templates_derive_the_address_from_username(self, path):
+        line = next(l for l in open(path) if l.startswith("MAIL_USER"))
+        assert "USERNAME" in line, "MAIL_USER must fill itself in from $USER"
+        assert "SLURM_MAIL_USER" in line, "and stay overridable per shell"
+
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_a_fresh_config_needs_no_mail_user_typing(self, path, monkeypatch):
+        monkeypatch.setenv("USER", "newperson")
+        monkeypatch.delenv("SLURM_MAIL_USER", raising=False)
+        ns = {}
+        exec(compile(open(path).read(), path, "exec"), ns)
+        assert ns["MAIL_USER"] == "newperson@post.bgu.ac.il"
+
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_it_is_still_editable_in_the_form(self, path):
+        doc = cm.load(path)
+        assert doc.is_editable("MAIL_USER")
+        assert doc.set("MAIL_USER", "me@gmail.com") is None
+        assert 'os.environ.get("SLURM_MAIL_USER", "me@gmail.com")' in doc.render()
+
+    def test_checkout_config_is_not_a_hardcoded_address(self):
+        """A literal address in config.py is what every labmate who copied the
+        old template inherited."""
+        path = os.path.join(REPO, "config.py")
+        if not os.path.exists(path):
+            pytest.skip("no config.py on this checkout")
+        line = next(l for l in open(path) if l.startswith("MAIL_USER"))
+        assert "USERNAME" in line
+
+
+class TestProvenanceWording:
+    def test_the_form_and_show_use_the_same_word(self, tmp_path):
+        text = MANGLED.replace('MAIL_TYPE = ["END", "FAIL"]\n', "")
+        st = state_for(tmp_path, text)
+        row = next("".join(t for t, _ in r.spans)
+                   for r in cf.build_rows(st) if r.kind == "mailgroup")
+        out = config_cmd.show_text(st.doc)
+        mail_line = next(l for l in out.splitlines() if "MAIL_TYPE" in l)
+        assert "default" in row and "default" in mail_line
+        assert "absent" not in row and "absent" not in mail_line

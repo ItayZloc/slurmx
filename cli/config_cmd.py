@@ -24,7 +24,8 @@ NAME_W = 24
 
 def _note(doc, name: str) -> str:
     slot = doc.slots[name]
-    bits = [slot.provenance] if slot.provenance != "file" else []
+    label = cm.PROVENANCE_LABEL.get(slot.provenance, "")
+    bits = [label] if label else []
     if slot.env_var:
         live = os.environ.get(slot.env_var)
         if live is not None:
@@ -47,13 +48,11 @@ def show_text(doc) -> str:
         if not cards:
             lines.append(f"    {DIM}(none){NC}")
         for name, disp, vram, tickets, part in cards:
+            # A card with no golden partition stores None; print it blank rather
+            # than the word "None".
             lines.append(f"    {name.ljust(16)}{str(vram).rjust(4)}GB "
-                         f"tickets {str(tickets).rjust(3)}  {part}   {DIM}{disp}{NC}")
-    lines.append("")
-    lines.append(f"  {BOLD}fixed{NC}  {DIM}{cm.FIXED_SOURCE}, "
-                 f"not part of config.py{NC}")
-    for name, value, help_text in cm.FIXED_FACTS:
-        lines.append(f"    {name.ljust(NAME_W - 2)}{value}   {DIM}{help_text}{NC}")
+                         f"tickets {str(tickets).rjust(3)}  "
+                         f"{(part or '-').ljust(14)} {DIM}{disp}{NC}")
     errs = doc.cross_field_errors()
     warns = doc.warnings()
     if errs or warns:

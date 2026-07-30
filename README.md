@@ -127,13 +127,17 @@ imported straight from `config`.
 
 `CPU_PARTITION`, `CPU_QOS` and `MAIN_PARTITION` are **not** config keys. A
 partition name is a property of the cluster, the same for every user, so it lives
-in `config_defaults.py` (which is tracked) and is read from nowhere else — a copy
-left over in someone's gitignored `config.py` is ignored. `slurmx config` shows
-them in a read-only footer. To change one for a single shell:
+in `config_defaults.py` (which is tracked) and is read from nowhere else. They
+don't appear in `slurmx config` at all. To change one for a single shell:
 
 ```bash
 SLURM_CPU_PARTITION=bigcpu slurmx submit --vram 0 -- ./job.sh
 ```
+
+They used to be config keys, so a `config.py` created before 2026-07-30 still
+assigns them. That copy is ignored. If it assigns a value that differs from the
+fixed one, `slurmx config` says so and names the env var that restores the old
+behaviour, rather than letting your jobs quietly move partition.
 
 ## Maintenance windows
 

@@ -48,11 +48,9 @@ class FormState:
 
 
 def _tag(doc, name: str) -> str:
-    slot = doc.slots[name]
     if name in doc.staged_names():
         return "edited"
-    return {"derived": "derived", "absent": "default",
-            "env-default": "env", "unsupported": "read-only"}.get(slot.provenance, "")
+    return cm.PROVENANCE_LABEL.get(doc.slots[name].provenance, "")
 
 
 def _field_row(state, name: str, editing: bool) -> Row:
@@ -84,13 +82,13 @@ def _mail_rows(state) -> list[Row]:
     checked = doc.mail_events()
     summary = ", ".join(checked) if checked else "(no mail)"
     glyph = "▾" if state.mail_open else "▸"
-    tag = "edited" if "MAIL_TYPE" in doc.staged_names() else ""
+    tag = _tag(doc, "MAIL_TYPE")
     # The prefix is two cells, exactly like a field row's "  ", so the name
     # column stays aligned with everything above and below it.
     rows = [Row("mailgroup",
                 spans=[(f"{glyph} " + "MAIL_TYPE".ljust(NAME_W), Role.CFG_NAME),
                        (summary.ljust(VALUE_W),
-                        Role.CFG_EDITED if tag else Role.CFG_VALUE),
+                        Role.CFG_EDITED if tag == "edited" else Role.CFG_VALUE),
                        (tag, Role.CFG_TAG)],
                 field="MAIL_TYPE", selectable=True)]
     if not state.mail_open:
@@ -153,17 +151,6 @@ def build_rows(state: FormState) -> list[Row]:
         rows.append(Row("add", spans=[("      + add card", Role.CFG_TAG)],
                         qos=qos, selectable=True))
         rows.append(Row("blank", spans=[("", Role.PLAIN)]))
-
-    # Cluster facts, not config.py keys — shown so "where do CPU jobs go?" is
-    # answerable here, unselectable so nobody mistakes them for settings.
-    rows.append(Row("fixed_head",
-                    spans=[(f" ─ fixed · {cm.FIXED_SOURCE} "
-                            f"(not part of config.py)", Role.CFG_TAG)]))
-    for name, value, _help in cm.FIXED_FACTS:
-        rows.append(Row("fixed",
-                        spans=[("  " + name.ljust(NAME_W), Role.CFG_TAG),
-                               (str(value).ljust(VALUE_W), Role.CFG_TAG)],
-                        field=name))
     return rows
 
 

@@ -11,8 +11,10 @@ as-approved one; three changes landed on top of it:
 1. `CPU_PARTITION`, `CPU_QOS` and `MAIN_PARTITION` are no longer config keys at
    all. They are cluster facts, identical for every user, so they moved into
    `config_defaults.py` and are read from nowhere else — a copy left in a
-   gitignored `config.py` is ignored. The form and `--show` display them in a
-   read-only footer labelled with their source.
+   gitignored `config.py` is ignored. They are not displayed anywhere. The one
+   exception is an upgrade guard: if a pre-existing `config.py` assigns one with
+   a value that *differs* from the fixed one, `warnings()` reports it and names
+   the env var that restores the old behaviour, so the change can't be silent.
 2. New personal key `MAIL_TYPE` (list of `sbatch --mail-type` events, default
    `["END", "FAIL"]`), replacing the hardcoded `--mail-type=ALL`. An empty list
    or `["NONE"]`, or an empty `MAIL_USER`, drops both mail lines from the script.
