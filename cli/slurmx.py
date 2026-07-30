@@ -15,16 +15,33 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cli import status as status_mod
-from cli import submit as submit_mod
-from cli import select_gpu as select_gpu_mod
-from cli import history as history_mod
-from cli import job_status as job_status_mod
-from cli import wait as wait_mod
-from cli import log as log_mod
-from cli import diagnose as diagnose_mod
-from cli import cancel as cancel_mod
 from cli import config_cmd as config_mod
+
+# Every other subcommand reaches slurm_mcp, which does `from config import ...`
+# at import time. On a checkout with no config.py that is a hard
+# ModuleNotFoundError before argparse ever runs, so `slurmx --help` died too.
+# Degrade instead: offer the three subcommands that don't need a config, with
+# `slurmx config` among them so the file can actually be created.
+CONFIG_ONLY_HINT = (
+    "config.py is missing, so only `slurmx config`, `slurmx setup`, and "
+    "`slurmx update` are available. Run `slurmx config` to create it."
+)
+
+try:
+    from cli import status as status_mod
+    from cli import submit as submit_mod
+    from cli import select_gpu as select_gpu_mod
+    from cli import history as history_mod
+    from cli import job_status as job_status_mod
+    from cli import wait as wait_mod
+    from cli import log as log_mod
+    from cli import diagnose as diagnose_mod
+    from cli import cancel as cancel_mod
+    HAVE_CONFIG = True
+except ModuleNotFoundError as e:
+    if e.name != "config":
+        raise
+    HAVE_CONFIG = False
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -59,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Cluster CLI: submit, monitor, and manage SLURM jobs. "
             "Use `slurmx <subcommand> --help` for per-command options."
-        ),
+        ) if HAVE_CONFIG else CONFIG_ONLY_HINT,
     )
     subparsers = parser.add_subparsers(
         dest="subcommand",
@@ -67,44 +84,45 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
-    _add_subcommand(
-        subparsers, "status", status_mod,
-        aliases=("s",),
-        help="Live SLURM dashboard (scrollable; one-shot text when piped or --once).",
-    )
-    _add_subcommand(
-        subparsers, "submit", submit_mod,
-        help="Submit a GPU/CPU job (auto-selects GPU by VRAM).",
-    )
-    _add_subcommand(
-        subparsers, "select-gpu", select_gpu_mod,
-        help="Recommend the best GPU for a VRAM requirement.",
-    )
-    _add_subcommand(
-        subparsers, "history", history_mod,
-        help="Show recent finished jobs from SLURM accounting (sacct).",
-    )
-    _add_subcommand(
-        subparsers, "job-status", job_status_mod,
-        aliases=("job",),
-        help="Show the status of a specific job.",
-    )
-    _add_subcommand(
-        subparsers, "wait", wait_mod,
-        help="Block until a job finishes.",
-    )
-    _add_subcommand(
-        subparsers, "log", log_mod,
-        help="Read a job's SLURM log file.",
-    )
-    _add_subcommand(
-        subparsers, "diagnose", diagnose_mod,
-        help="Diagnose a job failure (OOM / timeout / missing module / code error).",
-    )
-    _add_subcommand(
-        subparsers, "cancel", cancel_mod,
-        help="Cancel jobs by ID, or all your jobs.",
-    )
+    if HAVE_CONFIG:
+        _add_subcommand(
+            subparsers, "status", status_mod,
+            aliases=("s",),
+            help="Live SLURM dashboard (scrollable; one-shot text when piped or --once).",
+        )
+        _add_subcommand(
+            subparsers, "submit", submit_mod,
+            help="Submit a GPU/CPU job (auto-selects GPU by VRAM).",
+        )
+        _add_subcommand(
+            subparsers, "select-gpu", select_gpu_mod,
+            help="Recommend the best GPU for a VRAM requirement.",
+        )
+        _add_subcommand(
+            subparsers, "history", history_mod,
+            help="Show recent finished jobs from SLURM accounting (sacct).",
+        )
+        _add_subcommand(
+            subparsers, "job-status", job_status_mod,
+            aliases=("job",),
+            help="Show the status of a specific job.",
+        )
+        _add_subcommand(
+            subparsers, "wait", wait_mod,
+            help="Block until a job finishes.",
+        )
+        _add_subcommand(
+            subparsers, "log", log_mod,
+            help="Read a job's SLURM log file.",
+        )
+        _add_subcommand(
+            subparsers, "diagnose", diagnose_mod,
+            help="Diagnose a job failure (OOM / timeout / missing module / code error).",
+        )
+        _add_subcommand(
+            subparsers, "cancel", cancel_mod,
+            help="Cancel jobs by ID, or all your jobs.",
+        )
     _add_subcommand(
         subparsers, "config", config_mod,
         help="Edit config.py in a terminal form (--show prints it as text).",

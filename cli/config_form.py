@@ -366,13 +366,18 @@ def _loop(stdscr, state: FormState) -> None:
         dispatch(state, ch)
 
 
-def run_form(path: str) -> None:
+def run_form(path: str, start_field: str | None = None) -> None:
     """Open the form on `path`. Blocks until the user quits.
 
     Raises curses.error when the terminal can't host curses (TERM=dumb, no tty);
     cli/config_cmd.run falls back to the text dump, same as slurmx status.
     """
     state = FormState(doc=cm.load(path), path=path)
+    if start_field:
+        for i, row in enumerate(build_rows(state)):
+            if row.field == start_field and row.selectable:
+                state.cursor = i
+                break
     try:
         curses.wrapper(_loop, state)
     except KeyboardInterrupt:

@@ -24,9 +24,8 @@ uv sync
 # --- config.py warning ---
 if [ ! -f "$REPO/config.py" ]; then
     echo
-    echo "WARNING: config.py is missing. Copy an example and edit MAIL_USER:"
-    echo "    cp config-examples/default.py config.py     # blank template"
-    echo "    cp config-examples/yisroel.py config.py     # Yisroel's lab pre-filled"
+    echo "WARNING: config.py is missing. Create it with:"
+    echo "    slurmx config      # pick a template, then edit it in a form"
 fi
 
 # --- Symlink every bin/*.sh into ~/.local/bin/ (with .sh stripped) ---

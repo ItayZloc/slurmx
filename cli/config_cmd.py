@@ -11,6 +11,7 @@ to work on a checkout where config.py does not exist yet.
 
 import argparse
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -57,12 +58,37 @@ def show_text(doc) -> str:
     return "\n".join(lines)
 
 
-def _bootstrap(path: str) -> str | None:
-    """Create config.py from a template. Returns an error string, or None.
+def templates() -> list[tuple[str, str]]:
+    """(label, path) for each config-examples/*.py, default first."""
+    names = sorted(n for n in os.listdir(cm.TEMPLATE_DIR)
+                   if n.endswith(".py") and not n.startswith("_"))
+    names.sort(key=lambda n: (n != "default.py", n))
+    return [(n[:-3], os.path.join(cm.TEMPLATE_DIR, n)) for n in names]
 
-    Filled in by Task 9; until then a missing config.py is a plain error.
-    """
-    return f"{path} does not exist. Copy one of config-examples/ to config.py."
+
+_TEMPLATE_BLURB = {
+    "default": "blank template, fill in your own QoS and cards",
+    "yisroel": "Yisroel's lab, pre-filled QoS and golden quotas",
+}
+
+
+def _bootstrap(path: str, choose=input) -> str | None:
+    """Create `path` from a template chosen interactively. Error, or None."""
+    opts = templates()
+    print(f"{BOLD}{path} does not exist.{NC} Pick a starting template:\n")
+    for i, (label, _) in enumerate(opts, 1):
+        blurb = _TEMPLATE_BLURB.get(label, "")
+        print(f"  {i}. {label:<10} {DIM}{blurb}{NC}")
+    print()
+    raw = (choose(f"Template [1-{len(opts)}, Enter to abort]: ") or "").strip()
+    if not raw:
+        return "aborted — nothing written."
+    if not raw.isdigit() or not 1 <= int(raw) <= len(opts):
+        return f"'{raw}' is not one of 1-{len(opts)}. Nothing written."
+    label, src = opts[int(raw) - 1]
+    shutil.copyfile(src, path)
+    print(f"created {path} from config-examples/{label}.py")
+    return None
 
 
 def add_arguments(parser):
@@ -74,7 +100,8 @@ def add_arguments(parser):
 
 def run(args):
     path = getattr(args, "path", cm.CONFIG_PATH)
-    if not os.path.exists(path):
+    fresh = not os.path.exists(path)
+    if fresh:
         err = _bootstrap(path)
         if err:
             print(err, file=sys.stderr)
@@ -86,7 +113,7 @@ def run(args):
     from cli import config_form
     import curses
     try:
-        config_form.run_form(path)
+        config_form.run_form(path, start_field="MAIL_USER" if fresh else None)
     except curses.error:
         # TERM unset/dumb or no usable terminal — same fallback as slurmx status.
         print(show_text(cm.load(path)))

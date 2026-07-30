@@ -672,3 +672,72 @@ class TestDerivedDisplay:
         st = state_for(tmp_path)
         st.doc.add_card("alpha")
         assert st.doc.display_value("GPU_DEFINITIONS") == "2 cards (alpha)"
+
+
+import subprocess
+
+
+class TestBootstrap:
+    def test_templates_lists_both_examples(self):
+        labels = [l for l, _ in config_cmd.templates()]
+        assert "default" in labels and "yisroel" in labels
+
+    def test_bootstrap_copies_the_chosen_template(self, tmp_path, capsys):
+        path = str(tmp_path / "config.py")
+        err = config_cmd._bootstrap(path, choose=lambda prompt: "1")
+        assert err is None
+        assert os.path.exists(path)
+        assert "GPU_DEFINITIONS_BY_QOS" in open(path).read()
+
+    def test_bootstrap_rejects_a_bad_choice(self, tmp_path, capsys):
+        path = str(tmp_path / "config.py")
+        err = config_cmd._bootstrap(path, choose=lambda prompt: "9")
+        assert err is not None
+        assert not os.path.exists(path)
+
+    def test_bootstrap_aborts_on_empty_input(self, tmp_path, capsys):
+        path = str(tmp_path / "config.py")
+        assert config_cmd._bootstrap(path, choose=lambda prompt: "") is not None
+        assert not os.path.exists(path)
+
+
+# Runs in a fresh interpreter: blocking the `config` module in-process means
+# popping and re-importing every cli.* and slurm_mcp module, which leaves a
+# stale cli.slurmx object on the `cli` package and breaks whatever runs next.
+# `name="config"` matters — cli/slurmx.py degrades only for that module and
+# re-raises anything else, so a nameless error would exercise the wrong branch.
+_DEGRADED_PROBE = r'''
+import importlib.abc
+import sys
+
+
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        if name == "config":
+            raise ModuleNotFoundError("No module named 'config'", name="config")
+        return None
+
+
+sys.meta_path.insert(0, Block())
+from cli import slurmx
+
+parser = slurmx.build_parser()
+print(",".join(sorted(parser._subparsers._group_actions[0].choices)))
+print("HINT_OK" if "slurmx config" in slurmx.CONFIG_ONLY_HINT else "HINT_BAD")
+'''
+
+
+class TestDegradedParser:
+    def test_parser_offers_only_config_setup_update_without_config_py(self):
+        proc = subprocess.run([sys.executable, "-c", _DEGRADED_PROBE],
+                              cwd=REPO, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        names, hint = proc.stdout.strip().splitlines()
+        assert names == "config,setup,update"
+        assert hint == "HINT_OK"
+
+    def test_full_parser_has_every_subcommand(self):
+        from cli import slurmx as slurmx_cli
+        parser = slurmx_cli.build_parser()
+        names = set(parser._subparsers._group_actions[0].choices)
+        assert {"status", "submit", "config", "cancel", "setup", "update"} <= names
