@@ -115,3 +115,117 @@ class TestLoad:
     def test_default_mail_user_uses_the_bgu_domain(self, monkeypatch):
         monkeypatch.setenv("USER", "someone")
         assert cm.default_mail_user() == "someone@post.bgu.ac.il"
+
+
+class TestSet:
+    def doc(self, tmp_path):
+        return cm.load(write(tmp_path, MANGLED))
+
+    def test_int_edit_replaces_only_the_literal(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.set("MAX_MEM_GB", "64") is None
+        out = doc.render()
+        assert "MAX_MEM_GB = 64\n" in out
+        assert "CPU_CPUS = 4\n" in out
+        assert out.count("MAX_MEM_GB") == 1
+
+    def test_str_edit_keeps_the_inline_comment(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.set("MAIL_USER", "new@post.bgu.ac.il") is None
+        assert "\"new@post.bgu.ac.il\"   # inline comment" in doc.render()
+
+    def test_env_default_edit_keeps_the_env_call(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.set("MAIN_PARTITION", "gpu") is None
+        assert 'os.environ.get("SLURM_MAIN_PARTITION", "gpu")' in doc.render()
+
+    def test_list_edit_renders_a_python_list(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.set("GOLDEN_QOS", "alpha, gamma") is None
+        assert 'GOLDEN_QOS = ["alpha", "gamma"]' in doc.render()
+
+    def test_csv_list_edit_renders_a_comma_string(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.set("EXCLUDE_NODES", "n7, n8") is None
+        out = doc.render()
+        assert '_EXCLUDE_NODES_DEFAULT = "n7,n8"' in out
+        assert "for n in os.environ.get(" in out
+
+    def test_absent_key_is_appended(self, tmp_path):
+        text = MANGLED.replace(
+            'MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")\n', ""
+        )
+        doc = cm.load(write(tmp_path, text))
+        assert doc.set("MAIN_PARTITION", "gpu") is None
+        out = doc.render()
+        assert out.endswith('MAIN_PARTITION = "gpu"\n')
+        assert "# --- Added by `slurmx config` ---" in out
+
+    def test_absent_key_edited_twice_appends_once(self, tmp_path):
+        text = MANGLED.replace(
+            'MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")\n', ""
+        )
+        doc = cm.load(write(tmp_path, text))
+        doc.set("MAIN_PARTITION", "gpu")
+        doc.set("MAIN_PARTITION", "main")
+        assert doc.render().count("MAIN_PARTITION =") == 1
+
+    def test_derived_and_unsupported_are_not_editable(self, tmp_path):
+        text = MANGLED.replace("MAX_MEM_GB = 80", "MAX_MEM_GB = 40 + 40")
+        doc = cm.load(write(tmp_path, text))
+        assert doc.is_editable("GPU_DEFINITIONS") is False
+        assert doc.is_editable("MAX_MEM_GB") is False
+        assert "not editable" in doc.set("MAX_MEM_GB", "64")
+
+    def test_revert_clears_the_stage(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.set("MAX_MEM_GB", "64")
+        assert doc.dirty is True
+        doc.revert("MAX_MEM_GB")
+        assert doc.dirty is False
+        assert doc.render() == MANGLED
+
+    def test_value_and_text_value_read_through_the_stage(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.value("GOLDEN_QOS") == ["alpha", "beta"]
+        assert doc.text_value("GOLDEN_QOS") == "alpha, beta"
+        doc.set("GOLDEN_QOS", "solo")
+        assert doc.value("GOLDEN_QOS") == ["solo"]
+        assert doc.text_value("GOLDEN_QOS") == "solo"
+
+    def test_empty_mail_user_prefills_the_bgu_default(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("USER", "someone")
+        doc = cm.load(write(tmp_path, MANGLED.replace(
+            "MAIL_USER   =    'someone@example.com'   # inline comment",
+            'MAIL_USER = ""',
+        )))
+        assert doc.text_value("MAIL_USER") == "someone@post.bgu.ac.il"
+
+    @pytest.mark.parametrize("name,raw,ok", [
+        ("MAIL_USER", "a@b.c", True),
+        ("MAIL_USER", "nope", False),
+        ("MAIL_USER", "  ", False),
+        ("GOLDEN_QOS", "a,b", True),
+        ("GOLDEN_QOS", "", False),
+        ("GOLDEN_QOS", "a b", False),
+        ("CPU_PARTITION", "cpu", True),
+        ("CPU_PARTITION", "two words", False),
+        ("EXCLUDE_NODES", "", True),
+        ("EXCLUDE_NODES", "n1,n2", True),
+        ("EXCLUDE_NODES", "n 1", False),
+        ("MAX_MEM_GB", "64", True),
+        ("MAX_MEM_GB", "0", False),
+        ("MAX_MEM_GB", "huge", False),
+        ("CPU_MEM", "16G", True),
+        ("CPU_MEM", "16", True),
+        ("CPU_MEM", "16GB", False),
+        ("TIME_LIMIT", "7-0:00:00", True),
+        ("TIME_LIMIT", "0-12:30:00", True),
+        ("TIME_LIMIT", "12:30", False),
+        ("START_TIMEOUT", "300", True),
+        ("START_TIMEOUT", "-1", False),
+    ])
+    def test_validators(self, tmp_path, name, raw, ok):
+        doc = self.doc(tmp_path)
+        err = doc.set(name, raw)
+        assert (err is None) is ok, err

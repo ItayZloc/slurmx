@@ -15,11 +15,17 @@ import ast
 import json
 import os
 import re
+import sys
 from dataclasses import dataclass
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(REPO, "config.py")
 TEMPLATE_DIR = os.path.join(REPO, "config-examples")
+
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from maintenance import _parse_slurm_time  # stdlib-only module; safe to import
 
 DEFAULT_MAIL_DOMAIN = "post.bgu.ac.il"
 
@@ -27,6 +33,83 @@ DEFAULT_MAIL_DOMAIN = "post.bgu.ac.il"
 def default_mail_user() -> str:
     """Prefill for an empty or absent MAIL_USER."""
     return f"{os.environ.get('USER', '')}@{DEFAULT_MAIL_DOMAIN}"
+
+
+# --------------------------------------------------------------------------- #
+# Validators — each takes the raw typed string, returns an error or None
+# --------------------------------------------------------------------------- #
+
+def _v_email(raw: str) -> str | None:
+    raw = raw.strip()
+    if not raw:
+        return "must not be empty"
+    if "@" not in raw:
+        return "must look like an email (user@host)"
+    return None
+
+
+def _v_word(raw: str) -> str | None:
+    raw = raw.strip()
+    if not raw:
+        return "must not be empty"
+    if re.search(r"\s", raw):
+        return "must not contain whitespace"
+    return None
+
+
+def _v_text(raw: str) -> str | None:
+    return None if raw.strip() else "must not be empty"
+
+
+def _words(raw: str) -> list[str]:
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+def _v_word_list(raw: str) -> str | None:
+    toks = _words(raw)
+    if not toks:
+        return "needs at least one entry"
+    for t in toks:
+        if re.search(r"\s", t):
+            return f"'{t}' must not contain whitespace"
+    return None
+
+
+def _v_word_list_or_empty(raw: str) -> str | None:
+    for t in _words(raw):
+        if re.search(r"\s", t):
+            return f"'{t}' must not contain whitespace"
+    return None
+
+
+def _v_int(raw: str, *, minimum: int) -> str | None:
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        return "must be an integer"
+    return None if n >= minimum else f"must be >= {minimum}"
+
+
+def _v_posint(raw: str) -> str | None:
+    return _v_int(raw, minimum=1)
+
+
+def _v_nonneg(raw: str) -> str | None:
+    return _v_int(raw, minimum=0)
+
+
+def _v_mem(raw: str) -> str | None:
+    if re.fullmatch(r"\d+[KMGT]?", raw.strip()):
+        return None
+    return "must be a SLURM size like 16G or 4096"
+
+
+def _v_time(raw: str) -> str | None:
+    try:
+        _parse_slurm_time(raw.strip())
+    except (ValueError, IndexError):
+        return "must be D-HH:MM:SS, e.g. 7-0:00:00"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -43,21 +126,39 @@ class Field:
 
 FIELDS: tuple[Field, ...] = (
     Field("USERNAME", "derived", "auto-detected from $USER"),
-    Field("MAIL_USER", "str", "address for SLURM mail notifications"),
-    Field("GOLDEN_QOS", "list", "golden QoS list; the first is primary"),
-    Field("CPU_PARTITION", "str", "partition for CPU-only jobs"),
-    Field("CPU_QOS", "str", "QoS for CPU-only jobs"),
-    Field("MAIN_PARTITION", "str", "shared preemptible GPU pool"),
-    Field("EXCLUDE_NODES", "list", "nodes to keep jobs off"),
-    Field("MAX_MEM_GB", "int", "memory ceiling for a GPU job"),
-    Field("CPU_CPUS", "int", "cores for a CPU-only job"),
-    Field("CPU_MEM", "str", "memory for a CPU-only job, e.g. 16G"),
-    Field("TIME_LIMIT", "str", "default wall clock, D-HH:MM:SS"),
-    Field("START_TIMEOUT", "int", "seconds submit_job waits for RUNNING"),
+    Field("MAIL_USER", "str", "address for SLURM mail notifications", _v_email),
+    Field("GOLDEN_QOS", "list", "golden QoS list; the first is primary", _v_word_list),
+    Field("CPU_PARTITION", "str", "partition for CPU-only jobs", _v_word),
+    Field("CPU_QOS", "str", "QoS for CPU-only jobs", _v_word),
+    Field("MAIN_PARTITION", "str", "shared preemptible GPU pool", _v_word),
+    Field("EXCLUDE_NODES", "list", "nodes to keep jobs off", _v_word_list_or_empty),
+    Field("MAX_MEM_GB", "int", "memory ceiling for a GPU job", _v_posint),
+    Field("CPU_CPUS", "int", "cores for a CPU-only job", _v_posint),
+    Field("CPU_MEM", "str", "memory for a CPU-only job, e.g. 16G", _v_mem),
+    Field("TIME_LIMIT", "str", "default wall clock, D-HH:MM:SS", _v_time),
+    Field("START_TIMEOUT", "int", "seconds submit_job waits for RUNNING", _v_posint),
     Field("GPU_DEFINITIONS_BY_QOS", "table", "GPU cards per QoS"),
     Field("GPU_DEFINITIONS", "derived", "the primary QoS's cards"),
 )
 FIELD_BY_NAME = {f.name: f for f in FIELDS}
+
+
+def _parse_raw(f: Field, raw: str):
+    if f.kind == "int":
+        return int(raw.strip())
+    if f.kind == "list":
+        return _words(raw)
+    return raw.strip()
+
+
+def _literal(f: Field, value, *, as_csv: bool) -> str:
+    if f.kind == "int":
+        return str(value)
+    if f.kind == "list":
+        if as_csv:
+            return json.dumps(",".join(value))
+        return "[" + ", ".join(json.dumps(v) for v in value) + "]"
+    return json.dumps(value)
 
 
 @dataclass
@@ -180,6 +281,61 @@ class ConfigDoc:
                 text += "\n"
             text += "\n# --- Added by `slurmx config` ---\n" + "".join(self._appends)
         return text
+
+    # -- staged edits ----------------------------------------------------- #
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self._staged or self._appends)
+
+    def staged_names(self) -> set[str]:
+        appended = {a.split(" =", 1)[0] for a in self._appends}
+        return set(self._staged) | appended
+
+    def is_editable(self, name: str) -> bool:
+        slot = self.slots[name]
+        return slot.field.kind not in ("derived", "table") \
+            and slot.provenance != "unsupported"
+
+    def value(self, name: str):
+        if name in self._values:
+            return self._values[name]
+        return self.slots[name].value
+
+    def text_value(self, name: str) -> str:
+        v = self.value(name)
+        if name == "MAIL_USER" and not v:
+            return default_mail_user()
+        if v is None:
+            return ""
+        if self.slots[name].field.kind == "list":
+            return ", ".join(v)
+        return str(v)
+
+    def set(self, name: str, raw: str) -> str | None:
+        """Validate and stage one edit. Error message, or None on success."""
+        slot = self.slots[name]
+        if not self.is_editable(name):
+            return f"{name} is not editable here ({slot.provenance})"
+        err = slot.field.validator(raw)
+        if err:
+            return f"{name} {err}"
+        value = _parse_raw(slot.field, raw)
+        literal = _literal(slot.field, value, as_csv=slot.as_csv)
+        self._values[name] = value
+        if slot.span is None:
+            self._appends = [a for a in self._appends
+                             if not a.startswith(f"{name} =")]
+            self._appends.append(f"{name} = {literal}\n")
+        else:
+            self._staged[name] = literal
+        return None
+
+    def revert(self, name: str) -> None:
+        self._staged.pop(name, None)
+        self._values.pop(name, None)
+        self._appends = [a for a in self._appends
+                         if not a.startswith(f"{name} =")]
 
 
 def load(path: str = CONFIG_PATH) -> ConfigDoc:
