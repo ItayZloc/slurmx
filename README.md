@@ -40,10 +40,10 @@ Your golden QoS (e.g. `yisroel`) runs on the per-card dedicated partitions
   and **never** accept a preemptible slot. If the golden ticket is full the job
   waits in the golden queue and starts automatically when a slot frees (it is not
   downgraded). Works on every card, including the smaller ones the group doesn't
-  own (`golden_quota=0`) — those then preempt other groups' `normal` jobs there.
+  own (`golden_tickets=0`) — those then preempt other groups' `normal` jobs there.
   Recommended for training you don't want evicted. Ignored for CPU jobs.
 - **`--allow-main` / `golden_only=false`** — golden-first on the cards you own
-  (`golden_quota > 0`), then fall back to the preemptible main pool if golden is
+  (`golden_tickets > 0`), then fall back to the preemptible main pool if golden is
   full (the previous default).
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
@@ -100,11 +100,15 @@ comments and `os.environ.get` fallbacks intact (it replaces one literal, not the
 file). `slurmx config --show` prints the resolved values instead, and that is
 what you get automatically when the output is piped.
 
+`config.py` holds personal things only: who you are, which QoS you belong to,
+how many golden tickets your group owns.
+
 | Field | What to fill in |
 |-------|----------------|
 | `MAIL_USER` | Your cluster email for SLURM notifications. Defaults to `$USER@post.bgu.ac.il`. |
+| `MAIL_TYPE` | Which events mail you, passed to `sbatch --mail-type`. Defaults to `["END", "FAIL"]`. `[]` or `["NONE"]` turns mail off entirely. |
 | `GOLDEN_QOS` | List of your QoS, e.g. `["yisroel"]` or `["yisroel", "shared"]`. First entry is primary for job submission. |
-| `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_quota, golden_partition)` tuples for that QoS. |
+| `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_tickets, golden_partition)` tuples for that QoS. |
 
 A save writes `config.py.bak` first, so the previous version is always one `mv`
 away. The form refuses to write a config whose primary QoS has no GPU cards:
@@ -118,6 +122,18 @@ whatever template it was created from, and updating never requires editing it. A
 key added to the templates later is therefore missing from every `config.py` already
 on disk, so new keys live in `config_defaults.py` with a fallback rather than being
 imported straight from `config`.
+
+### Fixed cluster facts
+
+`CPU_PARTITION`, `CPU_QOS` and `MAIN_PARTITION` are **not** config keys. A
+partition name is a property of the cluster, the same for every user, so it lives
+in `config_defaults.py` (which is tracked) and is read from nowhere else — a copy
+left over in someone's gitignored `config.py` is ignored. `slurmx config` shows
+them in a read-only footer. To change one for a single shell:
+
+```bash
+SLURM_CPU_PARTITION=bigcpu slurmx submit --vram 0 -- ./job.sh
+```
 
 ## Maintenance windows
 

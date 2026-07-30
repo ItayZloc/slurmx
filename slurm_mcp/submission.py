@@ -10,9 +10,10 @@ import time
 from typing import Optional
 
 from config import (
-    CPU_PARTITION, CPU_QOS, CPU_MEM, CPU_CPUS,
+    CPU_MEM, CPU_CPUS,
     EXCLUDE_NODES, MAIL_USER, MAX_MEM_GB, START_TIMEOUT, TIME_LIMIT,
 )
+from config_defaults import CPU_PARTITION, CPU_QOS, MAIL_TYPE
 from maintenance import cap_time_limit
 
 from . import availability, monitoring, selection, shell
@@ -70,10 +71,16 @@ def _build_sbatch_script(
     if dependency:
         lines.append(f"#SBATCH --dependency={dependency}")
 
+    # MAIL_TYPE = [] or ["NONE"] means no mail at all, and an empty MAIL_USER
+    # would emit a bare `--mail-user=`, which SLURM rejects. Either way, omit
+    # both lines rather than writing a half-configured pair.
+    mail_types = [t for t in MAIL_TYPE if t and t.upper() != "NONE"]
+    lines.append("")
+    if MAIL_USER and mail_types:
+        lines.append(f"#SBATCH --mail-user={MAIL_USER}")
+        lines.append(f"#SBATCH --mail-type={','.join(mail_types)}")
+
     lines += [
-        "",
-        f"#SBATCH --mail-user={MAIL_USER}",
-        "#SBATCH --mail-type=ALL",
         "",
         "################ Following lines will be executed by the compute node ################",
         "",

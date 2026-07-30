@@ -25,10 +25,8 @@ MANGLED = '''\
 import os
 USERNAME = os.environ.get("USER", "")
 MAIL_USER   =    'someone@example.com'   # inline comment
+MAIL_TYPE = ["END", "FAIL"]
 GOLDEN_QOS = ['alpha' , 'beta']
-CPU_PARTITION="cpu"
-CPU_QOS = "normal"
-MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")
 _EXCLUDE_NODES_DEFAULT = "n1,n2"
 EXCLUDE_NODES = [
     n.strip()
@@ -47,6 +45,14 @@ GPU_DEFINITIONS_BY_QOS = {
     "beta": [],
 }
 GPU_DEFINITIONS = GPU_DEFINITIONS_BY_QOS[GOLDEN_QOS[0]]'''
+
+
+_MAIL_LINE = "MAIL_USER   =    'someone@example.com'   # inline comment"
+ENV_WRAPPED = MANGLED.replace(
+    _MAIL_LINE, 'MAIL_USER = os.environ.get("SLURM_MAIL_USER", "env@example.com")')
+FSTRING_DEFAULT = MANGLED.replace(
+    _MAIL_LINE,
+    'MAIL_USER = os.environ.get("SLURM_MAIL_USER", f"{USERNAME}@post.bgu.ac.il")')
 
 
 def write(tmp_path, text, name="config.py"):
@@ -73,12 +79,35 @@ class TestLoad:
         assert doc.slots["MAX_MEM_GB"].provenance == "file"
 
     def test_env_wrapper_span_points_at_the_default(self, tmp_path):
-        doc = cm.load(write(tmp_path, MANGLED))
-        slot = doc.slots["MAIN_PARTITION"]
+        doc = cm.load(write(tmp_path, ENV_WRAPPED))
+        slot = doc.slots["MAIL_USER"]
         start, end = slot.span
-        assert MANGLED[start:end] == '"main"'
+        assert ENV_WRAPPED[start:end] == '"env@example.com"'
         assert slot.provenance == "env-default"
-        assert slot.env_var == "SLURM_MAIN_PARTITION"
+        assert slot.env_var == "SLURM_MAIL_USER"
+
+    def test_fstring_env_default_is_still_editable(self, tmp_path):
+        """The templates ship f"{USERNAME}@post.bgu.ac.il" as MAIL_USER's
+        default. An f-string is not a literal, so an earlier version marked the
+        field unsupported and the form refused to edit the one key every new
+        user must set."""
+        doc = cm.load(write(tmp_path, FSTRING_DEFAULT))
+        slot = doc.slots["MAIL_USER"]
+        assert slot.provenance == "env-default"
+        assert doc.is_editable("MAIL_USER") is True
+        assert FSTRING_DEFAULT[slot.span[0]:slot.span[1]] == \
+            'f"{USERNAME}@post.bgu.ac.il"'
+        assert doc.set("MAIL_USER", "me@example.com") is None
+        assert 'os.environ.get("SLURM_MAIL_USER", "me@example.com")' in doc.render()
+
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_every_editable_field_is_editable_in_both_templates(self, path):
+        doc = cm.load(path)
+        for f in cm.FIELDS:
+            if f.kind in ("derived", "table"):
+                continue
+            assert doc.is_editable(f.name), \
+                f"{f.name} is {doc.slots[f.name].provenance} in {path}"
 
     def test_exclude_nodes_span_points_at_the_helper_string(self, tmp_path):
         doc = cm.load(write(tmp_path, MANGLED))
@@ -99,12 +128,9 @@ class TestLoad:
             assert doc.slots[name].provenance == "derived"
 
     def test_absent_key_is_marked_absent(self, tmp_path):
-        text = MANGLED.replace(
-            'MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")\n', ""
-        )
-        doc = cm.load(write(tmp_path, text))
-        assert doc.slots["MAIN_PARTITION"].provenance == "absent"
-        assert doc.slots["MAIN_PARTITION"].span is None
+        doc = cm.load(write(tmp_path, MANGLED.replace('MAIL_TYPE = ["END", "FAIL"]\n', "")))
+        assert doc.slots["MAIL_TYPE"].provenance == "absent"
+        assert doc.slots["MAIL_TYPE"].span is None
 
     def test_unsupported_shape_is_read_only_not_a_crash(self, tmp_path):
         text = MANGLED.replace("MAX_MEM_GB = 80", "MAX_MEM_GB = 40 + 40")
@@ -135,9 +161,9 @@ class TestSet:
         assert "\"new@post.bgu.ac.il\"   # inline comment" in doc.render()
 
     def test_env_default_edit_keeps_the_env_call(self, tmp_path):
-        doc = self.doc(tmp_path)
-        assert doc.set("MAIN_PARTITION", "gpu") is None
-        assert 'os.environ.get("SLURM_MAIN_PARTITION", "gpu")' in doc.render()
+        doc = cm.load(write(tmp_path, ENV_WRAPPED))
+        assert doc.set("MAIL_USER", "new@example.com") is None
+        assert 'os.environ.get("SLURM_MAIL_USER", "new@example.com")' in doc.render()
 
     def test_list_edit_renders_a_python_list(self, tmp_path):
         doc = self.doc(tmp_path)
@@ -152,23 +178,19 @@ class TestSet:
         assert "for n in os.environ.get(" in out
 
     def test_absent_key_is_appended(self, tmp_path):
-        text = MANGLED.replace(
-            'MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")\n', ""
-        )
+        text = MANGLED.replace('MAIL_TYPE = ["END", "FAIL"]\n', "")
         doc = cm.load(write(tmp_path, text))
-        assert doc.set("MAIN_PARTITION", "gpu") is None
+        assert doc.set("MAIL_TYPE", "END, FAIL") is None
         out = doc.render()
-        assert out.endswith('MAIN_PARTITION = "gpu"\n')
+        assert out.endswith('MAIL_TYPE = ["END", "FAIL"]\n')
         assert "# --- Added by `slurmx config` ---" in out
 
     def test_absent_key_edited_twice_appends_once(self, tmp_path):
-        text = MANGLED.replace(
-            'MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")\n', ""
-        )
+        text = MANGLED.replace('MAIL_TYPE = ["END", "FAIL"]\n', "")
         doc = cm.load(write(tmp_path, text))
-        doc.set("MAIN_PARTITION", "gpu")
-        doc.set("MAIN_PARTITION", "main")
-        assert doc.render().count("MAIN_PARTITION =") == 1
+        doc.set("MAIL_TYPE", "END")
+        doc.set("MAIL_TYPE", "ALL")
+        assert doc.render().count("MAIL_TYPE =") == 1
 
     def test_derived_and_unsupported_are_not_editable(self, tmp_path):
         text = MANGLED.replace("MAX_MEM_GB = 80", "MAX_MEM_GB = 40 + 40")
@@ -208,8 +230,11 @@ class TestSet:
         ("GOLDEN_QOS", "a,b", True),
         ("GOLDEN_QOS", "", False),
         ("GOLDEN_QOS", "a b", False),
-        ("CPU_PARTITION", "cpu", True),
-        ("CPU_PARTITION", "two words", False),
+        ("MAIL_TYPE", "END,FAIL", True),
+        ("MAIL_TYPE", "end, fail", True),
+        ("MAIL_TYPE", "", True),
+        ("MAIL_TYPE", "NONE", True),
+        ("MAIL_TYPE", "SOMETIMES", False),
         ("EXCLUDE_NODES", "", True),
         ("EXCLUDE_NODES", "n1,n2", True),
         ("EXCLUDE_NODES", "n 1", False),
@@ -373,14 +398,15 @@ class TestShow:
         doc = cm.load(write(tmp_path, MANGLED))
         out = config_cmd.show_text(doc)
         assert "MAIL_USER" in out and "someone@example.com" in out
-        assert "MAIN_PARTITION" in out and "env-default" in out
+        assert "MAIL_TYPE" in out and "END, FAIL" in out
+        assert "EXCLUDE_NODES" in out and "env-default" in out
         assert "GPU_DEFINITIONS" in out and "derived" in out
         assert "alpha" in out and "a_card" in out and "96" in out
 
     def test_show_text_marks_an_active_env_override(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("SLURM_MAIN_PARTITION", "gpu")
-        doc = cm.load(write(tmp_path, MANGLED))
-        assert "SLURM_MAIN_PARTITION=gpu" in config_cmd.show_text(doc)
+        monkeypatch.setenv("SLURM_MAIL_USER", "over@example.com")
+        doc = cm.load(write(tmp_path, ENV_WRAPPED))
+        assert "SLURM_MAIL_USER=over@example.com" in config_cmd.show_text(doc)
 
     def test_show_text_renders_an_empty_list_readably(self, tmp_path):
         doc = cm.load(write(tmp_path, MANGLED.replace('"n1,n2"', '""')))
@@ -675,6 +701,11 @@ class TestDerivedDisplay:
 
 
 import subprocess
+from unittest.mock import patch as mock_modules_patch
+
+
+def mock_modules(mapping):
+    return mock_modules_patch.dict(sys.modules, mapping)
 
 
 class TestBootstrap:
@@ -762,3 +793,121 @@ class TestTemplateDefaults:
     @pytest.mark.parametrize("path", TEMPLATES)
     def test_no_template_hardcodes_a_personal_address(self, path):
         assert "itayzloc" not in open(path).read()
+
+
+class TestTicketsAndFixed:
+    def test_table_header_and_errors_say_golden_tickets(self, tmp_path):
+        st = state_for(tmp_path)
+        head = next("".join(t for t, _ in r.spans)
+                    for r in cf.build_rows(st) if r.kind == "thead")
+        assert "tickets" in head
+        assert "quota" not in head
+        assert "golden tickets must be >= 0" in st.doc.set_card("alpha", 0, 3, "-1")
+
+    def test_show_text_says_tickets(self, tmp_path):
+        out = config_cmd.show_text(cm.load(write(tmp_path, MANGLED)))
+        assert "tickets" in out
+        assert "quota" not in out
+
+    def test_fixed_facts_are_shown_but_not_config_keys(self, tmp_path):
+        names = {n for n, _v, _h in cm.FIXED_FACTS}
+        assert names == {"CPU_PARTITION", "CPU_QOS", "MAIN_PARTITION"}
+        # Not in the schema at all, so they can never be staged or written.
+        assert not (names & {f.name for f in cm.FIELDS})
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert names.isdisjoint(doc.slots)
+
+    def test_fixed_rows_render_unselectable(self, tmp_path):
+        rows = cf.build_rows(state_for(tmp_path))
+        fixed = [r for r in rows if r.kind == "fixed"]
+        assert [r.field for r in fixed] == ["CPU_PARTITION", "CPU_QOS", "MAIN_PARTITION"]
+        assert all(r.selectable is False for r in fixed)
+        head = next(r for r in rows if r.kind == "fixed_head")
+        assert "config_defaults.py" in "".join(t for t, _ in head.spans)
+        assert "not part of config.py" in "".join(t for t, _ in head.spans)
+
+    def test_fixed_values_come_from_config_defaults(self):
+        import config_defaults
+        assert dict((n, v) for n, v, _h in cm.FIXED_FACTS) == {
+            "CPU_PARTITION": config_defaults.CPU_PARTITION,
+            "CPU_QOS": config_defaults.CPU_QOS,
+            "MAIN_PARTITION": config_defaults.MAIN_PARTITION,
+        }
+
+    def test_save_no_longer_requires_the_fixed_keys(self, tmp_path):
+        # MANGLED has none of the three; a save must still go through.
+        doc = cm.load(write(tmp_path, MANGLED))
+        doc.set("MAX_MEM_GB", "64")
+        assert doc.save() is None
+
+
+class TestMailType:
+    def test_events_are_upper_cased_on_the_way_in(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert doc.set("MAIL_TYPE", "end, fail") is None
+        assert doc.value("MAIL_TYPE") == ["END", "FAIL"]
+        assert 'MAIL_TYPE = ["END", "FAIL"]' in doc.render()
+
+    def test_empty_is_allowed_and_means_no_mail(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert doc.set("MAIL_TYPE", "") is None
+        assert doc.value("MAIL_TYPE") == []
+        assert "MAIL_TYPE = []" in doc.render()
+
+    def test_a_bogus_event_is_rejected(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert "not a SLURM mail event" in doc.set("MAIL_TYPE", "END,WHENEVER")
+        assert doc.dirty is False
+
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_templates_ship_mail_type(self, path):
+        ns = {}
+        exec(compile(open(path).read(), path, "exec"), ns)
+        assert ns["MAIL_TYPE"] == ["END", "FAIL"]
+
+    def test_config_defaults_falls_back_for_an_older_config(self):
+        import importlib
+        import types as _types
+        import config as real_config
+        stale = _types.ModuleType("config")
+        try:
+            with mock_modules({"config": stale}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.MAIL_TYPE == ["END", "FAIL"]
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
+
+class TestNonePartition:
+    NONE_PART = MANGLED.replace('("a_card", "A Card", 96, 16, "a_part"),',
+                                '("a_card", "A Card", 96, 16, None),')
+
+    def test_a_none_partition_re_renders_as_python_none_not_json_null(self, tmp_path):
+        doc = cm.load(write(tmp_path, self.NONE_PART))
+        doc.set_card("alpha", 0, 2, "48")
+        out = doc.render()
+        assert "None)" in out
+        assert "null" not in out
+        assert cm.ConfigDoc(doc.path, out).groups()[0][1][0][4] is None
+
+    def test_a_none_partition_table_still_saves(self, tmp_path):
+        doc = cm.load(write(tmp_path, self.NONE_PART))
+        doc.set_card("alpha", 0, 2, "48")
+        assert doc.save() is None
+
+    def test_clearing_the_partition_cell_stores_none(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert doc.set_card("alpha", 0, 4, "") is None
+        assert dict(doc.groups())["alpha"][0][4] is None
+
+    def test_a_none_partition_renders_blank_in_the_form(self, tmp_path):
+        st = state_for(tmp_path, self.NONE_PART)
+        row = next(r for r in cf.build_rows(st) if r.kind == "card")
+        assert "None" not in "".join(t for t, _ in row.spans)
+
+    def test_every_card_column_is_wider_than_its_header(self):
+        """'tickets' is exactly 7 chars; a 7-wide column ran it into the next
+        header with no gap."""
+        for cell, width in zip(cm.CARD_CELLS, cf.CARD_W):
+            assert width > len(cell.header), f"{cell.header} needs > {len(cell.header)}"

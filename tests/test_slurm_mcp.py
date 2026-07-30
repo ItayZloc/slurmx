@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import slurm_mcp
 from slurm_mcp import (
-    GPU_TYPES, GPU_BY_NAME, GOLDEN_QOS, MAX_MEM_GB, MAIL_USER,
+    GPU_TYPES, GPU_BY_NAME, GOLDEN_QOS, MAX_MEM_GB, MAIL_USER, MAIL_TYPE,
     GPUType, GPUAvailability, Availability, JobResult, JobStatus,
     check_availability, select_gpu, submit_job,
     my_jobs, cancel_jobs, _build_sbatch_script, _run, _run_quiet,
@@ -679,8 +679,44 @@ class TestBuildSbatchScript:
         assert "#SBATCH --time 7-0:00:00" in script
         assert "#SBATCH --output ./slurm-test-job-%J.out" in script
         assert f"#SBATCH --mail-user={MAIL_USER}" in script
-        assert "#SBATCH --mail-type=ALL" in script
+        assert f"#SBATCH --mail-type={','.join(MAIL_TYPE)}" in script
         assert "python train.py" in script
+
+    @pytest.mark.parametrize("mail_type,expected", [
+        (["END", "FAIL"], "END,FAIL"),
+        (["ALL"], "ALL"),
+        (["end", "fail"], "end,fail"),      # passed through as written
+    ])
+    def test_mail_type_comes_from_config(self, mail_type, expected):
+        with patch("slurm_mcp.submission.MAIL_TYPE", mail_type):
+            script = _build_sbatch_script(
+                cmd="python train.py", partition="main", qos="normal",
+                gpu_type="rtx_4090", num_gpus=1, job_name="test",
+                output_path="out.log", workdir=None,
+            )
+        assert f"#SBATCH --mail-type={expected}" in script
+
+    @pytest.mark.parametrize("mail_type", [[], ["NONE"], ["none"]])
+    def test_no_mail_type_drops_both_mail_lines(self, mail_type):
+        with patch("slurm_mcp.submission.MAIL_TYPE", mail_type):
+            script = _build_sbatch_script(
+                cmd="python train.py", partition="main", qos="normal",
+                gpu_type="rtx_4090", num_gpus=1, job_name="test",
+                output_path="out.log", workdir=None,
+            )
+        assert "--mail-type" not in script
+        assert "--mail-user" not in script
+
+    def test_empty_mail_user_drops_both_mail_lines(self):
+        """A bare `--mail-user=` is rejected by sbatch, so omit the pair."""
+        with patch("slurm_mcp.submission.MAIL_USER", ""):
+            script = _build_sbatch_script(
+                cmd="python train.py", partition="main", qos="normal",
+                gpu_type="rtx_4090", num_gpus=1, job_name="test",
+                output_path="out.log", workdir=None,
+            )
+        assert "--mail-user" not in script
+        assert "--mail-type" not in script
 
     def test_scratch_dir_setup(self):
         script = _build_sbatch_script(
@@ -2235,11 +2271,16 @@ class TestDashboardSegments:
 # straight from `config` is safe. Anything added later must go through
 # config_defaults.py with a fallback — a user's config.py is gitignored and
 # never updated by `slurmx update`, so a new hard import breaks their CLI.
+# CPU_PARTITION, CPU_QOS and MAIN_PARTITION were dropped from this set on
+# 2026-07-30: they are cluster facts, identical for everyone, so they live in
+# config_defaults.py and are read from nowhere else. A stale copy in someone's
+# gitignored config.py is ignored by design.
 _BASELINE_CONFIG_KEYS = {
-    "USERNAME", "MAIL_USER", "GOLDEN_QOS", "CPU_PARTITION", "CPU_QOS",
+    "USERNAME", "MAIL_USER", "GOLDEN_QOS",
     "CPU_CPUS", "CPU_MEM", "EXCLUDE_NODES", "MAX_MEM_GB", "TIME_LIMIT",
     "START_TIMEOUT", "GPU_DEFINITIONS", "GPU_DEFINITIONS_BY_QOS",
 }
+_FIXED_CLUSTER_KEYS = {"CPU_PARTITION", "CPU_QOS", "MAIN_PARTITION"}
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -2289,11 +2330,26 @@ class TestConfigDefaults:
             sys.modules["config"] = real_config
             importlib.reload(sys.modules["config_defaults"])
 
-    def test_real_config_wins_over_the_default(self):
+    def test_mail_type_falls_back_for_an_older_config(self):
+        import importlib
+        import types as _types
+        import config as real_config
+
+        stale = _types.ModuleType("config")   # a config.py predating the key
+        assert not hasattr(stale, "MAIL_TYPE")
+        try:
+            with patch.dict(sys.modules, {"config": stale}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.MAIL_TYPE == ["END", "FAIL"]
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
+    def test_real_config_wins_for_a_personal_key(self):
         import config
-        if hasattr(config, "MAIN_PARTITION"):
+        if hasattr(config, "MAIL_TYPE"):
             import config_defaults
-            assert config_defaults.MAIN_PARTITION == config.MAIN_PARTITION
+            assert config_defaults.MAIL_TYPE == config.MAIL_TYPE
 
     def test_no_module_hard_imports_a_post_release_config_key(self):
         import ast
@@ -2328,6 +2384,49 @@ class TestConfigDefaults:
             }
             missing = _BASELINE_CONFIG_KEYS - assigned
             assert not missing, f"config-examples/{name} is missing {missing}"
+            leaked = _FIXED_CLUSTER_KEYS & assigned
+            assert not leaked, (
+                f"config-examples/{name} defines {leaked}, which are cluster "
+                "facts owned by config_defaults.py, not personal config"
+            )
+
+    def test_fixed_cluster_keys_are_not_read_from_config(self):
+        """They must resolve from config_defaults alone: a value left over in a
+        gitignored config.py cannot be allowed to win."""
+        import importlib
+        import types as _types
+        import config as real_config
+
+        stale = _types.ModuleType("config")
+        stale.CPU_PARTITION = "leftover"
+        stale.CPU_QOS = "leftover"
+        stale.MAIN_PARTITION = "leftover"
+        try:
+            with patch.dict(sys.modules, {"config": stale}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.CPU_PARTITION == "cpu"
+                assert mod.CPU_QOS == "normal"
+                assert mod.MAIN_PARTITION == "main"
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
+    def test_config_defaults_imports_without_a_config_module(self):
+        """`slurmx config` on a fresh clone imports config_defaults through
+        cli/config_model, before config.py exists."""
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.abc, sys\n"
+             "class B(importlib.abc.MetaPathFinder):\n"
+             "    def find_spec(self, n, p=None, t=None):\n"
+             "        if n == 'config':\n"
+             "            raise ModuleNotFoundError('no config', name='config')\n"
+             "sys.meta_path.insert(0, B())\n"
+             "import config_defaults as cd\n"
+             "print(cd.CPU_PARTITION, cd.MAIN_PARTITION, cd.MAIL_TYPE)"],
+            cwd=_REPO_ROOT, capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "cpu main ['END', 'FAIL']"
 
 
 # ============================================================

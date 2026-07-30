@@ -3,7 +3,21 @@
 Design for a `slurmx config` subcommand that edits `config.py` from the terminal
 as a full-screen curses form, in the same visual family as `slurmx status`.
 
-Status: approved 2026-07-30.
+Status: approved 2026-07-30, implemented the same day.
+
+**Amended after implementation (2026-07-30).** The field schema below is the
+as-approved one; three changes landed on top of it:
+
+1. `CPU_PARTITION`, `CPU_QOS` and `MAIN_PARTITION` are no longer config keys at
+   all. They are cluster facts, identical for every user, so they moved into
+   `config_defaults.py` and are read from nowhere else — a copy left in a
+   gitignored `config.py` is ignored. The form and `--show` display them in a
+   read-only footer labelled with their source.
+2. New personal key `MAIL_TYPE` (list of `sbatch --mail-type` events, default
+   `["END", "FAIL"]`), replacing the hardcoded `--mail-type=ALL`. An empty list
+   or `["NONE"]`, or an empty `MAIL_USER`, drops both mail lines from the script.
+3. The card table's fourth column is "golden tickets", not "quota" (display
+   only; `GPUType.golden_quota` keeps its name).
 
 ## Why
 

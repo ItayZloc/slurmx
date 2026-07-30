@@ -61,7 +61,7 @@ HOW TO USE WITH AGENTS
       "Cancel my pending jobs."
 
 NEXT STEPS
-  1. Run `slurmx config` to check MAIL_USER and your GOLDEN_QOS list.
+  1. Run `slurmx config` to check MAIL_USER, MAIL_TYPE and your GOLDEN_QOS list.
   2. Register the MCP server with Claude Code:
        claude mcp add slurmx \
          "$(pwd)/.venv/bin/python" "$(pwd)/server.py"

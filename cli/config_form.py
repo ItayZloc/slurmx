@@ -16,7 +16,9 @@ from cli.theme import Role
 
 NAME_W = 18
 VALUE_W = 30
-CARD_W = (16, 16, 6, 7, 16)      # name, display, vram, quota, partition
+# name, display, vram, tickets, partition. Each is wider than its header word
+# in cm.CARD_CELLS, or the header runs into the next column.
+CARD_W = (16, 16, 6, 9, 16)
 CARET = "▏"
 
 
@@ -72,7 +74,9 @@ def _field_row(state, name: str, editing: bool) -> Row:
 
 
 def _card_row(state, qos: str, index: int, card: tuple, selected: bool) -> Row:
-    cells = [str(c) for c in card]
+    # A None golden partition renders blank, and editing it prefills blank, so
+    # clearing the cell round-trips back to None.
+    cells = ["" if c is None else str(c) for c in card]
     if selected and state.editing is not None:
         buf = state.editing
         cells[state.cell] = buf[:state.edit_pos] + CARET + buf[state.edit_pos:]
@@ -105,13 +109,25 @@ def build_rows(state: FormState) -> list[Row]:
                         qos=qos, selectable=True))
         if folded:
             continue
-        head = "      " + "".join(n.ljust(w) for (n, _), w in zip(cm.CARD_CELLS, CARD_W))
+        head = "      " + "".join(c.header.ljust(w)
+                                  for c, w in zip(cm.CARD_CELLS, CARD_W))
         rows.append(Row("thead", spans=[(head, Role.CFG_TAG)], qos=qos))
         for i, card in enumerate(cards):
             rows.append(_card_row(state, qos, i, card, selected=state.cursor == len(rows)))
         rows.append(Row("add", spans=[("      + add card", Role.CFG_TAG)],
                         qos=qos, selectable=True))
         rows.append(Row("blank", spans=[("", Role.PLAIN)]))
+
+    # Cluster facts, not config.py keys — shown so "where do CPU jobs go?" is
+    # answerable here, unselectable so nobody mistakes them for settings.
+    rows.append(Row("fixed_head",
+                    spans=[(f" ─ fixed · {cm.FIXED_SOURCE} "
+                            f"(not part of config.py)", Role.CFG_TAG)]))
+    for name, value, _help in cm.FIXED_FACTS:
+        rows.append(Row("fixed",
+                        spans=[("  " + name.ljust(NAME_W), Role.CFG_TAG),
+                               (str(value).ljust(VALUE_W), Role.CFG_TAG)],
+                        field=name))
     return rows
 
 
@@ -165,7 +181,8 @@ def _begin_edit(state: FormState, rows) -> None:
         state.editing = state.doc.text_value(row.field)
     else:
         card = dict(state.doc.groups())[row.qos][row.index]
-        state.editing = str(card[state.cell])
+        cell = card[state.cell]
+        state.editing = "" if cell is None else str(cell)
     state.edit_pos = len(state.editing)
 
 

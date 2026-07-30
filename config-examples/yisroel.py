@@ -1,6 +1,6 @@
 """Cluster-specific configuration — Yisroel's lab.
 
-Pre-filled with Yisroel's QoS and golden ticket quotas.
+Pre-filled with Yisroel's QoS and golden ticket counts.
 Copy to config.py — MAIL_USER defaults to $USER@post.bgu.ac.il.
 """
 
@@ -12,15 +12,14 @@ USERNAME = os.environ.get("USER", "")
 # --- Personal ---
 # Defaults to $USER@post.bgu.ac.il; override per-shell with SLURM_MAIL_USER.
 MAIL_USER = os.environ.get("SLURM_MAIL_USER", f"{USERNAME}@post.bgu.ac.il")
+# SLURM mail events, passed to `sbatch --mail-type`. Valid: NONE, BEGIN, END,
+# FAIL, REQUEUE, ALL, TIME_LIMIT, TIME_LIMIT_90/80/50, ARRAY_TASKS. An empty
+# list or ["NONE"] drops the mail lines from the script entirely.
+MAIL_TYPE = ["END", "FAIL"]
 
-# --- QoS / Partitions ---
+# --- Golden QoS ---
 # Golden-ticket QoS list. First entry is primary for job submission.
 GOLDEN_QOS = ["yisroel"]
-CPU_PARTITION = "cpu"
-CPU_QOS = "normal"
-# Shared, preemptible GPU pool — where non-golden jobs land, and (together with
-# the golden partitions below) what counts as reachable capacity.
-MAIN_PARTITION = "main"
 
 # --- Excluded nodes ---
 # Nodes to exclude from job placement (sbatch --exclude). Override via
@@ -40,8 +39,8 @@ TIME_LIMIT = "7-0:00:00"
 START_TIMEOUT = 300  # seconds to wait for job to start
 
 # --- GPU Definitions ---
-# Each tuple: (name, display_name, vram_gb, golden_quota, golden_partition)
-# golden_quota and golden_partition are QoS-specific reserved allocations.
+# Each tuple: (name, display_name, vram_gb, golden_tickets, golden_partition)
+# golden_tickets and golden_partition are QoS-specific reserved allocations.
 GPU_DEFINITIONS_BY_QOS = {
     "yisroel": [
         ("rtx_pro_6000", "RTX 6000 Pro", 96, 16, "rtx_pro_6000"),

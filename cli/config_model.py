@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import NamedTuple
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(REPO, "config.py")
@@ -28,8 +29,21 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from maintenance import _parse_slurm_time  # stdlib-only module; safe to import
+# config_defaults tolerates a missing config.py, so this stays importable on a
+# fresh clone. It is the ONLY source of the fixed cluster facts below.
+from config_defaults import CPU_PARTITION, CPU_QOS, MAIN_PARTITION
 
 DEFAULT_MAIL_DOMAIN = "post.bgu.ac.il"
+
+# Cluster facts, shown read-only. Not config.py keys: config.py is gitignored
+# and personal (your address, your QoS, your cards), while a partition name is
+# the same for everyone and lives in tracked code.
+FIXED_FACTS = (
+    ("CPU_PARTITION", CPU_PARTITION, "partition for CPU-only jobs"),
+    ("CPU_QOS", CPU_QOS, "QoS for CPU-only jobs"),
+    ("MAIN_PARTITION", MAIN_PARTITION, "shared preemptible GPU pool"),
+)
+FIXED_SOURCE = "config_defaults.py"
 
 
 def default_mail_user() -> str:
@@ -114,6 +128,27 @@ def _v_time(raw: str) -> str | None:
     return None
 
 
+# `sbatch --mail-type` vocabulary. Empty or NONE means no mail at all.
+MAIL_EVENTS = (
+    "NONE", "BEGIN", "END", "FAIL", "REQUEUE", "ALL", "INVALID_DEPEND",
+    "STAGE_OUT", "TIME_LIMIT", "TIME_LIMIT_90", "TIME_LIMIT_80",
+    "TIME_LIMIT_50", "ARRAY_TASKS",
+)
+
+
+def _v_word_or_empty(raw: str) -> str | None:
+    """A single token, or blank. Blank stores None — the templates use None for
+    a card with no golden partition."""
+    return None if not raw.strip() else _v_word(raw)
+
+
+def _v_mail_types(raw: str) -> str | None:
+    for t in _words(raw):
+        if t.upper() not in MAIL_EVENTS:
+            return f"'{t}' is not a SLURM mail event ({', '.join(MAIL_EVENTS[:6])}, ...)"
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Schema
 # --------------------------------------------------------------------------- #
@@ -129,10 +164,9 @@ class Field:
 FIELDS: tuple[Field, ...] = (
     Field("USERNAME", "derived", "auto-detected from $USER"),
     Field("MAIL_USER", "str", "address for SLURM mail notifications", _v_email),
+    Field("MAIL_TYPE", "list", "SLURM mail events; empty or NONE = no mail",
+          _v_mail_types),
     Field("GOLDEN_QOS", "list", "golden QoS list; the first is primary", _v_word_list),
-    Field("CPU_PARTITION", "str", "partition for CPU-only jobs", _v_word),
-    Field("CPU_QOS", "str", "QoS for CPU-only jobs", _v_word),
-    Field("MAIN_PARTITION", "str", "shared preemptible GPU pool", _v_word),
     Field("EXCLUDE_NODES", "list", "nodes to keep jobs off", _v_word_list_or_empty),
     Field("MAX_MEM_GB", "int", "memory ceiling for a GPU job", _v_posint),
     Field("CPU_CPUS", "int", "cores for a CPU-only job", _v_posint),
@@ -145,15 +179,33 @@ FIELDS: tuple[Field, ...] = (
 FIELD_BY_NAME = {f.name: f for f in FIELDS}
 
 
+class Cell(NamedTuple):
+    header: str      # column header in the form, kept short
+    label: str       # what an error message calls it
+    validator: object
+
+
 CARD_CELLS = (
-    ("name", _v_word),
-    ("display", _v_text),
-    ("vram", _v_posint),
-    ("quota", _v_nonneg),
-    ("partition", _v_word),
+    Cell("name", "name", _v_word),
+    Cell("display", "display name", _v_text),
+    Cell("vram", "VRAM", _v_posint),
+    Cell("tickets", "golden tickets", _v_nonneg),
+    Cell("partition", "golden partition", _v_word_or_empty),
 )
 NEW_CARD = ("new_card", "New card", 24, 0, "new_partition")
 _INT_CELLS = (2, 3)
+_PARTITION_CELL = 4
+
+
+def _py_literal(v) -> str:
+    """One card field as Python source. NOT json.dumps: the default template
+    ships None for a card with no golden partition, and json renders that as
+    `null`, which is a NameError when config.py is imported."""
+    if v is None:
+        return "None"
+    if isinstance(v, bool) or isinstance(v, int):
+        return str(v)
+    return json.dumps(v)
 
 
 def _table_literal(table: dict[str, list[list]]) -> str:
@@ -165,16 +217,14 @@ def _table_literal(table: dict[str, list[list]]) -> str:
     out = ["{"]
     for qos, cards in table.items():
         out.append(f"    {json.dumps(qos)}: [")
-        w0 = max((len(json.dumps(c[0])) for c in cards), default=0)
-        w1 = max((len(json.dumps(c[1])) for c in cards), default=0)
-        w2 = max((len(str(c[2])) for c in cards), default=0)
-        w3 = max((len(str(c[3])) for c in cards), default=0)
+        widths = [max((len(_py_literal(c[i])) for c in cards), default=0)
+                  for i in range(4)]
         for c in cards:
-            name = (json.dumps(c[0]) + ",").ljust(w0 + 2)
-            disp = (json.dumps(c[1]) + ",").ljust(w1 + 2)
-            vram = (str(c[2]) + ",").rjust(w2 + 1)
-            quota = (str(c[3]) + ",").rjust(w3 + 1)
-            out.append(f"        ({name}{disp}{vram} {quota} {json.dumps(c[4])}),")
+            name = (_py_literal(c[0]) + ",").ljust(widths[0] + 2)
+            disp = (_py_literal(c[1]) + ",").ljust(widths[1] + 2)
+            vram = (_py_literal(c[2]) + ",").rjust(widths[2] + 1)
+            tickets = (_py_literal(c[3]) + ",").rjust(widths[3] + 1)
+            out.append(f"        ({name}{disp}{vram} {tickets} {_py_literal(c[4])}),")
         out.append("    ],")
     out.append("}")
     return "\n".join(out)
@@ -184,7 +234,10 @@ def _parse_raw(f: Field, raw: str):
     if f.kind == "int":
         return int(raw.strip())
     if f.kind == "list":
-        return _words(raw)
+        toks = _words(raw)
+        # sbatch only accepts the events upper-case, so store them that way
+        # rather than making the reader remember.
+        return [t.upper() for t in toks] if f.name == "MAIL_TYPE" else toks
     return raw.strip()
 
 
@@ -245,6 +298,31 @@ def _env_get_call(node: ast.AST):
     return node.args[0].value, node.args[1]
 
 
+_UNREADABLE = object()
+
+
+def _literal_eval(node: ast.AST):
+    """The node's value, or _UNREADABLE when it isn't a literal."""
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError, TypeError):
+        return _UNREADABLE
+
+
+def _find_env_get(node: ast.AST):
+    """The first os.environ.get(...) anywhere inside an expression.
+
+    Not just at the top: the templates wrap GOLDEN_QOS and EXCLUDE_NODES in a
+    comprehension that splits the env default on commas, so the editable literal
+    sits several levels down.
+    """
+    for sub in ast.walk(node):
+        found = _env_get_call(sub)
+        if found is not None:
+            return found
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Document
 # --------------------------------------------------------------------------- #
@@ -277,33 +355,42 @@ class ConfigDoc:
         if f.kind == "derived":
             return Slot(f, None, None, "derived")
 
-        # EXCLUDE_NODES is a comprehension over an env default: the editable
-        # literal is the _EXCLUDE_NODES_DEFAULT comma string above it.
-        if f.name == "EXCLUDE_NODES":
-            helper = assigns.get("_EXCLUDE_NODES_DEFAULT")
-            if helper is not None and isinstance(helper.value, ast.Constant):
-                csv = helper.value.value or ""
-                return Slot(f, self._span(helper.value),
-                            [t.strip() for t in csv.split(",") if t.strip()],
-                            "env-default", env_var="SLURM_EXCLUDE_NODES", as_csv=True)
-
         node = assigns.get(f.name)
         if node is None:
             return Slot(f, None, None, "absent")
 
-        env = _env_get_call(node.value)
-        if env is not None:
-            env_var, default_node = env
-            if isinstance(default_node, ast.Constant):
-                return Slot(f, self._span(default_node), default_node.value,
-                            "env-default", env_var=env_var)
-            return Slot(f, None, None, "unsupported")
+        # A plain literal is the easy case: the span is the literal itself.
+        value = _literal_eval(node.value)
+        if value is not _UNREADABLE:
+            return Slot(f, self._span(node.value), value, "file")
 
-        try:
-            value = ast.literal_eval(node.value)
-        except (ValueError, SyntaxError, TypeError):
+        # Otherwise the value is an expression. If an os.environ.get(NAME,
+        # DEFAULT) appears anywhere in it, DEFAULT is the editable part and the
+        # env var keeps working. Covers the plain wrapper (MAIN_PARTITION), an
+        # f-string default (MAIL_USER), the comprehension over an inline default
+        # (GOLDEN_QOS), and the comprehension over a named one (EXCLUDE_NODES).
+        env = _find_env_get(node.value)
+        if env is None:
             return Slot(f, None, None, "unsupported")
-        return Slot(f, self._span(node.value), value, "file")
+        env_var, default_node = env
+        if isinstance(default_node, ast.Name):
+            helper = assigns.get(default_node.id)
+            if helper is None:
+                return Slot(f, None, None, "unsupported")
+            default_node = helper.value
+
+        raw = _literal_eval(default_node)
+        # A list field whose env default is a string is a comma-separated one,
+        # because the comprehension around it splits on commas.
+        as_csv = f.kind == "list" and not isinstance(default_node, (ast.List, ast.Tuple))
+        if as_csv:
+            value = [t.strip() for t in (raw or "").split(",") if t.strip()]
+        else:
+            # None when it can't be read statically (an f-string). text_value
+            # then falls back to the same default the f-string would compute.
+            value = None if raw is _UNREADABLE else raw
+        return Slot(f, self._span(default_node), value, "env-default",
+                    env_var=env_var, as_csv=as_csv)
 
     # -- rendering -------------------------------------------------------- #
 
@@ -428,13 +515,19 @@ class ConfigDoc:
             self._staged["GPU_DEFINITIONS_BY_QOS"] = literal
 
     def set_card(self, qos: str, index: int, cell: int, raw: str) -> str | None:
-        cell_name, validator = CARD_CELLS[cell]
-        err = validator(raw)
+        spec = CARD_CELLS[cell]
+        err = spec.validator(raw)
         if err:
-            return f"{cell_name} {err}"
+            return f"{spec.label} {err}"
+        if cell in _INT_CELLS:
+            value = int(raw.strip())
+        elif cell == _PARTITION_CELL and not raw.strip():
+            value = None
+        else:
+            value = raw.strip()
         table = self._mutable_table()
         table.setdefault(qos, [])
-        table[qos][index][cell] = int(raw.strip()) if cell in _INT_CELLS else raw.strip()
+        table[qos][index][cell] = value
         self._stage_table()
         return None
 
@@ -508,7 +601,7 @@ class ConfigDoc:
 BACKUP_SUFFIX = ".bak"
 
 _REQUIRED = (
-    "MAIL_USER", "GOLDEN_QOS", "CPU_PARTITION", "CPU_QOS", "CPU_MEM", "CPU_CPUS",
+    "MAIL_USER", "GOLDEN_QOS", "CPU_MEM", "CPU_CPUS",
     "MAX_MEM_GB", "TIME_LIMIT", "START_TIMEOUT",
     "GPU_DEFINITIONS_BY_QOS", "GPU_DEFINITIONS",
 )

@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from config import (
     MAIL_USER, MAX_MEM_GB, TIME_LIMIT, START_TIMEOUT,
-    CPU_PARTITION, CPU_QOS, CPU_MEM, CPU_CPUS,
+    CPU_MEM, CPU_CPUS,
     GOLDEN_QOS, EXCLUDE_NODES,
 )
-from config_defaults import MAIN_PARTITION
+from config_defaults import CPU_PARTITION, CPU_QOS, MAIL_TYPE, MAIN_PARTITION
 
 from .types import (
     GPUType, GPUAvailability, Availability, JobResult, JobStatus,

@@ -46,9 +46,14 @@ def show_text(doc) -> str:
         lines.append(f"  {BOLD}GPU cards · {qos}{NC} ({len(cards)})")
         if not cards:
             lines.append(f"    {DIM}(none){NC}")
-        for name, disp, vram, quota, part in cards:
+        for name, disp, vram, tickets, part in cards:
             lines.append(f"    {name.ljust(16)}{str(vram).rjust(4)}GB "
-                         f"quota {str(quota).rjust(3)}  {part}   {DIM}{disp}{NC}")
+                         f"tickets {str(tickets).rjust(3)}  {part}   {DIM}{disp}{NC}")
+    lines.append("")
+    lines.append(f"  {BOLD}fixed{NC}  {DIM}{cm.FIXED_SOURCE}, "
+                 f"not part of config.py{NC}")
+    for name, value, help_text in cm.FIXED_FACTS:
+        lines.append(f"    {name.ljust(NAME_W - 2)}{value}   {DIM}{help_text}{NC}")
     errs = doc.cross_field_errors()
     warns = doc.warnings()
     if errs or warns:
@@ -68,7 +73,7 @@ def templates() -> list[tuple[str, str]]:
 
 _TEMPLATE_BLURB = {
     "default": "blank template, fill in your own QoS and cards",
-    "yisroel": "Yisroel's lab, pre-filled QoS and golden quotas",
+    "yisroel": "Yisroel's lab, pre-filled QoS and golden tickets",
 }
 
 
