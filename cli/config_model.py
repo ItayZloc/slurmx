@@ -128,12 +128,31 @@ def _v_time(raw: str) -> str | None:
     return None
 
 
-# `sbatch --mail-type` vocabulary. Empty or NONE means no mail at all.
+# `sbatch --mail-type` vocabulary, in the order the form lists them. Empty or
+# NONE means no mail at all.
 MAIL_EVENTS = (
     "NONE", "BEGIN", "END", "FAIL", "REQUEUE", "ALL", "INVALID_DEPEND",
     "STAGE_OUT", "TIME_LIMIT", "TIME_LIMIT_90", "TIME_LIMIT_80",
     "TIME_LIMIT_50", "ARRAY_TASKS",
 )
+MAIL_EVENT_HELP = {
+    "NONE": "no mail at all",
+    "BEGIN": "the job starts",
+    "END": "the job finishes",
+    "FAIL": "the job fails or is killed",
+    "REQUEUE": "the job is requeued (preemption)",
+    "ALL": "BEGIN, END, FAIL, REQUEUE and the rest",
+    "INVALID_DEPEND": "a dependency can never be satisfied",
+    "STAGE_OUT": "burst-buffer stage-out finished",
+    "TIME_LIMIT": "the job hit its wall clock",
+    "TIME_LIMIT_90": "reached 90% of the wall clock",
+    "TIME_LIMIT_80": "reached 80% of the wall clock",
+    "TIME_LIMIT_50": "reached 50% of the wall clock",
+    "ARRAY_TASKS": "mail per array task, not per job",
+}
+# Checking one of these clears everything else, and checking anything else
+# clears them: "no mail" and "every event" don't combine with a specific event.
+MAIL_EXCLUSIVE = ("NONE", "ALL")
 
 
 def _v_word_or_empty(raw: str) -> str | None:
@@ -472,6 +491,24 @@ class ConfigDoc:
         else:
             self._staged[name] = literal
         return None
+
+    def mail_events(self) -> list[str]:
+        """The currently checked events, upper-cased."""
+        return [str(e).upper() for e in (self.value("MAIL_TYPE") or [])]
+
+    def toggle_mail_event(self, event: str) -> str | None:
+        """Check or uncheck one event. Error message, or None on success."""
+        event = event.upper()
+        checked = set(self.mail_events())
+        if event in checked:
+            checked.discard(event)
+        elif event in MAIL_EXCLUSIVE:
+            checked = {event}
+        else:
+            checked -= set(MAIL_EXCLUSIVE)
+            checked.add(event)
+        # Re-emit in MAIL_EVENTS order so the file doesn't churn on click order.
+        return self.set("MAIL_TYPE", ", ".join(e for e in MAIL_EVENTS if e in checked))
 
     def revert(self, name: str) -> None:
         self._staged.pop(name, None)

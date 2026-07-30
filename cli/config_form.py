@@ -44,6 +44,7 @@ class FormState:
     status: str = ""
     confirm: str | None = None    # "delete" | "quit" | None
     done: bool = False
+    mail_open: bool = False       # MAIL_TYPE checklist expanded
 
 
 def _tag(doc, name: str) -> str:
@@ -73,6 +74,38 @@ def _field_row(state, name: str, editing: bool) -> Row:
     )
 
 
+def _mail_rows(state) -> list[Row]:
+    """MAIL_TYPE as a fold-out checklist rather than a typed list.
+
+    The events are a closed vocabulary, so picking from them beats retyping
+    "END, FAIL" and misspelling it.
+    """
+    doc = state.doc
+    checked = doc.mail_events()
+    summary = ", ".join(checked) if checked else "(no mail)"
+    glyph = "▾" if state.mail_open else "▸"
+    tag = "edited" if "MAIL_TYPE" in doc.staged_names() else ""
+    # The prefix is two cells, exactly like a field row's "  ", so the name
+    # column stays aligned with everything above and below it.
+    rows = [Row("mailgroup",
+                spans=[(f"{glyph} " + "MAIL_TYPE".ljust(NAME_W), Role.CFG_NAME),
+                       (summary.ljust(VALUE_W),
+                        Role.CFG_EDITED if tag else Role.CFG_VALUE),
+                       (tag, Role.CFG_TAG)],
+                field="MAIL_TYPE", selectable=True)]
+    if not state.mail_open:
+        return rows
+    for event in cm.MAIL_EVENTS:
+        box = "[x]" if event in checked else "[ ]"
+        rows.append(Row("mailopt",
+                        spans=[(f"      {box} ", Role.CFG_VALUE),
+                               (event.ljust(16),
+                                Role.CFG_EDITED if event in checked else Role.CFG_VALUE),
+                               (cm.MAIL_EVENT_HELP.get(event, ""), Role.CFG_TAG)],
+                        field=event, selectable=True))
+    return rows
+
+
 def _card_row(state, qos: str, index: int, card: tuple, selected: bool) -> Row:
     # A None golden partition renders blank, and editing it prefills blank, so
     # clearing the cell round-trips back to None.
@@ -93,6 +126,9 @@ def build_rows(state: FormState) -> list[Row]:
     rows: list[Row] = [Row("blank", spans=[("", Role.PLAIN)])]
     for f in cm.FIELDS:
         if f.kind == "table":
+            continue
+        if f.name == "MAIL_TYPE":
+            rows.extend(_mail_rows(state))
             continue
         editing = state.editing is not None and state.cursor == len(rows)
         rows.append(_field_row(state, f.name, editing))
@@ -142,6 +178,7 @@ _DOWN = (curses.KEY_DOWN, ord("j"))
 _ENTER = (ord("\n"), ord("\r"), curses.KEY_ENTER)
 _BACKSPACE = (curses.KEY_BACKSPACE, 127, 8)
 _ESC = 27
+_SPACE = ord(" ")
 
 SAVED_HINT = ("saved · config.py.bak written · a running Claude Code session "
               "keeps the old config until you restart it or reconnect with /mcp")
@@ -157,7 +194,16 @@ def move(state: FormState, key: int) -> FormState:
     idx = _selectable(rows)
     if not idx:
         return state
-    here = min(range(len(idx)), key=lambda i: abs(idx[i] - state.cursor))
+    if state.cursor not in idx:
+        # Sitting on a blank or read-only row (the cursor starts on row 0).
+        # Snap to the nearest selectable. For a single step that snap IS the
+        # move, or the first keypress silently skips a field; g/G/PgUp/PgDn are
+        # absolute, so they still apply.
+        state.cursor = min(idx, key=lambda i: abs(i - state.cursor))
+        state.cell = 0
+        if key in _UP or key in _DOWN:
+            return state
+    here = idx.index(state.cursor)
     if key in _DOWN:
         here = min(here + 1, len(idx) - 1)
     elif key in _UP:
@@ -257,13 +303,20 @@ def dispatch(state: FormState, key: int) -> FormState:
     elif key in SAVE_KEYS:
         err = state.doc.save()
         state.status = f"cannot save: {err}" if err else SAVED_HINT
-    elif key in _ENTER and row is not None:
+    elif (key in _ENTER or key == _SPACE) and row is not None:
         if row.kind == "group":
             state.folds.symmetric_difference_update({row.qos})
+        elif row.kind == "mailgroup":
+            state.mail_open = not state.mail_open
+        elif row.kind == "mailopt":
+            err = state.doc.toggle_mail_event(row.field)
+            state.status = err or ""
         elif row.kind == "add":
             state.doc.add_card(row.qos)
-        elif row.kind in ("field", "card"):
+        elif row.kind in ("field", "card") and key in _ENTER:
             _begin_edit(state, rows)
+        else:
+            move(state, key)
     elif key == ord("a") and row is not None and row.qos:
         state.doc.add_card(row.qos)
     elif key == ord("d") and row is not None and row.kind == "card":
@@ -274,7 +327,7 @@ def dispatch(state: FormState, key: int) -> FormState:
         else:
             state.confirm = "delete"
             state.status = f"delete {row.qos} card {row.index + 1}? d again to confirm"
-    elif key == ord("r") and row is not None and row.kind == "field":
+    elif key == ord("r") and row is not None and row.kind in ("field", "mailgroup"):
         state.doc.revert(row.field)
         state.status = f"{row.field} reverted"
     elif key == curses.KEY_RIGHT and row is not None and row.kind == "card":
@@ -368,8 +421,8 @@ def _loop(stdscr, state: FormState) -> None:
         status, is_err = _status_line(state)
         _addbar(stdscr, maxy - 2, " " + status, maxx,
                 theme.get(theme_mod.Role.CFG_ERROR, 0) if is_err else 0)
-        keys = ("↑↓ move · ⏎ edit · ←→ cell · a add · d delete · r revert · "
-                "s save · q quit")
+        keys = ("↑↓ move · ⏎ edit/open · space toggle · ←→ cell · a add · "
+                "d delete · r revert · s save · q quit")
         _addbar(stdscr, maxy - 1, " " + keys, maxx, bar)
         try:
             curses.curs_set(1 if state.editing is not None else 0)
@@ -390,8 +443,12 @@ def run_form(path: str, start_field: str | None = None) -> None:
     cli/config_cmd.run falls back to the text dump, same as slurmx status.
     """
     state = FormState(doc=cm.load(path), path=path)
+    rows = build_rows(state)
+    # Row 0 is blank and row 1 is derived, so start on the first row you can
+    # actually act on rather than drawing the cursor next to nothing.
+    state.cursor = next((i for i, r in enumerate(rows) if r.selectable), 0)
     if start_field:
-        for i, row in enumerate(build_rows(state)):
+        for i, row in enumerate(rows):
             if row.field == start_field and row.selectable:
                 state.cursor = i
                 break

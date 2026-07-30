@@ -106,7 +106,7 @@ how many golden tickets your group owns.
 | Field | What to fill in |
 |-------|----------------|
 | `MAIL_USER` | Your cluster email for SLURM notifications. Defaults to `$USER@post.bgu.ac.il`. |
-| `MAIL_TYPE` | Which events mail you, passed to `sbatch --mail-type`. Defaults to `["END", "FAIL"]`. `[]` or `["NONE"]` turns mail off entirely. |
+| `MAIL_TYPE` | Which events mail you, passed to `sbatch --mail-type`. A checklist in the form (`⏎` opens it, space ticks an event). Defaults to `["END", "FAIL"]`; unticking everything, or ticking `NONE`, turns mail off entirely. |
 | `GOLDEN_QOS` | List of your QoS, e.g. `["yisroel"]` or `["yisroel", "shared"]`. First entry is primary for job submission. |
 | `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_tickets, golden_partition)` tuples for that QoS. |
 

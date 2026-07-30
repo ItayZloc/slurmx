@@ -450,7 +450,8 @@ def flat(rows):
 class TestRows:
     def test_every_scalar_field_gets_a_row(self, tmp_path):
         rows = cf.build_rows(state_for(tmp_path))
-        fields = [r.field for r in rows if r.kind == "field"]
+        # MAIL_TYPE is a checklist group, not a typed field.
+        fields = [r.field for r in rows if r.kind in ("field", "mailgroup")]
         assert fields == [f.name for f in cm.FIELDS if f.kind != "table"]
 
     def test_table_renders_a_group_header_per_qos(self, tmp_path):
@@ -911,3 +912,155 @@ class TestNonePartition:
         header with no gap."""
         for cell, width in zip(cm.CARD_CELLS, cf.CARD_W):
             assert width > len(cell.header), f"{cell.header} needs > {len(cell.header)}"
+
+
+class TestMailChecklist:
+    def cursor_kind(self, st, kind, field=None):
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st))
+                         if r.kind == kind and (field is None or r.field == field))
+        return st
+
+    def test_mail_type_is_a_collapsed_group_by_default(self, tmp_path):
+        st = state_for(tmp_path)
+        rows = cf.build_rows(st)
+        group = next(r for r in rows if r.kind == "mailgroup")
+        assert group.field == "MAIL_TYPE"
+        assert "▸" in "".join(t for t, _ in group.spans)
+        assert "END, FAIL" in "".join(t for t, _ in group.spans)
+        assert not [r for r in rows if r.kind == "mailopt"]
+
+    def test_enter_opens_the_checklist_with_every_event(self, tmp_path):
+        st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+        cf.dispatch(st, ord("\n"))
+        rows = cf.build_rows(st)
+        opts = [r for r in rows if r.kind == "mailopt"]
+        assert [r.field for r in opts] == list(cm.MAIL_EVENTS)
+        assert "▾" in "".join(t for t, _ in
+                              next(r for r in rows if r.kind == "mailgroup").spans)
+
+    def test_checked_events_render_with_a_tick(self, tmp_path):
+        st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+        cf.dispatch(st, ord("\n"))
+        boxes = {r.field: "".join(t for t, _ in r.spans)
+                 for r in cf.build_rows(st) if r.kind == "mailopt"}
+        assert "[x]" in boxes["END"] and "[x]" in boxes["FAIL"]
+        assert "[ ]" in boxes["BEGIN"] and "[ ]" in boxes["ALL"]
+        assert "the job finishes" in boxes["END"]
+
+    def test_space_and_enter_both_toggle_an_event(self, tmp_path):
+        for key in (ord(" "), ord("\n")):
+            st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+            st.mail_open = True
+            self.cursor_kind(st, "mailopt", "BEGIN")
+            cf.dispatch(st, key)
+            assert st.doc.mail_events() == ["BEGIN", "END", "FAIL"]
+            cf.dispatch(st, key)
+            assert st.doc.mail_events() == ["END", "FAIL"]
+
+    def test_events_are_written_in_canonical_order(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.toggle_mail_event("FAIL")          # leaves END
+        st.doc.toggle_mail_event("BEGIN")
+        assert st.doc.mail_events() == ["BEGIN", "END"]
+        assert 'MAIL_TYPE = ["BEGIN", "END"]' in st.doc.render()
+
+    def test_checking_none_clears_everything_else(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.toggle_mail_event("NONE")
+        assert st.doc.mail_events() == ["NONE"]
+
+    def test_checking_all_clears_everything_else(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.toggle_mail_event("ALL")
+        assert st.doc.mail_events() == ["ALL"]
+
+    def test_checking_a_specific_event_clears_none_and_all(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.toggle_mail_event("ALL")
+        st.doc.toggle_mail_event("TIME_LIMIT")
+        assert st.doc.mail_events() == ["TIME_LIMIT"]
+
+    def test_unchecking_the_last_event_means_no_mail(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.toggle_mail_event("END")
+        st.doc.toggle_mail_event("FAIL")
+        assert st.doc.mail_events() == []
+        assert "MAIL_TYPE = []" in st.doc.render()
+        group = next(r for r in cf.build_rows(st) if r.kind == "mailgroup")
+        assert "(no mail)" in "".join(t for t, _ in group.spans)
+
+    def test_toggling_marks_the_group_edited(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.toggle_mail_event("BEGIN")
+        group = next(r for r in cf.build_rows(st) if r.kind == "mailgroup")
+        assert "edited" in "".join(t for t, _ in group.spans)
+
+    def test_r_reverts_the_whole_checklist(self, tmp_path):
+        st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+        st.doc.toggle_mail_event("ALL")
+        cf.dispatch(st, ord("r"))
+        assert st.doc.dirty is False
+        assert st.doc.mail_events() == ["END", "FAIL"]
+
+    def test_every_event_has_a_help_line(self):
+        assert set(cm.MAIL_EVENT_HELP) == set(cm.MAIL_EVENTS)
+
+    def test_movement_walks_into_and_out_of_an_open_checklist(self, tmp_path):
+        st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+        cf.dispatch(st, ord("\n"))
+        cf.dispatch(st, curses.KEY_DOWN)
+        assert cf.build_rows(st)[st.cursor].kind == "mailopt"
+        for _ in range(len(cm.MAIL_EVENTS)):
+            cf.dispatch(st, curses.KEY_DOWN)
+        assert cf.build_rows(st)[st.cursor].kind == "field"
+
+    def test_a_toggled_checklist_survives_a_save(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.toggle_mail_event("ALL")
+        assert st.doc.save() is None
+        assert 'MAIL_TYPE = ["ALL"]' in open(st.path).read()
+        assert cm.load(st.path).mail_events() == ["ALL"]
+
+
+class TestCursorSnap:
+    def test_first_keypress_from_row_zero_does_not_skip_a_field(self, tmp_path):
+        """The cursor starts on the blank row 0. Stepping from an unselectable
+        row used to snap AND step, so the first field (MAIL_USER) was skipped."""
+        st = state_for(tmp_path)
+        assert st.cursor == 0
+        cf.dispatch(st, curses.KEY_DOWN)
+        assert cf.build_rows(st)[st.cursor].field == "MAIL_USER"
+        cf.dispatch(st, curses.KEY_DOWN)
+        assert cf.build_rows(st)[st.cursor].field == "MAIL_TYPE"
+
+    def test_up_from_row_zero_also_snaps(self, tmp_path):
+        st = state_for(tmp_path)
+        cf.dispatch(st, curses.KEY_UP)
+        assert cf.build_rows(st)[st.cursor].selectable is True
+
+    def test_run_form_starts_on_the_first_selectable_row(self, tmp_path, monkeypatch):
+        seen = {}
+
+        def fake_wrapper(fn, state):
+            seen["cursor"] = state.cursor
+            seen["field"] = cf.build_rows(state)[state.cursor].field
+
+        monkeypatch.setattr(cf.curses, "wrapper", fake_wrapper)
+        cf.run_form(write(tmp_path, MANGLED))
+        assert seen["field"] == "MAIL_USER"
+
+    def test_run_form_honours_start_field(self, tmp_path, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(cf.curses, "wrapper",
+                            lambda fn, st: seen.update(
+                                field=cf.build_rows(st)[st.cursor].field))
+        cf.run_form(write(tmp_path, MANGLED), start_field="GOLDEN_QOS")
+        assert seen["field"] == "GOLDEN_QOS"
+
+    def test_the_mail_group_name_column_aligns_with_the_fields(self, tmp_path):
+        rows = cf.build_rows(state_for(tmp_path))
+        field = next("".join(t for t, _ in r.spans)
+                     for r in rows if r.field == "MAIL_USER")
+        group = next("".join(t for t, _ in r.spans)
+                     for r in rows if r.kind == "mailgroup")
+        assert field.index("MAIL_USER") == group.index("MAIL_TYPE")

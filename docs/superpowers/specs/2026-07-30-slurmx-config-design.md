@@ -16,6 +16,10 @@ as-approved one; three changes landed on top of it:
 2. New personal key `MAIL_TYPE` (list of `sbatch --mail-type` events, default
    `["END", "FAIL"]`), replacing the hardcoded `--mail-type=ALL`. An empty list
    or `["NONE"]`, or an empty `MAIL_USER`, drops both mail lines from the script.
+   It is the one field that is not typed: the vocabulary is closed, so the form
+   shows a fold-out checklist (`⏎` opens, space or `⏎` ticks an event, `r`
+   reverts the lot). Ticking `NONE` or `ALL` clears every other event, and
+   ticking a specific event clears those two.
 3. The card table's fourth column is "golden tickets", not "quota" (display
    only; `GPUType.golden_quota` keeps its name).
 
