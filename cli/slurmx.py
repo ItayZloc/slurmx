@@ -24,6 +24,7 @@ from cli import wait as wait_mod
 from cli import log as log_mod
 from cli import diagnose as diagnose_mod
 from cli import cancel as cancel_mod
+from cli import config_cmd as config_mod
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -103,6 +104,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_subcommand(
         subparsers, "cancel", cancel_mod,
         help="Cancel jobs by ID, or all your jobs.",
+    )
+    _add_subcommand(
+        subparsers, "config", config_mod,
+        help="Edit config.py in a terminal form (--show prints it as text).",
     )
     _add_script_subcommand(
         subparsers, "setup", "setup.sh",

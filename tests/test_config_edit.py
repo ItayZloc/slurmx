@@ -363,3 +363,47 @@ class TestGate:
     @pytest.mark.parametrize("path", TEMPLATES)
     def test_templates_validate(self, path):
         assert cm.validate_file(path) is None
+
+
+from cli import config_cmd
+
+
+class TestShow:
+    def test_show_text_lists_every_field_with_provenance(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED))
+        out = config_cmd.show_text(doc)
+        assert "MAIL_USER" in out and "someone@example.com" in out
+        assert "MAIN_PARTITION" in out and "env-default" in out
+        assert "GPU_DEFINITIONS" in out and "derived" in out
+        assert "alpha" in out and "a_card" in out and "96" in out
+
+    def test_show_text_marks_an_active_env_override(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SLURM_MAIN_PARTITION", "gpu")
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert "SLURM_MAIN_PARTITION=gpu" in config_cmd.show_text(doc)
+
+    def test_show_text_renders_an_empty_list_readably(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED.replace('"n1,n2"', '""')))
+        assert "(none)" in config_cmd.show_text(doc)
+
+    def test_run_show_prints_and_does_not_touch_the_file(self, tmp_path, capsys):
+        path = write(tmp_path, MANGLED)
+        args = type("A", (), {"show": True, "path": path})()
+        config_cmd.run(args)
+        assert "MAIL_USER" in capsys.readouterr().out
+        assert open(path).read() == MANGLED
+
+    def test_non_tty_routes_to_text(self, tmp_path, capsys, monkeypatch):
+        monkeypatch.setattr("sys.stdout.isatty", lambda: False, raising=False)
+        args = type("A", (), {"show": False, "path": write(tmp_path, MANGLED)})()
+        config_cmd.run(args)
+        assert "GOLDEN_QOS" in capsys.readouterr().out
+
+
+class TestParser:
+    def test_config_is_registered(self):
+        from cli import slurmx as slurmx_cli
+        parser = slurmx_cli.build_parser()
+        args = parser.parse_args(["config", "--show"])
+        assert args.show is True
+        assert args._run is config_cmd.run
