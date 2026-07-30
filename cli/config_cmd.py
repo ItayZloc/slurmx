@@ -21,18 +21,6 @@ from cli._style import BOLD, DIM, NC
 NAME_W = 24
 
 
-def _display(doc, name: str) -> str:
-    slot = doc.slots[name]
-    if slot.field.kind == "list":
-        return doc.text_value(name) or "(none)"
-    if name == "GPU_DEFINITIONS":
-        primary = (doc.value("GOLDEN_QOS") or [""])[0]
-        return f"{len(dict(doc.groups()).get(primary, []))} cards ({primary})"
-    if name == "USERNAME":
-        return os.environ.get("USER", "")
-    return doc.text_value(name) or "(unset)"
-
-
 def _note(doc, name: str) -> str:
     slot = doc.slots[name]
     bits = [slot.provenance] if slot.provenance != "file" else []
@@ -50,7 +38,7 @@ def show_text(doc) -> str:
         if f.kind == "table":
             continue
         note = _note(doc, f.name)
-        line = f"  {f.name.ljust(NAME_W)}{_display(doc, f.name)}"
+        line = f"  {f.name.ljust(NAME_W)}{doc.display_value(f.name)}"
         lines.append(f"{line}   {DIM}{note}{NC}" if note else line)
     lines.append("")
     for qos, cards in doc.groups():

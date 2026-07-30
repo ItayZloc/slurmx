@@ -167,10 +167,14 @@ def _table_literal(table: dict[str, list[list]]) -> str:
         out.append(f"    {json.dumps(qos)}: [")
         w0 = max((len(json.dumps(c[0])) for c in cards), default=0)
         w1 = max((len(json.dumps(c[1])) for c in cards), default=0)
+        w2 = max((len(str(c[2])) for c in cards), default=0)
+        w3 = max((len(str(c[3])) for c in cards), default=0)
         for c in cards:
             name = (json.dumps(c[0]) + ",").ljust(w0 + 2)
             disp = (json.dumps(c[1]) + ",").ljust(w1 + 2)
-            out.append(f"        ({name}{disp}{c[2]}, {c[3]}, {json.dumps(c[4])}),")
+            vram = (str(c[2]) + ",").rjust(w2 + 1)
+            quota = (str(c[3]) + ",").rjust(w3 + 1)
+            out.append(f"        ({name}{disp}{vram} {quota} {json.dumps(c[4])}),")
         out.append("    ],")
     out.append("}")
     return "\n".join(out)
@@ -344,6 +348,24 @@ class ConfigDoc:
         if self.slots[name].field.kind == "list":
             return ", ".join(v)
         return str(v)
+
+    def display_value(self, name: str) -> str:
+        """What the form and `--show` print for one field.
+
+        The two derived fields have no literal to read, so they are resolved the
+        way config.py resolves them: USERNAME from $USER, GPU_DEFINITIONS from
+        the primary QoS's card list.
+        """
+        if name == "USERNAME":
+            return os.environ.get("USER", "")
+        if name == "GPU_DEFINITIONS":
+            primary = (self.value("GOLDEN_QOS") or [""])[0]
+            n = len(dict(self.groups()).get(primary, []))
+            return f"{n} cards ({primary})" if primary else "(no QoS)"
+        text = self.text_value(name)
+        if text:
+            return text
+        return "(none)" if self.slots[name].field.kind == "list" else "(unset)"
 
     def set(self, name: str, raw: str) -> str | None:
         """Validate and stage one edit. Error message, or None on success."""

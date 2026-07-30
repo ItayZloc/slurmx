@@ -54,16 +54,11 @@ def _tag(doc, name: str) -> str:
 
 def _field_row(state, name: str, editing: bool) -> Row:
     doc = state.doc
-    slot = doc.slots[name]
     if editing:
         buf = state.editing or ""
         value = buf[:state.edit_pos] + CARET + buf[state.edit_pos:]
     else:
-        value = doc.text_value(name)
-        if slot.field.kind == "list" and not value:
-            value = "(none)"
-        if not value:
-            value = "(unset)"
+        value = doc.display_value(name)
     tag = _tag(doc, name)
     value_role = Role.CFG_EDITED if tag == "edited" or editing else Role.CFG_VALUE
     return Row(
@@ -272,3 +267,113 @@ def dispatch(state: FormState, key: int) -> FormState:
     else:
         move(state, key)
     return state
+
+
+# --------------------------------------------------------------------------- #
+# curses glue (no test — everything it needs is in build_rows/dispatch)
+# --------------------------------------------------------------------------- #
+
+def _addbar(stdscr, y: int, text: str, maxx: int, attr) -> None:
+    try:
+        stdscr.addnstr(y, 0, text[:maxx - 1].ljust(maxx - 1), maxx - 1, attr)
+    except curses.error:
+        pass
+
+
+def _status_line(state: FormState) -> tuple[str, bool]:
+    """(text, is_error) for the bottom bar."""
+    if state.status:
+        return state.status, state.status.startswith("cannot save")
+    errs = state.doc.cross_field_errors()
+    if errs:
+        return errs[0], True
+    warns = state.doc.warnings()
+    if warns:
+        return warns[0], False
+    n = len(state.doc.staged_names())
+    return (f"{n} unsaved change{'s' if n != 1 else ''}" if n else "no changes"), False
+
+
+def _loop(stdscr, state: FormState) -> None:
+    from cli import theme as theme_mod
+
+    for setup in (lambda: curses.curs_set(0),
+                  curses.use_default_colors,
+                  lambda: curses.set_escdelay(25)):
+        try:
+            setup()
+        except (curses.error, AttributeError):
+            pass
+    theme = theme_mod.init_theme()
+    scroll = 0
+
+    while not state.done:
+        rows = build_rows(state)
+        maxy, maxx = stdscr.getmaxyx()
+        if maxy < 6 or maxx < 40:
+            stdscr.erase()
+            try:
+                stdscr.addnstr(0, 0, "terminal too small", maxx - 1)
+            except curses.error:
+                pass
+            stdscr.refresh()
+            if stdscr.getch() in QUIT_KEYS:
+                break
+            continue
+
+        body_h = maxy - 3
+        if state.cursor < scroll:
+            scroll = state.cursor
+        elif state.cursor >= scroll + body_h:
+            scroll = state.cursor - body_h + 1
+
+        stdscr.erase()
+        bar = theme.get(theme_mod.Role.BAR, curses.A_REVERSE)
+        _addbar(stdscr, 0, f" slurmx config · {state.path}", maxx, bar)
+        for y, row in enumerate(rows[scroll:scroll + body_h]):
+            x = 0
+            cursor_here = (scroll + y) == state.cursor
+            if cursor_here:
+                try:
+                    stdscr.addnstr(y + 1, 0, "▸", 1,
+                                   theme.get(theme_mod.Role.CFG_THEAD, 0))
+                except curses.error:
+                    pass
+            for text, role in row.spans:
+                attr = theme.get(role, 0)
+                if cursor_here and not theme:
+                    attr |= curses.A_BOLD
+                try:
+                    stdscr.addnstr(y + 1, x + 1, text, max(0, maxx - x - 2), attr)
+                except curses.error:
+                    pass
+                x += len(text)
+        status, is_err = _status_line(state)
+        _addbar(stdscr, maxy - 2, " " + status, maxx,
+                theme.get(theme_mod.Role.CFG_ERROR, 0) if is_err else 0)
+        keys = ("↑↓ move · ⏎ edit · ←→ cell · a add · d delete · r revert · "
+                "s save · q quit")
+        _addbar(stdscr, maxy - 1, " " + keys, maxx, bar)
+        try:
+            curses.curs_set(1 if state.editing is not None else 0)
+        except curses.error:
+            pass
+        stdscr.refresh()
+
+        ch = stdscr.getch()
+        if ch == curses.KEY_RESIZE:
+            continue
+        dispatch(state, ch)
+
+
+def run_form(path: str) -> None:
+    """Open the form on `path`. Blocks until the user quits.
+
+    Raises curses.error when the terminal can't host curses (TERM=dumb, no tty);
+    cli/config_cmd.run falls back to the text dump, same as slurmx status.
+    """
+    state = FormState(doc=cm.load(path), path=path)
+    try:
+        curses.wrapper(_loop, state)
+    except KeyboardInterrupt:
+        pass

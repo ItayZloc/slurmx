@@ -653,3 +653,22 @@ class TestDispatch:
         cf.dispatch(st, ord("s"))
         assert "gamma" in st.status
         assert not os.path.exists(st.path + ".bak")
+
+
+class TestDerivedDisplay:
+    def test_form_and_show_agree_on_derived_values(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("USER", "someone")
+        st = state_for(tmp_path)
+        rows = {r.field: "".join(t for t, _ in r.spans)
+                for r in cf.build_rows(st) if r.kind == "field"}
+        assert "someone" in rows["USERNAME"]
+        assert "1 cards (alpha)" in rows["GPU_DEFINITIONS"]
+        assert "(unset)" not in rows["USERNAME"]
+        assert "(unset)" not in rows["GPU_DEFINITIONS"]
+        out = config_cmd.show_text(st.doc)
+        assert "1 cards (alpha)" in out
+
+    def test_derived_card_count_follows_the_stage(self, tmp_path):
+        st = state_for(tmp_path)
+        st.doc.add_card("alpha")
+        assert st.doc.display_value("GPU_DEFINITIONS") == "2 cards (alpha)"
