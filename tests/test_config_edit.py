@@ -289,3 +289,77 @@ class TestTable:
         reloaded = cm.ConfigDoc(doc.path, doc.render())
         assert dict(reloaded.groups())["alpha"][0][4] == "new_part"
         assert dict(reloaded.groups())["beta"] == [cm.NEW_CARD]
+
+
+class TestGate:
+    def doc(self, tmp_path):
+        return cm.load(write(tmp_path, MANGLED))
+
+    def test_clean_doc_has_no_errors(self, tmp_path):
+        doc = self.doc(tmp_path)
+        assert doc.cross_field_errors() == []
+
+    def test_primary_qos_without_cards_blocks(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.set("GOLDEN_QOS", "beta, alpha")   # beta's group is empty
+        errs = doc.cross_field_errors()
+        assert any("beta" in e and "no GPU cards" in e for e in errs)
+
+    def test_missing_primary_group_blocks(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.set("GOLDEN_QOS", "gamma")
+        assert any("gamma" in e for e in doc.cross_field_errors())
+
+    def test_secondary_qos_without_cards_only_warns(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.set("GOLDEN_QOS", "alpha, gamma")
+        assert doc.cross_field_errors() == []
+        assert any("gamma" in w for w in doc.warnings())
+
+    def test_duplicate_card_names_block(self, tmp_path):
+        doc = self.doc(tmp_path)
+        doc.add_card("alpha")
+        doc.set_card("alpha", 1, 0, "a_card")
+        assert any("duplicate" in e for e in doc.cross_field_errors())
+
+    def test_save_writes_backup_and_replaces(self, tmp_path):
+        path = write(tmp_path, MANGLED)
+        doc = cm.load(path)
+        doc.set("MAX_MEM_GB", "64")
+        assert doc.save() is None
+        assert "MAX_MEM_GB = 64" in open(path).read()
+        assert open(path + ".bak").read() == MANGLED
+        assert not os.path.exists(path + ".tmp")
+
+    def test_save_clears_dirty_and_reloads_state(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED))
+        doc.set("MAX_MEM_GB", "64")
+        doc.save()
+        assert doc.dirty is False
+        assert doc.value("MAX_MEM_GB") == 64
+
+    def test_save_rejects_a_file_that_would_not_import(self, tmp_path):
+        # A table rewrite that drops the primary QoS makes the derived line raise.
+        path = write(tmp_path, MANGLED)
+        doc = cm.load(path)
+        doc.delete_card("alpha", 0)
+        doc._table.pop("alpha")
+        doc._stage_table()
+        err = doc.save()
+        assert err is not None and "alpha" in err
+        assert open(path).read() == MANGLED       # original untouched
+        assert not os.path.exists(path + ".tmp")
+        assert not os.path.exists(path + ".bak")
+
+    def test_validate_file_rejects_a_syntax_error(self, tmp_path):
+        bad = write(tmp_path, "MAIL_USER = (", name="bad.py")
+        assert "SyntaxError" in cm.validate_file(bad)
+
+    def test_validate_file_rejects_a_short_card_tuple(self, tmp_path):
+        text = MANGLED.replace('("a_card", "A Card", 96, 16, "a_part")',
+                               '("a_card", "A Card", 96)')
+        assert "5 fields" in cm.validate_file(write(tmp_path, text, name="short.py"))
+
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_templates_validate(self, path):
+        assert cm.validate_file(path) is None

@@ -15,6 +15,8 @@ import ast
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 
@@ -421,6 +423,108 @@ class ConfigDoc:
     def delete_card(self, qos: str, index: int) -> None:
         del self._mutable_table()[qos][index]
         self._stage_table()
+
+
+    # -- gate + write ----------------------------------------------------- #
+
+    def cross_field_errors(self) -> list[str]:
+        """Conditions that must be fixed before a save is allowed."""
+        errs: list[str] = []
+        qos = self.value("GOLDEN_QOS") or []
+        groups = dict(self.groups())
+        if not qos:
+            errs.append("GOLDEN_QOS needs at least one QoS")
+        else:
+            primary = qos[0]
+            if not groups.get(primary):
+                errs.append(
+                    f"GOLDEN_QOS[0] '{primary}' has no GPU cards — "
+                    "every slurmx command would fail"
+                )
+        for q, cards in groups.items():
+            names = [c[0] for c in cards]
+            dupes = sorted({n for n in names if names.count(n) > 1})
+            if dupes:
+                errs.append(f"{q}: duplicate card name(s) {', '.join(dupes)}")
+        return errs
+
+    def warnings(self) -> list[str]:
+        """Non-blocking: the file still imports."""
+        groups = dict(self.groups())
+        qos = self.value("GOLDEN_QOS") or []
+        return [f"QoS '{q}' has no GPU cards" for q in qos[1:] if not groups.get(q)]
+
+    def save(self) -> str | None:
+        """Validate, back up, replace. Error string on failure, None on success.
+
+        Order matters: the backup is only written once the candidate has passed
+        validation, so a rejected save leaves the directory exactly as it was.
+        """
+        errs = self.cross_field_errors()
+        if errs:
+            return errs[0]
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(self.render())
+        err = validate_file(tmp)
+        if err:
+            os.unlink(tmp)
+            return err
+        if os.path.exists(self.path):
+            shutil.copy2(self.path, self.path + BACKUP_SUFFIX)
+        os.replace(tmp, self.path)
+        self._reload()
+        return None
+
+    def _reload(self) -> None:
+        """Re-parse from disk after a save, dropping the stage."""
+        with open(self.path) as f:
+            text = f.read()
+        self.__init__(self.path, text)
+
+
+BACKUP_SUFFIX = ".bak"
+
+_REQUIRED = (
+    "MAIL_USER", "GOLDEN_QOS", "CPU_PARTITION", "CPU_QOS", "CPU_MEM", "CPU_CPUS",
+    "MAX_MEM_GB", "TIME_LIMIT", "START_TIMEOUT",
+    "GPU_DEFINITIONS_BY_QOS", "GPU_DEFINITIONS",
+)
+
+_VALIDATE_SNIPPET = r"""
+import runpy, sys
+required = %r
+try:
+    ns = runpy.run_path(sys.argv[1])
+except Exception as e:
+    raise SystemExit("%%s: %%s" %% (type(e).__name__, e))
+missing = [k for k in required if k not in ns]
+if missing:
+    raise SystemExit("missing keys: " + ", ".join(missing))
+if not ns["GPU_DEFINITIONS"]:
+    raise SystemExit("GPU_DEFINITIONS is empty: the primary QoS has no cards")
+for qos, cards in ns["GPU_DEFINITIONS_BY_QOS"].items():
+    for c in cards:
+        if len(c) != 5:
+            raise SystemExit("%%s: card %%r needs 5 fields" %% (qos, tuple(c)))
+""" % (_REQUIRED,)
+
+
+def validate_file(path: str) -> str | None:
+    """Exec a candidate config in a subprocess. Error string, or None if fine.
+
+    A subprocess because a syntax error or a KeyError from the derived
+    GPU_DEFINITIONS line must not touch the interpreter running the form, and
+    because the check should see a clean import.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _VALIDATE_SNIPPET, path],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode == 0:
+        return None
+    lines = [l for l in proc.stderr.strip().splitlines() if l.strip()]
+    return lines[-1] if lines else f"validation failed (exit {proc.returncode})"
 
 
 def load(path: str = CONFIG_PATH) -> ConfigDoc:
