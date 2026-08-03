@@ -3,6 +3,7 @@
 #   - Runs `uv sync` to create .venv and install dependencies.
 #   - Symlinks every bin/*.sh into ~/.local/bin/ (with .sh stripped) so the
 #     CLI (slurmx) is callable from any shell.
+#   - Registers the MCP server with Claude Code, if `claude` is on PATH.
 # Idempotent — safe to re-run.
 set -euo pipefail
 
@@ -56,6 +57,24 @@ case ":$PATH:" in
         echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
         ;;
 esac
+
+# --- Register the MCP server with Claude Code ---
+# Skipped when `claude` isn't installed (the CLI still works on its own) and
+# when slurmx is already registered, so re-running never duplicates it.
+if command -v claude >/dev/null 2>&1; then
+    # `mcp get` over `mcp list`: list health-checks every configured server,
+    # which on a machine with a few remote ones takes seconds.
+    if claude mcp get slurmx 2>/dev/null | grep -q '^slurmx:'; then
+        echo "==> MCP server already registered with Claude Code"
+    elif claude mcp add slurmx "$REPO/.venv/bin/python" "$REPO/server.py" >/dev/null 2>&1; then
+        echo "==> Registered the MCP server with Claude Code"
+    else
+        echo "==> Could not register the MCP server. Add it by hand:"
+        echo "    claude mcp add slurmx $REPO/.venv/bin/python $REPO/server.py"
+    fi
+else
+    echo "==> 'claude' not on PATH — skipping MCP registration (the CLI still works)."
+fi
 
 echo
 if [ -f "$REPO/WELCOME.md" ]; then

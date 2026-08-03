@@ -85,29 +85,51 @@ Same for a `%N`-throttled job array.
 
 ## Installation
 
+Copy this line into any shell on the cluster — a login node, a `sinteractive`
+session, wherever you are. It doesn't care about your working directory, and
+re-running it updates an existing install instead of failing.
+
+```bash
+D=$HOME/.claude/mcp-servers/slurmx; git clone https://github.com/ItayZloc/slurmx.git "$D" 2>/dev/null || git -C "$D" pull --ff-only; "$D"/setup.sh
+```
+
+Then `slurmx config` to fill in who you are. That's the whole install.
+
+It works from anywhere because `$HOME` is the same NFS mount on every node, so
+one install covers the cluster. `setup.sh` creates the venv, symlinks `slurmx`
+into `~/.local/bin/`, and registers the MCP server with Claude Code if `claude`
+is on your PATH. Every step is idempotent.
+
+You need `uv` and `git`; `setup.sh` stops with a link if `uv` is missing.
+
+<details>
+<summary>The same thing, step by step</summary>
+
 ```bash
 # 1. Clone
 git clone https://github.com/ItayZloc/slurmx.git ~/.claude/mcp-servers/slurmx
 
-# 2. Bootstrap: create venv, install deps, symlink `slurmx` into ~/.local/bin/
+# 2. Bootstrap: venv, deps, `slurmx` on PATH, MCP registration
 cd ~/.claude/mcp-servers/slurmx
 ./setup.sh
 
 # 3. Configure: pick a template, then edit it in the form
 slurmx config
 
-# 4. Register the MCP server with Claude Code
+# 4. Only if setup.sh said it couldn't register the server
 claude mcp add slurmx \
   ~/.claude/mcp-servers/slurmx/.venv/bin/python \
   ~/.claude/mcp-servers/slurmx/server.py
 ```
+</details>
 
 Verify it works:
 ```bash
-claude mcp list
+slurmx status --once     # talks to SLURM
+claude mcp list          # slurmx should say "✔ Connected"
 ```
 
-To pull updates later: `slurmx update` (or `./update.sh`) — fast-forward `git pull`, re-runs `uv sync` if dependencies changed.
+To pull updates later: `slurmx update` (or `./update.sh`) — fast-forward `git pull`, re-runs `uv sync` if dependencies changed. The install line above does the same thing.
 
 ## Configuration
 
