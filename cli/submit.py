@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Backing module for `slurmx submit` (also runnable as `python -m cli.submit`).
 
-Auto-selects GPU based on VRAM requirement. Golden-only by default (queues on the
-card's preemption-immune golden partition); pass --allow-main to permit the
-golden-first-then-main fallback.
+Auto-selects GPU based on VRAM requirement. Which pool a job lands on comes from
+config's GOLDEN_POLICY unless --golden-only or --allow-main says otherwise;
+under the "ask" policy the choice is asked for at the terminal.
 
 Usage (via slurmx):
     slurmx submit --vram 48 -- python train.py --lr 1e-4
@@ -11,6 +11,7 @@ Usage (via slurmx):
     slurmx submit --gpu-type rtx_pro_6000 -- python eval.py
     slurmx submit --vram 48 --after 12345 -- python eval.py   # wait for job 12345
     slurmx submit --vram 48 --allow-main -- python train.py   # allow main fallback
+    slurmx submit --vram 48 --golden-only -- python train.py  # never preemptible
     slurmx submit --vram 48 --dry-run -- python train.py
 """
 
@@ -22,7 +23,7 @@ import sys
 # Allow import from the same directory as this script
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from slurm_mcp import submit_job, GPU_TYPES
+from slurm_mcp import submit_job, resolve_golden_only, GPU_TYPES
 
 BOLD = "\033[1m"
 GREEN = "\033[0;32m"
@@ -43,12 +44,16 @@ def add_arguments(parser):
                         help="Number of GPUs (default: 1)")
     parser.add_argument("-q", "--qos", default=None,
                         help="Override QoS (default: auto)")
-    parser.add_argument("--allow-main", action="store_true",
-                        help="Allow falling back to the preemptible main pool when "
-                             "the golden ticket is full. Default is golden-only "
-                             "(qos=yisroel on the card's dedicated partition, "
-                             "preemption-immune; queues on golden instead of "
-                             "dropping to main).")
+    pool = parser.add_mutually_exclusive_group()
+    pool.add_argument("--allow-main", action="store_true",
+                      help="Allow falling back to the preemptible main pool when "
+                           "the golden ticket is full.")
+    pool.add_argument("--golden-only", action="store_true",
+                      help="Force the golden ticket (qos on the card's dedicated "
+                           "partition, preemption-immune): queue on golden rather "
+                           "than drop to main. With neither flag the pool comes "
+                           "from config's GOLDEN_POLICY, which `slurmx config` "
+                           "edits; under the 'ask' policy you are prompted.")
     parser.add_argument("-j", "--job-name", default=None,
                         help="Job name (default: from command)")
     parser.add_argument("-w", "--workdir", default=None,
@@ -71,6 +76,35 @@ def add_arguments(parser):
     # Trailing positional: everything after `--` (or after the last option).
     parser.add_argument("cmd", nargs=argparse.REMAINDER,
                         help="Command to run; precede with `--` to be safe.")
+
+
+def _choose_pool(args, is_cpu_job):
+    """The golden_only to submit with, asking the user if the policy says to."""
+    if args.golden_only:
+        return True
+    if args.allow_main:
+        return False
+    chosen = resolve_golden_only(None)
+    if chosen is not None or is_cpu_job:
+        # CPU jobs ignore golden_only, so never hold one up for an answer.
+        return bool(chosen)
+    if not sys.stdin.isatty():
+        print(f"{RED}Error: GOLDEN_POLICY is 'ask' and there is no terminal to "
+              f"ask on.{NC} Pass --golden-only or --allow-main.", file=sys.stderr)
+        sys.exit(1)
+    # The prompt goes to stderr so it can't land in --json output.
+    while True:
+        print("Golden-only (preemption-immune, queues when the ticket is full) "
+              "or the preemptible main pool? [g/m]: ", end="", file=sys.stderr,
+              flush=True)
+        answer = (sys.stdin.readline() or "").strip().lower()
+        if answer in ("g", "golden", "golden-only"):
+            return True
+        if answer in ("m", "main", "allow-main"):
+            return False
+        if not answer:
+            print(f"{RED}Nothing chosen — aborted.{NC}", file=sys.stderr)
+            sys.exit(1)
 
 
 def run(args):
@@ -101,6 +135,7 @@ def run(args):
 
     vram_gb = args.vram if args.vram is not None else 0
     cmd = " ".join(cmd_args)
+    golden_only = _choose_pool(args, is_cpu_job=vram_gb == 0 and not args.gpu_type)
 
     result = submit_job(
         cmd=cmd,
@@ -111,7 +146,7 @@ def run(args):
         output_dir=args.output_dir,
         gpu_type=args.gpu_type,
         qos=args.qos,
-        golden_only=not args.allow_main,
+        golden_only=golden_only,
         dependency=dependency,
         wait_until_running=not args.no_wait,
         dry_run=args.dry_run,

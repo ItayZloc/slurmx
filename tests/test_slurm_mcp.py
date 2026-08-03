@@ -2167,6 +2167,97 @@ class TestCLIJsonOutput:
         assert data["partition"] == "main"
         assert data["qos"] == "normal"
 
+    def _submit(self, *args, env=None, stdin=None):
+        import subprocess
+        full = dict(os.environ)
+        full.update(env or {})
+        return subprocess.run(
+            [sys.executable,
+             os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
+             "--gpu-type", "rtx_4090", "--vram", "24", "--dry-run", "--json",
+             *args, "--", "python", "train.py"],
+            capture_output=True, text=True, timeout=10,
+            input=stdin, env=full,
+        )
+
+    def test_json_golden_only_flag_is_explicit(self):
+        """--golden-only says out loud what the default policy already does."""
+        import json
+        result = self._submit("--golden-only")
+        assert result.returncode == 0
+        data = json.loads(result.stdout)
+        assert (data["partition"], data["qos"]) == ("rtx4090", "yisroel")
+
+    def test_the_two_pool_flags_are_mutually_exclusive(self):
+        result = self._submit("--golden-only", "--allow-main")
+        assert result.returncode != 0
+        assert "not allowed with" in result.stderr
+
+    @pytest.mark.parametrize("policy,expected", [
+        ("golden_only", ("rtx4090", "yisroel")),
+        ("allow_main", ("main", "normal")),
+    ])
+    def test_the_cli_follows_the_policy(self, policy, expected):
+        import json
+        result = self._submit(env={"SLURM_GOLDEN_POLICY": policy})
+        assert result.returncode == 0, result.stderr
+        data = json.loads(result.stdout)
+        assert (data["partition"], data["qos"]) == expected
+
+    def test_an_explicit_flag_beats_the_policy(self):
+        import json
+        result = self._submit("--golden-only",
+                              env={"SLURM_GOLDEN_POLICY": "allow_main"})
+        data = json.loads(result.stdout)
+        assert (data["partition"], data["qos"]) == ("rtx4090", "yisroel")
+
+    def test_ask_without_a_tty_errors_instead_of_hanging(self):
+        """stdin is a pipe here, so a prompt would block forever."""
+        result = self._submit(env={"SLURM_GOLDEN_POLICY": "ask"}, stdin="")
+        assert result.returncode == 1
+        assert "--golden-only" in result.stderr and "--allow-main" in result.stderr
+        assert result.stdout.strip() == ""
+
+    @pytest.mark.parametrize("answer,expected", [
+        ("g\n", ("rtx4090", "yisroel")),
+        ("m\n", ("main", "normal")),
+        ("x\ng\n", ("rtx4090", "yisroel")),      # reprompts, doesn't guess
+    ])
+    def test_ask_prompts_when_a_human_is_there(self, answer, expected):
+        import json, pty, subprocess
+        master, slave = pty.openpty()             # a real tty on stdin
+        try:
+            proc = subprocess.Popen(
+                [sys.executable,
+                 os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
+                 "--gpu-type", "rtx_4090", "--vram", "24", "--dry-run", "--json",
+                 "--", "python", "train.py"],
+                stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=dict(os.environ, SLURM_GOLDEN_POLICY="ask"),
+            )
+            os.write(master, answer.encode())
+            out, err = proc.communicate(timeout=10)
+        finally:
+            os.close(master)
+            os.close(slave)
+        assert proc.returncode == 0, err
+        assert "[g/m]" in err, "the prompt belongs on stderr, not in --json stdout"
+        data = json.loads(out)
+        assert (data["partition"], data["qos"]) == expected
+
+    def test_ask_does_not_prompt_for_a_cpu_job(self):
+        """golden_only means nothing for a CPU job, so the question is noise."""
+        import json, subprocess
+        env = dict(os.environ, SLURM_GOLDEN_POLICY="ask")
+        result = subprocess.run(
+            [sys.executable,
+             os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
+             "--vram", "0", "--dry-run", "--json", "--", "echo", "hi"],
+            capture_output=True, text=True, timeout=10, input="", env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["partition"] == "cpu"
+
     def test_after_shorthand_builds_afterok(self):
         """--after 111 222 -> #SBATCH --dependency=afterok:111:222 in the script."""
         import subprocess, json
