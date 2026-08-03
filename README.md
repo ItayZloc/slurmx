@@ -2,7 +2,41 @@
 
 MCP server and unified CLI that lets you (and Claude Code) submit, monitor, and manage SLURM GPU jobs. Auto-selects the smallest GPU that fits your VRAM needs, tries golden tickets first, falls back to cluster-wide.
 
-After install (`./setup.sh` or `slurmx setup`), see [WELCOME.md](WELCOME.md) for a one-page summary of what's available and how to drive it from a Claude Code chat. The setup script prints the same content at the end of `uv sync`.
+## Install
+
+Paste this into any shell on the cluster — login node, `sinteractive` session,
+wherever you are, whatever directory you're in:
+
+```bash
+D=$HOME/.claude/mcp-servers/slurmx; git -C "$D" pull --ff-only 2>/dev/null || git clone https://github.com/ItayZloc/slurmx.git "$D"; "$D"/setup.sh
+```
+
+Then:
+
+```bash
+source ~/.bashrc     # only the first time, so `slurmx` is on PATH
+slurmx config        # pick a template, fill in who you are
+```
+
+That's the whole install. All you need beforehand is `git` and either `curl` or
+`wget` — `setup.sh` installs `uv` itself if you don't have it, creates the venv,
+puts `slurmx` on your PATH, and registers the MCP server with Claude Code. It
+tells you at the end if anything is left for you to do.
+
+It works from anywhere because `$HOME` is the same NFS mount on every node, so
+one install covers the whole cluster. Re-running the same line updates an
+existing install instead of failing, so it doubles as `slurmx update`.
+
+Verify:
+
+```bash
+slurmx status --once     # talks to SLURM
+claude mcp list          # slurmx should say "✔ Connected"
+```
+
+See [WELCOME.md](WELCOME.md) for a one-page summary of what's available and how
+to drive it from a Claude Code chat — `setup.sh` prints the same thing when it
+finishes.
 
 ## MCP tools
 
@@ -83,33 +117,16 @@ Quota waits (`QOSMaxGRESPerUser`, `MaxGRESPerAccount`, …) still count as pendi
 they clear when someone's running job ends, which is exactly waiting for a slot.
 Same for a `%N`-throttled job array.
 
-## Installation
+## Installing by hand
 
-Copy this line into any shell on the cluster — a login node, a `sinteractive`
-session, wherever you are. It doesn't care about your working directory, and
-re-running it updates an existing install instead of failing.
-
-```bash
-D=$HOME/.claude/mcp-servers/slurmx; git clone https://github.com/ItayZloc/slurmx.git "$D" 2>/dev/null || git -C "$D" pull --ff-only; "$D"/setup.sh
-```
-
-Then `slurmx config` to fill in who you are. That's the whole install.
-
-It works from anywhere because `$HOME` is the same NFS mount on every node, so
-one install covers the cluster. `setup.sh` creates the venv, symlinks `slurmx`
-into `~/.local/bin/`, and registers the MCP server with Claude Code if `claude`
-is on your PATH. Every step is idempotent.
-
-You need `uv` and `git`; `setup.sh` stops with a link if `uv` is missing.
-
-<details>
-<summary>The same thing, step by step</summary>
+The [one-liner at the top](#install) is the same as this, and re-running it
+updates. Do it step by step if you'd rather see each part:
 
 ```bash
 # 1. Clone
 git clone https://github.com/ItayZloc/slurmx.git ~/.claude/mcp-servers/slurmx
 
-# 2. Bootstrap: venv, deps, `slurmx` on PATH, MCP registration
+# 2. Bootstrap: uv, venv, deps, `slurmx` on PATH, MCP registration
 cd ~/.claude/mcp-servers/slurmx
 ./setup.sh
 
@@ -121,15 +138,13 @@ claude mcp add slurmx \
   ~/.claude/mcp-servers/slurmx/.venv/bin/python \
   ~/.claude/mcp-servers/slurmx/server.py
 ```
-</details>
 
-Verify it works:
-```bash
-slurmx status --once     # talks to SLURM
-claude mcp list          # slurmx should say "✔ Connected"
-```
+`setup.sh` appends `~/.local/bin` to your PATH in `~/.bashrc` (or `~/.zshrc`)
+when it isn't there already, because otherwise it links `slurmx` somewhere your
+shell never looks and setup "succeeds" into a `command not found`. Set
+`SLURMX_NO_PATH_EDIT=1` to be told what to add instead of having it added.
 
-To pull updates later: `slurmx update` (or `./update.sh`) — fast-forward `git pull`, re-runs `uv sync` if dependencies changed. The install line above does the same thing.
+To pull updates later: `slurmx update` (or `./update.sh`) — fast-forward `git pull`, re-runs `uv sync` if dependencies changed.
 
 ## Configuration
 

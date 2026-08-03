@@ -62,11 +62,12 @@ HOW TO USE WITH AGENTS
       "Cancel my pending jobs."
 
 NEXT STEPS
+  setup.sh has already put `slurmx` on your PATH and registered the MCP
+  server with Claude Code. Anything it couldn't finish is listed under
+  "DO THIS NEXT" below this page — that list is the authoritative one.
+
   1. Run `slurmx config` to check MAIL_USER, MAIL_TYPE, your GOLDEN_QOS list
      and GOLDEN_POLICY (set it to "ask" if you want to be asked, per job,
      whether a job may land on the preemptible main pool).
-  2. Register the MCP server with Claude Code:
-       claude mcp add slurmx \
-         "$(pwd)/.venv/bin/python" "$(pwd)/server.py"
-  3. Run `claude mcp list` to confirm it shows up.
-  4. Start a session: `claude` — then ask "show me a cluster summary".
+  2. Check it talks to SLURM:  slurmx status --once
+  3. Start a session: `claude` — then ask "show me a cluster summary".
