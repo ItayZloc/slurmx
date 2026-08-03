@@ -57,3 +57,17 @@ MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")
 # config.py to find out.
 MAIL_TYPE_DEFAULT = ["END", "FAIL"]
 MAIL_TYPE = _from_config("MAIL_TYPE", list(MAIL_TYPE_DEFAULT))
+
+# What an omitted `golden_only` becomes, for both submit_job and `slurmx submit`.
+# Added 2026-08-03; before that the golden-only default was hardcoded, which is
+# what GOLDEN_POLICY_DEFAULT preserves.
+#   golden_only  preemption-immune; queue on golden rather than downgrade
+#   allow_main   golden first, then the preemptible main pool
+#   ask          refuse to guess — the caller has to choose per job
+GOLDEN_POLICIES = ("golden_only", "allow_main", "ask")
+GOLDEN_POLICY_DEFAULT = "golden_only"
+_golden_policy = _from_config("GOLDEN_POLICY", GOLDEN_POLICY_DEFAULT)
+# A hand-edited typo falls back to the safest option instead of silently putting
+# jobs on the preemptible pool. `slurmx config` warns when that happens.
+GOLDEN_POLICY = (_golden_policy if _golden_policy in GOLDEN_POLICIES
+                 else GOLDEN_POLICY_DEFAULT)

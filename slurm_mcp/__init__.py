@@ -11,7 +11,9 @@ from config import (
     CPU_MEM, CPU_CPUS,
     GOLDEN_QOS, EXCLUDE_NODES,
 )
-from config_defaults import CPU_PARTITION, CPU_QOS, MAIL_TYPE, MAIN_PARTITION
+from config_defaults import (
+    CPU_PARTITION, CPU_QOS, GOLDEN_POLICY, MAIL_TYPE, MAIN_PARTITION,
+)
 
 from .types import (
     GPUType, GPUAvailability, Availability, JobResult, JobStatus,
@@ -23,7 +25,8 @@ from .shell import _run, _run_quiet
 from .availability import check_availability, golden_queue, golden_queues
 from .selection import select_gpu
 from .submission import (
-    submit_job, _build_sbatch_script, _wait_for_running,
+    submit_job, resolve_golden_only, ASK_POLICY_MESSAGE,
+    _build_sbatch_script, _wait_for_running,
 )
 from .jobs import my_jobs, cancel_jobs, squeue_me
 from .monitoring import (

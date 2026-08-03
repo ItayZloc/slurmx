@@ -31,6 +31,7 @@ from slurm_mcp import (
     get_job_status, read_job_log, wait_for_job, _wait_for_running,
     _FINISHED_STATES, _UNRECOVERABLE_REASONS, _QUOTA_REASONS,
     _QOS_QUOTA_REASONS, _USER_QUOTA_REASONS,
+    resolve_golden_only, ASK_POLICY_MESSAGE,
 )
 from slurm_mcp.availability import (
     _SINFO_FIELDS, _GOLDEN_FIELDS, _QUEUE_FIELDS, _node_is_usable,
@@ -956,6 +957,99 @@ class TestSubmitJobGoldenOnly:
         assert result.success is True
         assert result.partition == "cpu"
         assert result.qos == "normal"
+
+
+# ============================================================
+# Unit Tests: GOLDEN_POLICY (what an omitted golden_only becomes)
+# ============================================================
+
+def _policy(name):
+    return patch("slurm_mcp.submission.GOLDEN_POLICY", name)
+
+
+class TestResolveGoldenOnly:
+    """The policy is a default, not a hard rule: an explicit argument wins."""
+
+    @pytest.mark.parametrize("policy,expected", [
+        ("golden_only", True),
+        ("allow_main", False),
+        ("ask", None),
+    ])
+    def test_omitted_resolves_from_policy(self, policy, expected):
+        with _policy(policy):
+            assert resolve_golden_only(None) is expected
+
+    @pytest.mark.parametrize("policy", ["golden_only", "allow_main", "ask"])
+    @pytest.mark.parametrize("explicit", [True, False])
+    def test_explicit_always_wins(self, policy, explicit):
+        with _policy(policy):
+            assert resolve_golden_only(explicit) is explicit
+
+
+class TestGoldenPolicyInSubmitJob:
+    def test_default_policy_is_golden(self):
+        with _policy("golden_only"):
+            result = submit_job(cmd="python train.py", vram_gb=96, dry_run=True)
+        assert result.success is True
+        assert result.partition == "rtx_pro_6000"
+        assert result.qos == "yisroel"
+
+    def test_allow_main_takes_the_fallback_path(self):
+        # rtx_4090 is a card the group doesn't own (golden_quota 0), so the two
+        # paths separate cleanly with no availability mocking: golden-only forces
+        # the dedicated partition, the fallback drops to the preemptible pool.
+        with _policy("allow_main"):
+            fallback = submit_job(cmd="python train.py", vram_gb=24,
+                                  gpu_type="rtx_4090", dry_run=True)
+        with _policy("golden_only"):
+            golden = submit_job(cmd="python train.py", vram_gb=24,
+                                gpu_type="rtx_4090", dry_run=True)
+        assert fallback.success is True
+        assert (fallback.qos, fallback.partition) == ("normal", "main")
+        assert (golden.qos, golden.partition) == ("yisroel", "rtx4090")
+
+    def test_ask_refuses_a_gpu_job(self):
+        with _policy("ask"):
+            result = submit_job(cmd="python train.py", vram_gb=96, dry_run=True)
+        assert result.success is False
+        assert result.message == ASK_POLICY_MESSAGE
+        assert result.job_id is None
+        assert result.sbatch_script == ""
+
+    @patch("slurm_mcp.submission._do_submit")
+    def test_ask_never_reaches_sbatch(self, mock_submit):
+        with _policy("ask"):
+            submit_job(cmd="python train.py", vram_gb=96, dry_run=False,
+                       wait_until_running=False)
+        mock_submit.assert_not_called()
+
+    @pytest.mark.parametrize("explicit,expected_qos", [(True, "yisroel")])
+    def test_ask_accepts_an_explicit_choice(self, explicit, expected_qos):
+        with _policy("ask"):
+            result = submit_job(cmd="python train.py", vram_gb=96,
+                                golden_only=explicit, dry_run=True)
+        assert result.success is True
+        assert result.qos == expected_qos
+
+    def test_ask_lets_cpu_jobs_through(self):
+        """golden_only is ignored for CPU jobs, so asking would be noise."""
+        with _policy("ask"):
+            result = submit_job(cmd="echo hi", vram_gb=0, dry_run=True)
+        assert result.success is True
+        assert result.partition == "cpu"
+
+    def test_ask_still_gates_a_vram0_job_with_an_explicit_card(self):
+        """vram_gb=0 plus gpu_type is a GPU job, so the gate applies."""
+        with _policy("ask"):
+            result = submit_job(cmd="python x.py", vram_gb=0,
+                                gpu_type="rtx_4090", dry_run=True)
+        assert result.success is False
+        assert result.message == ASK_POLICY_MESSAGE
+
+    def test_ask_message_names_both_choices(self):
+        assert "golden_only=true" in ASK_POLICY_MESSAGE
+        assert "golden_only=false" in ASK_POLICY_MESSAGE
+        assert "slurmx config" in ASK_POLICY_MESSAGE
 
 
 # ============================================================
@@ -2345,6 +2439,54 @@ class TestConfigDefaults:
             sys.modules["config"] = real_config
             importlib.reload(sys.modules["config_defaults"])
 
+    def test_golden_policy_falls_back_for_an_older_config(self):
+        import importlib
+        import types as _types
+        import config as real_config
+
+        stale = _types.ModuleType("config")   # a config.py predating the key
+        assert not hasattr(stale, "GOLDEN_POLICY")
+        try:
+            with patch.dict(sys.modules, {"config": stale}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.GOLDEN_POLICY == "golden_only"
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
+    @pytest.mark.parametrize("junk", ["golden", "", None, True, "ALLOW_MAIN"])
+    def test_an_unreadable_golden_policy_falls_back_to_the_safe_one(self, junk):
+        """A hand-edited typo must not silently move jobs to the preemptible pool."""
+        import importlib
+        import types as _types
+        import config as real_config
+
+        stale = _types.ModuleType("config")
+        stale.GOLDEN_POLICY = junk
+        try:
+            with patch.dict(sys.modules, {"config": stale}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.GOLDEN_POLICY == "golden_only"
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
+    @pytest.mark.parametrize("value", ["golden_only", "allow_main", "ask"])
+    def test_a_valid_golden_policy_is_honoured(self, value):
+        import importlib
+        import types as _types
+        import config as real_config
+
+        stale = _types.ModuleType("config")
+        stale.GOLDEN_POLICY = value
+        try:
+            with patch.dict(sys.modules, {"config": stale}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.GOLDEN_POLICY == value
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
     def test_real_config_wins_for_a_personal_key(self):
         import config
         if hasattr(config, "MAIL_TYPE"):
@@ -2370,6 +2512,17 @@ class TestConfigDefaults:
             "baseline every existing config.py has; give them a default in "
             f"config_defaults.py instead: {offenders}"
         )
+
+    def test_templates_ship_a_valid_golden_policy(self):
+        """A post-release key still belongs in the templates, so a fresh clone
+        can see it in `slurmx config` without hunting through the docs."""
+        import config_defaults
+        import runpy
+
+        for name in ("default.py", "yisroel.py"):
+            path = os.path.join(_REPO_ROOT, "config-examples", name)
+            ns = runpy.run_path(path)
+            assert ns["GOLDEN_POLICY"] in config_defaults.GOLDEN_POLICIES
 
     def test_templates_carry_every_baseline_key(self):
         import ast

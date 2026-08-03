@@ -13,7 +13,7 @@ from config import (
     CPU_MEM, CPU_CPUS,
     EXCLUDE_NODES, MAIL_USER, MAX_MEM_GB, START_TIMEOUT, TIME_LIMIT,
 )
-from config_defaults import CPU_PARTITION, CPU_QOS, MAIL_TYPE
+from config_defaults import CPU_PARTITION, CPU_QOS, GOLDEN_POLICY, MAIL_TYPE
 from maintenance import cap_time_limit
 
 from . import availability, monitoring, selection, shell
@@ -29,6 +29,28 @@ _CPU_PARTITION = CPU_PARTITION
 _CPU_QOS = CPU_QOS
 _CPU_MEM = CPU_MEM
 _CPU_CPUS = CPU_CPUS
+
+
+ASK_POLICY_MESSAGE = (
+    "GOLDEN_POLICY is 'ask': this config requires an explicit choice. Ask the "
+    "user whether to run golden-only (preemption-immune, queues when the golden "
+    "ticket is full) or to allow the preemptible main pool, then call again with "
+    "golden_only=true or golden_only=false. `slurmx config` changes the policy."
+)
+
+
+def resolve_golden_only(golden_only: Optional[bool]) -> Optional[bool]:
+    """The effective golden_only for a job.
+
+    The policy is a default, not a rule: an explicit argument always wins, so a
+    one-off "burst this onto main" doesn't mean editing config.py. None comes
+    back only under the 'ask' policy, meaning the caller has to choose.
+    """
+    if golden_only is not None:
+        return golden_only
+    if GOLDEN_POLICY == "ask":
+        return None
+    return GOLDEN_POLICY == "golden_only"
 
 
 def _build_sbatch_script(
@@ -230,7 +252,7 @@ def submit_job(
     output_dir: str = "logs",
     gpu_type: Optional[str] = None,
     qos: Optional[str] = None,
-    golden_only: bool = True,
+    golden_only: Optional[bool] = None,
     dependency: Optional[str] = None,
     wait_until_running: bool = True,
     dry_run: bool = False,
@@ -255,7 +277,10 @@ def submit_job(
             to the preemptible main pool. The job is left queued if the golden
             partition is saturated (starts automatically as slots free) instead of
             being downgraded. Overrides `qos`. Ignored for CPU jobs (vram_gb=0).
-            (default: True. Pass False for the golden-first-then-main fallback.)
+            False takes the golden-first-then-main fallback. Leave it None (the
+            default) to resolve from config's GOLDEN_POLICY; under the 'ask'
+            policy a None here refuses the submission with ASK_POLICY_MESSAGE
+            rather than guessing.
         dependency: Job dependency expression (e.g., "afterok:12345")
         wait_until_running: If True, poll until the job reaches RUNNING state.
             On quota limits (e.g., golden tickets full), auto-cancels and
@@ -278,7 +303,18 @@ def submit_job(
     # CPU-only job (vram_gb=0 and no explicit GPU requested). An explicit
     # gpu_type means the caller wants that card even if vram_gb was left at 0,
     # so fall through to the GPU path in that case.
-    if vram_gb == 0 and not gpu_type:
+    is_cpu_job = vram_gb == 0 and not gpu_type
+
+    effective = resolve_golden_only(golden_only)
+    if effective is None and not is_cpu_job:
+        # Policy 'ask'. Refuse before anything is built, dry runs included: the
+        # whole point is that the caller asks the user first, and the dry run is
+        # the first call it makes. CPU jobs are exempt — golden_only means
+        # nothing for them, so asking would be noise.
+        return JobResult(False, None, "", "", "", ASK_POLICY_MESSAGE, "")
+    golden_only = bool(effective)
+
+    if is_cpu_job:
         selected_gpu = ""
         selected_partition = _CPU_PARTITION
         selected_qos = _CPU_QOS
