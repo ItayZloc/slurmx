@@ -151,9 +151,10 @@ how many golden tickets your group owns.
 | `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_tickets, golden_partition)` tuples for that QoS. |
 
 Edit through the form where you can: it validates. `sbatch` keeps a `--mail-type`
-list as long as **one** token is recognised and drops the rest without a word, so
-a hand-typed `["END", "FIAL"]` silently costs you the failure mail. `slurmx config`
-warns when it sees one.
+list as long as **one** token is recognised and drops the rest without a word — so
+if you hand-edit the file and misspell `FAIL`, the job still submits and you simply
+stop getting failure mail. `slurmx config` warns about any event sbatch won't
+recognise.
 
 A save writes `config.py.bak` first, so the previous version is always one `mv`
 away. The form refuses to write a config whose primary QoS has no GPU cards:
