@@ -123,10 +123,15 @@ how many golden tickets your group owns.
 | Field | What to fill in |
 |-------|----------------|
 | `MAIL_USER` | Your cluster email for SLURM notifications. Defaults to `$USER@post.bgu.ac.il`. |
-| `MAIL_TYPE` | Which events mail you, passed to `sbatch --mail-type`. A checklist in the form (`⏎` opens it, space ticks an event). Defaults to `["END", "FAIL"]`; unticking everything, or ticking `NONE`, turns mail off entirely. |
+| `MAIL_TYPE` | Which events mail you, passed to `sbatch --mail-type`. A checklist in the form (`⏎` opens it, space ticks an event). Defaults to `["END", "FAIL"]`; unticking everything, or ticking `NONE`, turns mail off entirely. `SLURM_MAIL_TYPE="BEGIN,END"` overrides it for one shell. |
 | `GOLDEN_QOS` | List of your QoS, e.g. `["yisroel"]` or `["yisroel", "shared"]`. First entry is primary for job submission. |
 | `GOLDEN_POLICY` | What an unspecified `golden_only` becomes: `golden_only`, `allow_main`, or `ask`. A radio list in the form (`⏎` opens it). Defaults to `golden_only`. See [Golden tickets](#golden-tickets-preemption-vs-the-main-pool). |
 | `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_tickets, golden_partition)` tuples for that QoS. |
+
+Edit through the form where you can: it validates. `sbatch` keeps a `--mail-type`
+list as long as **one** token is recognised and drops the rest without a word, so
+a hand-typed `["END", "FIAL"]` silently costs you the failure mail. `slurmx config`
+warns when it sees one.
 
 A save writes `config.py.bak` first, so the previous version is always one `mv`
 away. The form refuses to write a config whose primary QoS has no GPU cards:

@@ -2567,6 +2567,28 @@ class TestConfigDefaults:
             sys.modules["config"] = real_config
             importlib.reload(sys.modules["config_defaults"])
 
+    def test_mail_type_honours_a_shell_override(self):
+        """Every other personal key can be steered for one shell; MAIL_TYPE was
+        the only one that couldn't, so a one-off quiet run meant editing the file."""
+        import importlib
+        import types as _types
+        import config as real_config
+
+        stale = _types.ModuleType("config")
+        stale.MAIL_TYPE = ["END", "FAIL"]
+        try:
+            with patch.dict(sys.modules, {"config": stale}), \
+                 patch.dict(os.environ, {"SLURM_MAIL_TYPE": "begin, END"}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.MAIL_TYPE == ["BEGIN", "END"]
+            with patch.dict(sys.modules, {"config": stale}), \
+                 patch.dict(os.environ, {"SLURM_MAIL_TYPE": "NONE"}):
+                mod = importlib.reload(sys.modules["config_defaults"])
+                assert mod.MAIL_TYPE == ["NONE"]
+        finally:
+            sys.modules["config"] = real_config
+            importlib.reload(sys.modules["config_defaults"])
+
     def test_golden_policy_falls_back_for_an_older_config(self):
         import importlib
         import types as _types

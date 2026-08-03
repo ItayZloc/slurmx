@@ -1006,6 +1006,38 @@ class TestMailChecklist:
     def test_every_event_has_a_help_line(self):
         assert set(cm.MAIL_EVENT_HELP) == set(cm.MAIL_EVENTS)
 
+    def test_a_misspelt_event_in_the_file_warns(self, tmp_path):
+        """sbatch keeps a mail-type list as long as ONE token is recognised and
+        drops the rest without a word, so `["END", "FIAL"]` silently stops the
+        failure mail. Verified against sbatch --test-only on 2026-08-03."""
+        text = MANGLED.replace('["END", "FAIL"]', '["END", "FIAL"]')
+        doc = cm.load(write(tmp_path, text))
+        warns = doc.warnings()
+        assert any("MAIL_TYPE" in w and "FIAL" in w for w in warns), warns
+        assert "silently" in " ".join(warns)
+        assert doc.cross_field_errors() == []      # the file still imports
+
+    def test_a_valid_list_is_silent(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert not [w for w in doc.warnings() if "MAIL_TYPE" in w]
+
+    def test_lowercase_is_not_a_typo(self, tmp_path):
+        """sbatch takes `end,fail` — only unknown words are dropped."""
+        text = MANGLED.replace('["END", "FAIL"]', '["end", "fail"]')
+        doc = cm.load(write(tmp_path, text))
+        assert not [w for w in doc.warnings() if "MAIL_TYPE" in w]
+
+    def test_fixing_it_in_the_form_clears_the_warning(self, tmp_path):
+        text = MANGLED.replace('["END", "FAIL"]', '["END", "FIAL"]')
+        doc = cm.load(write(tmp_path, text))
+        doc.toggle_mail_event("FIAL")              # untick the bogus one
+        assert not [w for w in doc.warnings() if "MAIL_TYPE" in w]
+
+    def test_an_absent_key_never_warns(self, tmp_path):
+        text = MANGLED.replace('MAIL_TYPE = ["END", "FAIL"]\n', "")
+        doc = cm.load(write(tmp_path, text))
+        assert not [w for w in doc.warnings() if "MAIL_TYPE" in w]
+
     def test_movement_walks_into_and_out_of_an_open_checklist(self, tmp_path):
         st = self.cursor_kind(state_for(tmp_path), "foldgroup")
         cf.dispatch(st, ord("\n"))

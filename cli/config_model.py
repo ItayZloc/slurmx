@@ -677,7 +677,17 @@ class ConfigDoc:
         groups = dict(self.groups())
         qos = self.value("GOLDEN_QOS") or []
         warns = [f"QoS '{q}' has no GPU cards" for q in qos[1:] if not groups.get(q)]
-        policy = self.slots["GOLDEN_POLICY"].value
+        # sbatch keeps a --mail-type list as long as ONE token is recognised and
+        # drops the others without a word, so a typo costs you that mail and
+        # says nothing. Only the form validates; a hand-edited file wouldn't.
+        bogus = [e for e in self.mail_events() if e not in MAIL_EVENTS]
+        if bogus:
+            warns.append(
+                f"MAIL_TYPE has {', '.join(repr(e) for e in bogus)}, which sbatch "
+                "does not know — it drops them silently, so you never get that "
+                "mail. Open the MAIL_TYPE checklist to fix it."
+            )
+        policy = self.value("GOLDEN_POLICY")
         if policy is not None and policy not in GOLDEN_POLICIES:
             # config_defaults normalises this away rather than crashing, so
             # without the warning the file says one thing and jobs do another.

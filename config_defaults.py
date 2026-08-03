@@ -56,7 +56,11 @@ MAIN_PARTITION = os.environ.get("SLURM_MAIN_PARTITION", "main")
 # config actually gets at submit time — without reading the editing user's own
 # config.py to find out.
 MAIL_TYPE_DEFAULT = ["END", "FAIL"]
-MAIL_TYPE = _from_config("MAIL_TYPE", list(MAIL_TYPE_DEFAULT))
+_mail_type_env = os.environ.get("SLURM_MAIL_TYPE")
+MAIL_TYPE = (
+    [t.strip().upper() for t in _mail_type_env.split(",") if t.strip()]
+    if _mail_type_env else _from_config("MAIL_TYPE", list(MAIL_TYPE_DEFAULT))
+)
 
 # What an omitted `golden_only` becomes, for both submit_job and `slurmx submit`.
 # Added 2026-08-03; before that the golden-only default was hardcoded, which is
