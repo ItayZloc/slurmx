@@ -24,9 +24,11 @@ CARET = "▏"
 
 @dataclass
 class Row:
-    kind: str                     # blank | field | group | thead | card | add
+    # blank | field | foldgroup | foldopt | group | thead | card | add
+    kind: str
     spans: list = dataclass_field(default_factory=list)
     field: str | None = None
+    parent: str | None = None     # a foldopt's field
     qos: str | None = None
     index: int | None = None
     selectable: bool = False
@@ -44,7 +46,7 @@ class FormState:
     status: str = ""
     confirm: str | None = None    # "delete" | "quit" | None
     done: bool = False
-    mail_open: bool = False       # MAIL_TYPE checklist expanded
+    open_folds: set = dataclass_field(default_factory=set)  # expanded pickers
 
 
 def _tag(doc, name: str) -> str:
@@ -72,35 +74,39 @@ def _field_row(state, name: str, editing: bool) -> Row:
     )
 
 
-def _mail_rows(state) -> list[Row]:
-    """MAIL_TYPE as a fold-out checklist rather than a typed list.
+def _fold_rows(state, f) -> list[Row]:
+    """A field with a closed vocabulary, as a fold-out picker.
 
-    The events are a closed vocabulary, so picking from them beats retyping
-    "END, FAIL" and misspelling it.
+    Picking from the list beats retyping "END, FAIL" and misspelling it. A list
+    field gets checkboxes (several at once), a choice gets radios (exactly one),
+    so the shape of the row says what the key accepts.
     """
     doc = state.doc
-    checked = doc.mail_events()
-    summary = ", ".join(checked) if checked else "(no mail)"
-    glyph = "▾" if state.mail_open else "▸"
-    tag = _tag(doc, "MAIL_TYPE")
+    single = f.kind == "choice"
+    picked = doc.selected_options(f.name)
+    summary = ", ".join(picked) or ("(none)" if single else "(no mail)")
+    glyph = "▾" if f.name in state.open_folds else "▸"
+    tag = _tag(doc, f.name)
     # The prefix is two cells, exactly like a field row's "  ", so the name
     # column stays aligned with everything above and below it.
-    rows = [Row("mailgroup",
-                spans=[(f"{glyph} " + "MAIL_TYPE".ljust(NAME_W), Role.CFG_NAME),
+    rows = [Row("foldgroup",
+                spans=[(f"{glyph} " + f.name.ljust(NAME_W), Role.CFG_NAME),
                        (summary.ljust(VALUE_W),
                         Role.CFG_EDITED if tag == "edited" else Role.CFG_VALUE),
                        (tag, Role.CFG_TAG)],
-                field="MAIL_TYPE", selectable=True)]
-    if not state.mail_open:
+                field=f.name, selectable=True)]
+    if f.name not in state.open_folds:
         return rows
-    for event in cm.MAIL_EVENTS:
-        box = "[x]" if event in checked else "[ ]"
-        rows.append(Row("mailopt",
+    help_for = cm.OPTION_HELP.get(f.name, {})
+    for option in f.options:
+        on = option in picked
+        box = ("(•)" if on else "( )") if single else ("[x]" if on else "[ ]")
+        rows.append(Row("foldopt",
                         spans=[(f"      {box} ", Role.CFG_VALUE),
-                               (event.ljust(16),
-                                Role.CFG_EDITED if event in checked else Role.CFG_VALUE),
-                               (cm.MAIL_EVENT_HELP.get(event, ""), Role.CFG_TAG)],
-                        field=event, selectable=True))
+                               (option.ljust(16),
+                                Role.CFG_EDITED if on else Role.CFG_VALUE),
+                               (help_for.get(option, ""), Role.CFG_TAG)],
+                        field=option, parent=f.name, selectable=True))
     return rows
 
 
@@ -125,8 +131,8 @@ def build_rows(state: FormState) -> list[Row]:
     for f in cm.FIELDS:
         if f.kind == "table":
             continue
-        if f.name == "MAIL_TYPE":
-            rows.extend(_mail_rows(state))
+        if f.options:
+            rows.extend(_fold_rows(state, f))
             continue
         editing = state.editing is not None and state.cursor == len(rows)
         rows.append(_field_row(state, f.name, editing))
@@ -293,11 +299,20 @@ def dispatch(state: FormState, key: int) -> FormState:
     elif (key in _ENTER or key == _SPACE) and row is not None:
         if row.kind == "group":
             state.folds.symmetric_difference_update({row.qos})
-        elif row.kind == "mailgroup":
-            state.mail_open = not state.mail_open
-        elif row.kind == "mailopt":
-            err = state.doc.toggle_mail_event(row.field)
+        elif row.kind == "foldgroup":
+            state.open_folds.symmetric_difference_update({row.field})
+        elif row.kind == "foldopt":
+            err = state.doc.toggle_option(row.parent, row.field)
             state.status = err or ""
+            if not err and cm.FIELD_BY_NAME[row.parent].kind == "choice":
+                # One pick is the whole edit, so close the fold behind it and
+                # put the cursor back on the group — the option rows are gone,
+                # so leaving it where it was would land on whatever follows.
+                state.open_folds.discard(row.parent)
+                state.cursor = next(
+                    (i for i, r in enumerate(build_rows(state))
+                     if r.kind == "foldgroup" and r.field == row.parent),
+                    state.cursor)
         elif row.kind == "add":
             state.doc.add_card(row.qos)
         elif row.kind in ("field", "card") and key in _ENTER:
@@ -314,7 +329,7 @@ def dispatch(state: FormState, key: int) -> FormState:
         else:
             state.confirm = "delete"
             state.status = f"delete {row.qos} card {row.index + 1}? d again to confirm"
-    elif key == ord("r") and row is not None and row.kind in ("field", "mailgroup"):
+    elif key == ord("r") and row is not None and row.kind in ("field", "foldgroup"):
         state.doc.revert(row.field)
         state.status = f"{row.field} reverted"
     elif key == curses.KEY_RIGHT and row is not None and row.kind == "card":

@@ -32,12 +32,16 @@ from maintenance import _parse_slurm_time  # stdlib-only module; safe to import
 # config_defaults tolerates a missing config.py, so this stays importable on a
 # fresh clone.
 from config_defaults import (
-    CPU_PARTITION, CPU_QOS, MAIL_TYPE_DEFAULT, MAIN_PARTITION,
+    CPU_PARTITION, CPU_QOS, GOLDEN_POLICIES, GOLDEN_POLICY_DEFAULT,
+    MAIL_TYPE_DEFAULT, MAIN_PARTITION,
 )
 
 # What a key that is absent from config.py resolves to at submit time. Shown
 # instead of a blank, so a config.py predating the key doesn't read as "off".
-ABSENT_DEFAULTS = {"MAIL_TYPE": list(MAIL_TYPE_DEFAULT)}
+ABSENT_DEFAULTS = {
+    "MAIL_TYPE": list(MAIL_TYPE_DEFAULT),
+    "GOLDEN_POLICY": GOLDEN_POLICY_DEFAULT,
+}
 
 DEFAULT_MAIL_DOMAIN = "post.bgu.ac.il"
 
@@ -172,6 +176,16 @@ MAIL_EVENT_HELP = {
 # clears them: "no mail" and "every event" don't combine with a specific event.
 MAIL_EXCLUSIVE = ("NONE", "ALL")
 
+# What each golden policy does, in the words the form shows next to the radio.
+GOLDEN_POLICY_HELP = {
+    "golden_only": "always preemption-immune; queue rather than downgrade",
+    "allow_main": "golden first, then the preemptible main pool",
+    "ask": "no default — Claude has to ask you, the CLI prompts",
+}
+
+# Per-field option help, so the form doesn't special-case field names.
+OPTION_HELP = {"MAIL_TYPE": MAIL_EVENT_HELP, "GOLDEN_POLICY": GOLDEN_POLICY_HELP}
+
 
 def _v_word_or_empty(raw: str) -> str | None:
     """A single token, or blank. Blank stores None — the templates use None for
@@ -186,6 +200,12 @@ def _v_mail_types(raw: str) -> str | None:
     return None
 
 
+def _v_policy(raw: str) -> str | None:
+    if raw.strip() in GOLDEN_POLICIES:
+        return None
+    return f"must be one of {', '.join(GOLDEN_POLICIES)}"
+
+
 # --------------------------------------------------------------------------- #
 # Schema
 # --------------------------------------------------------------------------- #
@@ -193,17 +213,20 @@ def _v_mail_types(raw: str) -> str | None:
 @dataclass(frozen=True)
 class Field:
     name: str
-    kind: str        # "str" | "int" | "list" | "table" | "derived"
+    kind: str        # "str" | "int" | "list" | "choice" | "table" | "derived"
     help: str
-    validator: object = None   # Callable[[str], str | None]
+    validator: object = None            # Callable[[str], str | None]
+    options: tuple[str, ...] = ()       # closed vocabulary -> fold-out picker
 
 
 FIELDS: tuple[Field, ...] = (
     Field("USERNAME", "derived", "auto-detected from $USER"),
     Field("MAIL_USER", "str", "address for SLURM mail notifications", _v_email),
     Field("MAIL_TYPE", "list", "SLURM mail events; empty or NONE = no mail",
-          _v_mail_types),
+          _v_mail_types, options=MAIL_EVENTS),
     Field("GOLDEN_QOS", "list", "golden QoS list; the first is primary", _v_word_list),
+    Field("GOLDEN_POLICY", "choice", "what an unspecified golden_only becomes",
+          _v_policy, options=GOLDEN_POLICIES),
     Field("EXCLUDE_NODES", "list", "nodes to keep jobs off", _v_word_list_or_empty),
     Field("MAX_MEM_GB", "int", "memory ceiling for a GPU job", _v_posint),
     Field("CPU_CPUS", "int", "cores for a CPU-only job", _v_posint),
@@ -524,6 +547,23 @@ class ConfigDoc:
             self._staged[name] = literal
         return None
 
+    def selected_options(self, name: str) -> list[str]:
+        """Which of a field's options are currently picked.
+
+        A list field can have several, a choice exactly one — the form draws
+        checkboxes or radios off that difference rather than off the field name.
+        """
+        if self.slots[name].field.kind == "choice":
+            v = self.value(name)
+            return [v] if v else []
+        return self.mail_events()
+
+    def toggle_option(self, name: str, option: str) -> str | None:
+        """Pick or unpick one option. Error message, or None on success."""
+        if self.slots[name].field.kind == "choice":
+            return self.set(name, option)
+        return self.toggle_mail_event(option)
+
     def mail_events(self) -> list[str]:
         """The currently checked events, upper-cased."""
         return [str(e).upper() for e in (self.value("MAIL_TYPE") or [])]
@@ -637,6 +677,15 @@ class ConfigDoc:
         groups = dict(self.groups())
         qos = self.value("GOLDEN_QOS") or []
         warns = [f"QoS '{q}' has no GPU cards" for q in qos[1:] if not groups.get(q)]
+        policy = self.slots["GOLDEN_POLICY"].value
+        if policy is not None and policy not in GOLDEN_POLICIES:
+            # config_defaults normalises this away rather than crashing, so
+            # without the warning the file says one thing and jobs do another.
+            warns.append(
+                f"GOLDEN_POLICY = {policy!r} is not one of "
+                f"{', '.join(GOLDEN_POLICIES)} — it is ignored and "
+                f"{GOLDEN_POLICY_DEFAULT!r} applies."
+            )
         for name, stale in sorted(self._retired.items()):
             fixed = RETIRED_KEYS[name]
             if stale != fixed:

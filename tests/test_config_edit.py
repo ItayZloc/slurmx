@@ -451,7 +451,7 @@ class TestRows:
     def test_every_scalar_field_gets_a_row(self, tmp_path):
         rows = cf.build_rows(state_for(tmp_path))
         # MAIL_TYPE is a checklist group, not a typed field.
-        fields = [r.field for r in rows if r.kind in ("field", "mailgroup")]
+        fields = [r.field for r in rows if r.kind in ("field", "foldgroup")]
         assert fields == [f.name for f in cm.FIELDS if f.kind != "table"]
 
     def test_table_renders_a_group_header_per_qos(self, tmp_path):
@@ -924,35 +924,35 @@ class TestMailChecklist:
     def test_mail_type_is_a_collapsed_group_by_default(self, tmp_path):
         st = state_for(tmp_path)
         rows = cf.build_rows(st)
-        group = next(r for r in rows if r.kind == "mailgroup")
+        group = next(r for r in rows if r.kind == "foldgroup")
         assert group.field == "MAIL_TYPE"
         assert "▸" in "".join(t for t, _ in group.spans)
         assert "END, FAIL" in "".join(t for t, _ in group.spans)
-        assert not [r for r in rows if r.kind == "mailopt"]
+        assert not [r for r in rows if r.kind == "foldopt"]
 
     def test_enter_opens_the_checklist_with_every_event(self, tmp_path):
-        st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+        st = self.cursor_kind(state_for(tmp_path), "foldgroup")
         cf.dispatch(st, ord("\n"))
         rows = cf.build_rows(st)
-        opts = [r for r in rows if r.kind == "mailopt"]
+        opts = [r for r in rows if r.kind == "foldopt"]
         assert [r.field for r in opts] == list(cm.MAIL_EVENTS)
         assert "▾" in "".join(t for t, _ in
-                              next(r for r in rows if r.kind == "mailgroup").spans)
+                              next(r for r in rows if r.kind == "foldgroup").spans)
 
     def test_checked_events_render_with_a_tick(self, tmp_path):
-        st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+        st = self.cursor_kind(state_for(tmp_path), "foldgroup")
         cf.dispatch(st, ord("\n"))
         boxes = {r.field: "".join(t for t, _ in r.spans)
-                 for r in cf.build_rows(st) if r.kind == "mailopt"}
+                 for r in cf.build_rows(st) if r.kind == "foldopt"}
         assert "[x]" in boxes["END"] and "[x]" in boxes["FAIL"]
         assert "[ ]" in boxes["BEGIN"] and "[ ]" in boxes["ALL"]
         assert "the job finishes" in boxes["END"]
 
     def test_space_and_enter_both_toggle_an_event(self, tmp_path):
         for key in (ord(" "), ord("\n")):
-            st = self.cursor_kind(state_for(tmp_path), "mailgroup")
-            st.mail_open = True
-            self.cursor_kind(st, "mailopt", "BEGIN")
+            st = self.cursor_kind(state_for(tmp_path), "foldgroup")
+            st.open_folds = {"MAIL_TYPE"}
+            self.cursor_kind(st, "foldopt", "BEGIN")
             cf.dispatch(st, key)
             assert st.doc.mail_events() == ["BEGIN", "END", "FAIL"]
             cf.dispatch(st, key)
@@ -987,17 +987,17 @@ class TestMailChecklist:
         st.doc.toggle_mail_event("FAIL")
         assert st.doc.mail_events() == []
         assert "MAIL_TYPE = []" in st.doc.render()
-        group = next(r for r in cf.build_rows(st) if r.kind == "mailgroup")
+        group = next(r for r in cf.build_rows(st) if r.kind == "foldgroup")
         assert "(no mail)" in "".join(t for t, _ in group.spans)
 
     def test_toggling_marks_the_group_edited(self, tmp_path):
         st = state_for(tmp_path)
         st.doc.toggle_mail_event("BEGIN")
-        group = next(r for r in cf.build_rows(st) if r.kind == "mailgroup")
+        group = next(r for r in cf.build_rows(st) if r.kind == "foldgroup")
         assert "edited" in "".join(t for t, _ in group.spans)
 
     def test_r_reverts_the_whole_checklist(self, tmp_path):
-        st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+        st = self.cursor_kind(state_for(tmp_path), "foldgroup")
         st.doc.toggle_mail_event("ALL")
         cf.dispatch(st, ord("r"))
         assert st.doc.dirty is False
@@ -1007,10 +1007,10 @@ class TestMailChecklist:
         assert set(cm.MAIL_EVENT_HELP) == set(cm.MAIL_EVENTS)
 
     def test_movement_walks_into_and_out_of_an_open_checklist(self, tmp_path):
-        st = self.cursor_kind(state_for(tmp_path), "mailgroup")
+        st = self.cursor_kind(state_for(tmp_path), "foldgroup")
         cf.dispatch(st, ord("\n"))
         cf.dispatch(st, curses.KEY_DOWN)
-        assert cf.build_rows(st)[st.cursor].kind == "mailopt"
+        assert cf.build_rows(st)[st.cursor].kind == "foldopt"
         for _ in range(len(cm.MAIL_EVENTS)):
             cf.dispatch(st, curses.KEY_DOWN)
         assert cf.build_rows(st)[st.cursor].kind == "field"
@@ -1021,6 +1021,142 @@ class TestMailChecklist:
         assert st.doc.save() is None
         assert 'MAIL_TYPE = ["ALL"]' in open(st.path).read()
         assert cm.load(st.path).mail_events() == ["ALL"]
+
+
+POLICY_CONFIG = MANGLED.replace('GOLDEN_QOS = ',
+                                'GOLDEN_POLICY = "allow_main"\nGOLDEN_QOS = ')
+
+
+class TestGoldenPolicyField:
+    """GOLDEN_POLICY decides what an omitted golden_only becomes, so the form
+    has to offer exactly the three values submit_job knows about."""
+
+    def row(self, st, kind, field=None):
+        st.cursor = next(i for i, r in enumerate(cf.build_rows(st))
+                         if r.kind == kind and (field is None or r.field == field))
+        return st
+
+    def test_it_is_an_editable_field(self, tmp_path):
+        doc = cm.load(write(tmp_path, POLICY_CONFIG))
+        assert doc.is_editable("GOLDEN_POLICY")
+        assert doc.value("GOLDEN_POLICY") == "allow_main"
+        assert doc.slots["GOLDEN_POLICY"].provenance == "file"
+
+    @pytest.mark.parametrize("value", ["golden_only", "allow_main", "ask"])
+    def test_every_policy_is_accepted(self, tmp_path, value):
+        doc = cm.load(write(tmp_path, POLICY_CONFIG))
+        assert doc.set("GOLDEN_POLICY", value) is None
+        assert f'GOLDEN_POLICY = "{value}"' in doc.render()
+
+    @pytest.mark.parametrize("junk", ["golden", "", "ALLOW_MAIN", "yes"])
+    def test_a_value_submit_job_cannot_read_is_rejected(self, tmp_path, junk):
+        doc = cm.load(write(tmp_path, POLICY_CONFIG))
+        err = doc.set("GOLDEN_POLICY", junk)
+        assert err and all(p in err for p in cm.GOLDEN_POLICIES)
+
+    def test_editing_touches_only_that_literal(self, tmp_path):
+        doc = cm.load(write(tmp_path, POLICY_CONFIG))
+        doc.set("GOLDEN_POLICY", "ask")
+        assert doc.render() == POLICY_CONFIG.replace('"allow_main"', '"ask"')
+
+    def test_a_saved_policy_round_trips(self, tmp_path):
+        doc = cm.load(write(tmp_path, POLICY_CONFIG))
+        doc.set("GOLDEN_POLICY", "ask")
+        assert doc.save() is None
+        assert cm.load(doc.path).value("GOLDEN_POLICY") == "ask"
+
+    # -- absent from an older config.py ---------------------------------- #
+
+    def test_absent_shows_what_submit_job_actually_does(self, tmp_path):
+        import config_defaults
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert doc.slots["GOLDEN_POLICY"].provenance == "absent"
+        assert doc.display_value("GOLDEN_POLICY") == "golden_only"
+        assert doc.value("GOLDEN_POLICY") == config_defaults.GOLDEN_POLICY_DEFAULT
+
+    def test_absent_is_tagged_default_in_both_surfaces(self, tmp_path):
+        st = state_for(tmp_path, MANGLED)
+        row = next("".join(t for t, _ in r.spans) for r in cf.build_rows(st)
+                   if r.kind == "foldgroup" and r.field == "GOLDEN_POLICY")
+        line = next(l for l in config_cmd.show_text(st.doc).splitlines()
+                    if "GOLDEN_POLICY" in l)
+        assert "default" in row and "default" in line
+        assert "(unset)" not in row and "(unset)" not in line
+
+    def test_setting_it_on_an_older_config_appends_the_key(self, tmp_path):
+        doc = cm.load(write(tmp_path, MANGLED))
+        assert doc.set("GOLDEN_POLICY", "ask") is None
+        assert 'GOLDEN_POLICY = "ask"' in doc.render()
+        assert doc.save() is None
+        assert cm.load(doc.path).value("GOLDEN_POLICY") == "ask"
+
+    def test_a_junk_policy_in_the_file_warns(self, tmp_path):
+        text = POLICY_CONFIG.replace('"allow_main"', '"golden"')
+        doc = cm.load(write(tmp_path, text))
+        warns = doc.warnings()
+        assert any("GOLDEN_POLICY" in w and "golden" in w and "ignored" in w
+                   for w in warns)
+        assert doc.cross_field_errors() == []      # never blocks a save
+
+    # -- the picker ------------------------------------------------------- #
+
+    def test_it_is_a_collapsed_group_showing_the_current_value(self, tmp_path):
+        st = state_for(tmp_path, POLICY_CONFIG)
+        rows = cf.build_rows(st)
+        group = next(r for r in rows if r.field == "GOLDEN_POLICY")
+        assert group.kind == "foldgroup"
+        assert "▸" in "".join(t for t, _ in group.spans)
+        assert "allow_main" in "".join(t for t, _ in group.spans)
+        assert not [r for r in rows if r.parent == "GOLDEN_POLICY"]
+
+    def test_opening_it_lists_every_policy_as_a_radio(self, tmp_path):
+        st = self.row(state_for(tmp_path, POLICY_CONFIG),
+                      "foldgroup", "GOLDEN_POLICY")
+        cf.dispatch(st, ord("\n"))
+        opts = [r for r in cf.build_rows(st) if r.parent == "GOLDEN_POLICY"]
+        assert [r.field for r in opts] == list(cm.GOLDEN_POLICIES)
+        boxes = {r.field: "".join(t for t, _ in r.spans) for r in opts}
+        assert "(•)" in boxes["allow_main"]
+        assert "( )" in boxes["ask"] and "( )" in boxes["golden_only"]
+        assert "[x]" not in boxes["allow_main"], "a choice is not a checklist"
+        assert "Claude has to ask you" in boxes["ask"]
+
+    def test_picking_one_replaces_the_value_and_closes_the_fold(self, tmp_path):
+        st = self.row(state_for(tmp_path, POLICY_CONFIG),
+                      "foldgroup", "GOLDEN_POLICY")
+        cf.dispatch(st, ord("\n"))
+        self.row(st, "foldopt", "ask")
+        cf.dispatch(st, ord(" "))
+        assert st.doc.value("GOLDEN_POLICY") == "ask"
+        assert "GOLDEN_POLICY" not in st.open_folds
+        # the cursor followed the fold shut instead of landing on a stale index
+        assert cf.build_rows(st)[st.cursor].field == "GOLDEN_POLICY"
+
+    def test_picking_never_leaves_two_selected(self, tmp_path):
+        st = self.row(state_for(tmp_path, POLICY_CONFIG),
+                      "foldgroup", "GOLDEN_POLICY")
+        for want in ("ask", "golden_only"):
+            cf.dispatch(st, ord("\n"))
+            self.row(st, "foldopt", want)
+            cf.dispatch(st, ord("\n"))
+            assert st.doc.selected_options("GOLDEN_POLICY") == [want]
+
+    def test_r_reverts_the_pick(self, tmp_path):
+        st = state_for(tmp_path, POLICY_CONFIG)
+        st.doc.set("GOLDEN_POLICY", "ask")
+        self.row(st, "foldgroup", "GOLDEN_POLICY")
+        cf.dispatch(st, ord("r"))
+        assert st.doc.dirty is False
+        assert st.doc.value("GOLDEN_POLICY") == "allow_main"
+
+    def test_every_policy_has_a_help_line(self):
+        assert set(cm.GOLDEN_POLICY_HELP) == set(cm.GOLDEN_POLICIES)
+
+    @pytest.mark.parametrize("path", TEMPLATES)
+    def test_templates_ship_it_editable(self, path):
+        doc = cm.load(path)
+        assert doc.is_editable("GOLDEN_POLICY")
+        assert doc.value("GOLDEN_POLICY") in cm.GOLDEN_POLICIES
 
 
 class TestCursorSnap:
@@ -1063,7 +1199,7 @@ class TestCursorSnap:
         field = next("".join(t for t, _ in r.spans)
                      for r in rows if r.field == "MAIL_USER")
         group = next("".join(t for t, _ in r.spans)
-                     for r in rows if r.kind == "mailgroup")
+                     for r in rows if r.kind == "foldgroup")
         assert field.index("MAIL_USER") == group.index("MAIL_TYPE")
 
 
@@ -1116,9 +1252,9 @@ GPU_DEFINITIONS = GPU_DEFINITIONS_BY_QOS[GOLDEN_QOS[0]]
 
     def test_the_checklist_ticks_the_resolved_default(self, tmp_path):
         st = state_for(tmp_path, self.OLD)
-        st.mail_open = True
+        st.open_folds = {"MAIL_TYPE"}
         boxes = {r.field: "".join(t for t, _ in r.spans)
-                 for r in cf.build_rows(st) if r.kind == "mailopt"}
+                 for r in cf.build_rows(st) if r.kind == "foldopt"}
         assert "[x]" in boxes["END"] and "[x]" in boxes["FAIL"]
         assert "[ ]" in boxes["BEGIN"]
 
@@ -1205,7 +1341,7 @@ class TestProvenanceWording:
         text = MANGLED.replace('MAIL_TYPE = ["END", "FAIL"]\n', "")
         st = state_for(tmp_path, text)
         row = next("".join(t for t, _ in r.spans)
-                   for r in cf.build_rows(st) if r.kind == "mailgroup")
+                   for r in cf.build_rows(st) if r.kind == "foldgroup")
         out = config_cmd.show_text(st.doc)
         mail_line = next(l for l in out.splitlines() if "MAIL_TYPE" in l)
         assert "default" in row and "default" in mail_line
