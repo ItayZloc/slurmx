@@ -16,9 +16,46 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import slurm_mcp
 from cli import render
+from config_defaults import GOLDEN_POLICY
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("slurmx", instructions="""\
+# What the agent is told about the golden ticket, per configured policy. The
+# rule has to match the gate in slurm_mcp.submission, or the agent learns the
+# tool's behaviour by being refused.
+_GOLDEN_RULE = {
+    "golden_only": (
+        "- Golden-only is the DEFAULT (golden_only=true): jobs run preemption-immune on the\n"
+        "  golden partition and queue there if it's full, never dropping to the preemptible\n"
+        "  main pool. Pass golden_only=false only when the user explicitly wants to burst onto\n"
+        "  the shared main pool. Ignored for CPU jobs."
+    ),
+    "allow_main": (
+        "- The main-pool fallback is the DEFAULT here (golden_only=false): jobs take a golden\n"
+        "  slot when one is free and drop to the preemptible main pool when it isn't, so they\n"
+        "  start sooner but can be evicted. Pass golden_only=true for training the user does\n"
+        "  not want preempted. Ignored for CPU jobs."
+    ),
+    "ask": (
+        "- There is NO default pool on this cluster: ask the user whether to run golden-only\n"
+        "  (preemption-immune, queues when the golden ticket is full) or to allow the\n"
+        "  preemptible main pool, then pass golden_only=true or golden_only=false explicitly.\n"
+        "  A submit_job call that omits golden_only is refused, dry runs included. Ignored for\n"
+        "  CPU jobs, which never need the question."
+    ),
+}
+
+
+def build_instructions(policy: str = GOLDEN_POLICY) -> str:
+    """The server instructions, with the golden-ticket rule set by the policy.
+
+    A parameter rather than an inline f-string so all three variants are
+    testable without reimporting the module.
+    """
+    return _INSTRUCTIONS.format(
+        golden_rule=_GOLDEN_RULE.get(policy, _GOLDEN_RULE["golden_only"]))
+
+
+_INSTRUCTIONS = """\
 ## SLURM Job Submission Rules
 
 When the user says "job" or "a job running", they mean a SLURM job — not a local process.
@@ -31,10 +68,7 @@ Check with MCP cluster_summary or squeue, not ps aux.
 - Default to 1 GPU. Use num_gpus=2 only when the user explicitly requests multi-GPU
   or the workload requires it (e.g. model too large for a single card).
   Max 2 GPUs per cluster policy; more comes back as success: false.
-- Golden-only is the DEFAULT (golden_only=true): jobs run preemption-immune on the
-  golden partition and queue there if it's full, never dropping to the preemptible
-  main pool. Pass golden_only=false only when the user explicitly wants to burst onto
-  the shared main pool. Ignored for CPU jobs.
+{golden_rule}
 - For multi-GPU training, use `torchrun --nproc_per_node=2 train.py` as the command.
 - Maintenance windows are enforced automatically — job time limits are capped to finish
   before scheduled maintenance. If a window is imminent (<5 min), submissions are blocked.
@@ -48,7 +82,9 @@ Check with MCP cluster_summary or squeue, not ps aux.
   call that worked.
 - submit_job blocks until the job is RUNNING, so expect it to take a while; it does
   not wait for the job to finish.
-""")
+"""
+
+mcp = FastMCP("slurmx", instructions=build_instructions())
 
 
 @mcp.tool()
@@ -347,7 +383,7 @@ def submit_job(
     workdir: str | None = None,
     output_dir: str = "logs",
     gpu_type: str | None = None,
-    golden_only: bool = True,
+    golden_only: bool | None = None,
     dependency: str | None = None,
     dry_run: bool = False,
 ) -> str:
@@ -359,27 +395,35 @@ def submit_job(
     expires, so the call can take minutes. It waits for the job to START, not
     to finish — use wait_for_job for that.
 
-    GPU choice: with the default golden_only=true you get the smallest card
-    with enough VRAM that has a golden partition configured, on the primary
-    golden QoS, with no availability check — if that partition is full the job
-    simply queues and starts when a slot frees, never downgraded to the
-    preemptible main pool. Note "golden" is a weaker test here than in
-    select_gpu and cluster_summary: those need a non-zero golden quota, this
-    only needs a configured golden partition, so golden_only can force a
-    quota-0 card that select_gpu will never recommend. golden_only=false
-    instead reads live availability and takes the smallest fitting card with a
-    free golden slot, else the smallest fitting free card on the main pool, and
-    refuses to submit when nothing is free, returning the availability table.
+    Omitting golden_only resolves it from the user's configured GOLDEN_POLICY,
+    which is stated in this server's instructions. Under the "ask" policy an
+    omitted golden_only is refused outright — "GOLDEN_POLICY is 'ask' ..." in
+    message, nothing submitted, dry runs included — so ask the user which pool
+    they want and pass it explicitly. An explicit value always wins, whatever
+    the policy.
 
-    golden_only also changes what happens to a pending job. Under the default,
-    a GPU job is never cancelled for a quota reason — only unrecoverable ones
-    (InvalidQOS, DependencyNeverSatisfied, PartitionDown, ...) cancel. Under
-    golden_only=false a per-account quota reason cancels the job and resubmits
-    it on the main pool, but only if the first attempt was on the golden QoS
-    (the job_id you get back is then the second job's); one already on the main
-    pool is cancelled with no retry, and a per-user GPU limit cancels with no
-    retry either way. CPU jobs are the exception: they always poll under the
-    golden_only=false rules, so a quota reason cancels them even at the default.
+    GPU choice: with golden_only=true you get the smallest card with enough
+    VRAM that has a golden partition configured, on the primary golden QoS,
+    with no availability check — if that partition is full the job simply
+    queues and starts when a slot frees, never downgraded to the preemptible
+    main pool. Note "golden" is a weaker test here than in select_gpu and
+    cluster_summary: those need a non-zero golden quota, this only needs a
+    configured golden partition, so golden_only can force a quota-0 card that
+    select_gpu will never recommend. golden_only=false instead reads live
+    availability and takes the smallest fitting card with a free golden slot,
+    else the smallest fitting free card on the main pool, and refuses to submit
+    when nothing is free, returning the availability table.
+
+    golden_only also changes what happens to a pending job. Under
+    golden_only=true a GPU job is never cancelled for a quota reason — only
+    unrecoverable ones (InvalidQOS, DependencyNeverSatisfied, PartitionDown,
+    ...) cancel. Under golden_only=false a per-account quota reason cancels the
+    job and resubmits it on the main pool, but only if the first attempt was on
+    the golden QoS (the job_id you get back is then the second job's); one
+    already on the main pool is cancelled with no retry, and a per-user GPU
+    limit cancels with no retry either way. CPU jobs are the exception: they
+    always poll under the golden_only=false rules, so a quota reason cancels
+    them whatever was asked for.
 
     The rest of the script comes from config.py and has no argument: the time
     limit (config.TIME_LIMIT, capped to end 15 minutes before the next window
@@ -423,15 +467,17 @@ def submit_job(
         gpu_type: Exact card name from the configured GPU catalog. Skips
             auto-selection and is validated against vram_gb. Leave None unless
             the user named a card.
-        golden_only: Default true, which is what you want for training you
-            don't want preempted; false opts into the fallback above. Fails if
-            the chosen card has no golden partition configured. Ignored for
-            CPU jobs.
+        golden_only: true is what you want for training you don't want
+            preempted; false opts into the fallback above. Fails if the chosen
+            card has no golden partition configured. Ignored for CPU jobs.
+            Omit it to take the user's GOLDEN_POLICY, but see the "ask" policy
+            above — under it, omitting is a refusal, not a default.
         dependency: sbatch dependency expression, e.g. 'afterok:12345'. Also
             used to estimate the start time when capping for maintenance.
         dry_run: true returns the script without submitting and without
             waiting. Under golden_only=false a dry run still queries live
-            availability, so it can fail when the cluster is busy.
+            availability, so it can fail when the cluster is busy, and under
+            the "ask" policy it is refused like a real submission.
     """
     result = slurm_mcp.submit_job(
         cmd=cmd,

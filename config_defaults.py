@@ -66,7 +66,11 @@ MAIL_TYPE = _from_config("MAIL_TYPE", list(MAIL_TYPE_DEFAULT))
 #   ask          refuse to guess — the caller has to choose per job
 GOLDEN_POLICIES = ("golden_only", "allow_main", "ask")
 GOLDEN_POLICY_DEFAULT = "golden_only"
-_golden_policy = _from_config("GOLDEN_POLICY", GOLDEN_POLICY_DEFAULT)
+# The env override is read here rather than in the templates, because a
+# config.py written before this key exists still needs a way to set the policy
+# for one shell (a non-interactive script under the 'ask' policy, say).
+_golden_policy = (os.environ.get("SLURM_GOLDEN_POLICY")
+                  or _from_config("GOLDEN_POLICY", GOLDEN_POLICY_DEFAULT))
 # A hand-edited typo falls back to the safest option instead of silently putting
 # jobs on the preemptible pool. `slurmx config` warns when that happens.
 GOLDEN_POLICY = (_golden_policy if _golden_policy in GOLDEN_POLICIES

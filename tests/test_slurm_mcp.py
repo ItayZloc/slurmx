@@ -1052,6 +1052,43 @@ class TestGoldenPolicyInSubmitJob:
         assert "slurmx config" in ASK_POLICY_MESSAGE
 
 
+class TestGoldenPolicyInstructions:
+    """The MCP instructions are the only thing an agent reads before its first
+    call, so the policy has to be stated there as well as enforced."""
+
+    def _bullet(self, policy):
+        import server
+        text = server.build_instructions(policy)
+        return next(l for l in text.splitlines() if "golden" in l.lower())
+
+    def test_each_policy_gets_its_own_rule(self):
+        bullets = {p: self._bullet(p)
+                   for p in ("golden_only", "allow_main", "ask")}
+        assert len(set(bullets.values())) == 3
+
+    def test_ask_tells_the_agent_to_ask(self):
+        import server
+        text = server.build_instructions("ask")
+        assert "ask the user" in text.lower()
+        assert "golden_only" in text
+
+    def test_default_policy_still_says_golden_only_is_the_default(self):
+        assert "DEFAULT" in self._bullet("golden_only")
+
+    def test_the_rest_of_the_instructions_are_untouched(self):
+        import server
+        for policy in ("golden_only", "allow_main", "ask"):
+            text = server.build_instructions(policy)
+            assert "Always use dry_run=true first" in text
+            assert "Max 2 GPUs per cluster policy" in text
+
+    def test_the_server_is_built_with_the_configured_policy(self):
+        # Not "..._live_policy": -k "not live" would silently deselect it.
+        import server
+        assert server.mcp.instructions == server.build_instructions(
+            slurm_mcp.GOLDEN_POLICY)
+
+
 # ============================================================
 # Unit Tests: my_jobs (mocked)
 # ============================================================
