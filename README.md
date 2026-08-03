@@ -9,7 +9,7 @@ After install (`./setup.sh` or `slurmx setup`), see [WELCOME.md](WELCOME.md) for
 | Tool | Description |
 |------|-------------|
 | `cluster_summary` | Single-call dashboard: your jobs + golden tickets (per QoS) + cluster-wide GPU availability. `view="jobs"` or `"gpu"` narrows the output. |
-| `submit_job` | Submit GPU/CPU jobs (auto-selects GPU by VRAM). Golden-only by default (preemption-immune); pass `golden_only=false` to allow the main-pool fallback. Supports `dependency` (e.g. `afterok:12345`). Blocks until the job is RUNNING. |
+| `submit_job` | Submit GPU/CPU jobs (auto-selects GPU by VRAM). An omitted `golden_only` resolves from your `GOLDEN_POLICY`; pass `true`/`false` to decide per job. Supports `dependency` (e.g. `afterok:12345`). Blocks until the job is RUNNING. |
 | `select_gpu` | Recommend a GPU for a VRAM requirement, with current availability. Advisory — it always reports the non-golden selection, so it can disagree with what a default `submit_job` picks. |
 | `job_history` | Recent jobs from sacct, finished ones included. Yours only, newest first. |
 | `get_job_status` | One job's status as JSON (squeue, falling back to sacct). Carries the pending reason; branch on `state`, not `exit_code`. |
@@ -33,10 +33,10 @@ Your golden QoS (e.g. `yisroel`) runs on the per-card dedicated partitions
 `normal` jobs and nothing bumps it. A golden QoS is invalid on `main`/`gpu`, so
 "golden" always means a dedicated partition.
 
-`submit_job` and `slurmx submit` are **golden-only by default**. Opt out with the
-**`--allow-main`** CLI flag (`golden_only=false` on the MCP tool):
+Which pool a job takes is set per job with **`--golden-only`** / **`--allow-main`**
+(`golden_only=true`/`false` on the MCP tool):
 
-- **default (golden-only)** — force `qos=yisroel` on the card's dedicated partition
+- **golden-only** — force `qos=yisroel` on the card's dedicated partition
   and **never** accept a preemptible slot. If the golden ticket is full the job
   waits in the golden queue and starts automatically when a slot frees (it is not
   downgraded). Works on every card, including the smaller ones the group doesn't
@@ -44,7 +44,24 @@ Your golden QoS (e.g. `yisroel`) runs on the per-card dedicated partitions
   Recommended for training you don't want evicted. Ignored for CPU jobs.
 - **`--allow-main` / `golden_only=false`** — golden-first on the cards you own
   (`golden_tickets > 0`), then fall back to the preemptible main pool if golden is
-  full (the previous default).
+  full.
+
+With neither flag, `GOLDEN_POLICY` in `config.py` decides — `slurmx config` edits
+it, and it defaults to `golden_only`:
+
+| `GOLDEN_POLICY` | what an unspecified `golden_only` becomes |
+|---|---|
+| `golden_only` | golden-only, the default |
+| `allow_main` | the main-pool fallback |
+| `ask` | no default at all: `submit_job` returns `success: false` until Claude asks you and passes `golden_only` explicitly (dry runs included), and `slurmx submit` prompts `[g/m]` at the terminal |
+
+An explicit flag or argument always wins, so a one-off "burst this onto main"
+never means editing the config. `SLURM_GOLDEN_POLICY=allow_main` overrides the
+policy for one shell — useful for a script that must not stop to prompt.
+
+Claude reads the policy from the MCP server's instructions, which are built when
+the session connects. After changing it, reconnect with `/mcp` or restart the
+session, or Claude keeps following the old rule.
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
 card's pending GPUs by user in dispatch order — like the Running block but
@@ -108,6 +125,7 @@ how many golden tickets your group owns.
 | `MAIL_USER` | Your cluster email for SLURM notifications. Defaults to `$USER@post.bgu.ac.il`. |
 | `MAIL_TYPE` | Which events mail you, passed to `sbatch --mail-type`. A checklist in the form (`⏎` opens it, space ticks an event). Defaults to `["END", "FAIL"]`; unticking everything, or ticking `NONE`, turns mail off entirely. |
 | `GOLDEN_QOS` | List of your QoS, e.g. `["yisroel"]` or `["yisroel", "shared"]`. First entry is primary for job submission. |
+| `GOLDEN_POLICY` | What an unspecified `golden_only` becomes: `golden_only`, `allow_main`, or `ask`. A radio list in the form (`⏎` opens it). Defaults to `golden_only`. See [Golden tickets](#golden-tickets-preemption-vs-the-main-pool). |
 | `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_tickets, golden_partition)` tuples for that QoS. |
 
 A save writes `config.py.bak` first, so the previous version is always one `mv`
@@ -169,9 +187,10 @@ slurmx --help                              # list subcommands
 slurmx status                              # live scrollable dashboard (in a terminal)
 slurmx status --once                       # one-shot text snapshot (+ golden queue when full)
 slurmx status -n 2                         # live dashboard, refresh every 2s
-slurmx submit --vram 48 -- python train.py # submit a job (golden-only by default)
+slurmx submit --vram 48 -- python train.py # submit a job (pool from GOLDEN_POLICY)
 slurmx submit --vram 48 --after 12345 -- python eval.py   # wait for job 12345 first
 slurmx submit --vram 48 --allow-main -- python train.py   # allow the main-pool fallback
+slurmx submit --vram 48 --golden-only -- python train.py  # never preemptible
 slurmx select-gpu --vram 48                # recommend a GPU for a VRAM need
 slurmx job-status 12345                    # status of one job (alias: slurmx job)
 slurmx wait 12345                          # block until a job finishes

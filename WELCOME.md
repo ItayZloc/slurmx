@@ -12,9 +12,9 @@ MCP TOOLS (invoked by Claude in chat)
   cluster_summary          your jobs + golden + cluster-wide GPU view
                            (lists pending jobs by user, in order, when a ticket is full)
   submit_job               submit GPU/CPU jobs (auto-selects GPU by VRAM;
-                           golden-only by default — golden_only=false to
-                           allow the preemptible main-pool fallback;
-                           blocks until the job is RUNNING)
+                           an omitted golden_only follows your GOLDEN_POLICY,
+                           and under the "ask" policy Claude has to ask you
+                           first; blocks until the job is RUNNING)
   select_gpu               recommend a GPU for a VRAM requirement (advisory;
                            reports the non-golden pick, so it can differ
                            from what a default submit_job uses)
@@ -33,9 +33,10 @@ CLI COMMANDS
                              slurmx status                live colorized dashboard
                                                           (--once for a text snapshot;
                                                            -n N sets refresh seconds)
-                             slurmx submit [opts] -- CMD  submit a job (golden-only;
-                                                          --after JOBID to chain,
-                                                          --allow-main for main pool)
+                             slurmx submit [opts] -- CMD  submit a job (pool from
+                                                          GOLDEN_POLICY; --after JOBID
+                                                          to chain, --golden-only or
+                                                          --allow-main to pick a pool)
                              slurmx select-gpu --vram N   recommend a GPU
                              slurmx job-status ID         status of one job (alias: job)
                              slurmx wait ID               block until a job finishes
@@ -61,7 +62,9 @@ HOW TO USE WITH AGENTS
       "Cancel my pending jobs."
 
 NEXT STEPS
-  1. Run `slurmx config` to check MAIL_USER, MAIL_TYPE and your GOLDEN_QOS list.
+  1. Run `slurmx config` to check MAIL_USER, MAIL_TYPE, your GOLDEN_QOS list
+     and GOLDEN_POLICY (set it to "ask" if you want to be asked, per job,
+     whether a job may land on the preemptible main pool).
   2. Register the MCP server with Claude Code:
        claude mcp add slurmx \
          "$(pwd)/.venv/bin/python" "$(pwd)/server.py"
