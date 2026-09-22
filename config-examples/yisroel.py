@@ -20,8 +20,8 @@ MAIL_TYPE = ["END", "FAIL"]
 # --- Golden QoS ---
 # Golden-ticket QoS list. First entry is primary for job submission.
 GOLDEN_QOS = ["yisroel"]
-# Legacy default for advisory selection. Submit scripts declare their own
-# preemption policy in their required slurmx metadata header.
+# Retained legacy setting, ignored by current submission and recommendation.
+# Submit scripts declare their policy in their required slurmx metadata header.
 GOLDEN_POLICY = "allow_main"
 
 # --- Excluded nodes ---

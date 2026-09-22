@@ -1151,7 +1151,7 @@ class TestGoldenPolicyField:
         assert "(•)" in boxes["allow_main"]
         assert "( )" in boxes["ask"] and "( )" in boxes["golden_only"]
         assert "[x]" not in boxes["allow_main"], "a choice is not a checklist"
-        assert "Claude has to ask you" in boxes["ask"]
+        assert "current tools do not prompt for a pool" in boxes["ask"]
 
     def test_picking_one_replaces_the_value_and_closes_the_fold(self, tmp_path):
         st = self.row(state_for(tmp_path, POLICY_CONFIG),

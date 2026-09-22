@@ -1,6 +1,6 @@
 # slurmx
 
-MCP server and unified CLI that lets you (and Claude Code) submit, monitor, and manage SLURM GPU jobs. Auto-selects the smallest GPU that fits your VRAM needs, tries golden tickets first, falls back to cluster-wide.
+MCP server and CLI for submitting, monitoring, and managing SLURM jobs. Executable scripts declare their VRAM needs, sharding support, and preemption safety. SLURMx chooses the GPU allocation and pool from that metadata.
 
 ## Install
 
@@ -44,7 +44,7 @@ finishes.
 |------|-------------|
 | `cluster_summary` | Single-call dashboard: your jobs + golden tickets (per QoS) + cluster-wide GPU availability. `view="jobs"` or `"gpu"` narrows the output. |
 | `submit_job` | Submit an executable script with a `# slurmx:` metadata header. The header, not the caller, selects GPU resources and preemption policy. Supports `dependency` (e.g. `afterok:12345`). Blocks until the job is RUNNING. |
-| `select_gpu` | Recommend a GPU for a VRAM requirement, with current availability. Advisory — it always reports the non-golden selection, so it can disagree with what a default `submit_job` picks. |
+| `select_gpu` | Recommend one GPU from current availability, trying golden first and main second. Advisory; use `submit_job` with a script path and `dry_run=true` to preview that script's allocation. |
 | `job_history` | Recent jobs from sacct, finished ones included. Yours only, newest first. |
 | `get_job_status` | One job's status as JSON (squeue, falling back to sacct). Carries the pending reason; branch on `state`, not `exit_code`. |
 | `wait_for_job` | Block until a job reaches a terminal state. Returns the last polled status on timeout rather than raising. |
@@ -73,16 +73,44 @@ of the script, immediately after its shebang:
 
 ```bash
 #!/bin/bash
-# slurmx: {"total_vram_gb": 48, "supports_gpu_sharding": false, "preemption_safe": true}
-python train.py
+# slurmx: {"total_vram_gb": 48, "supports_gpu_sharding": false, "preemption_safe": false}
+exec python train.py "$@"
 ```
 
-The header must contain exactly those three JSON keys. `total_vram_gb` is the
-total requirement, so a sharding-capable script may receive one or two cards of
-the same type. A safe job uses a live golden slot first, then a live main-pool
-slot, and is submitted with requeue plus a USR1 warning. An unsafe job is sent
-only to its golden partition and waits there if needed. CPU jobs set
-`total_vram_gb` to zero and must set `supports_gpu_sharding` to false.
+The header must contain exactly those three JSON keys. `total_vram_gb` must be
+a non-negative integer; the other fields must be JSON booleans. A script that
+supports sharding may receive one or two cards of the same type on one node.
+Their combined VRAM must meet the total requirement. Within each pool,
+selection minimizes allocated VRAM, then GPU count, per-card VRAM, and card name.
+
+A safe job checks live golden capacity first, then main, and requests requeue.
+The batch requests a USR1 warning 120 seconds before its time limit and forwards
+USR1 and TERM to the child while it waits for the child to exit. Set
+`preemption_safe` to true only when the script can save durable state and resume
+after interruption. An unsafe job uses its golden partition, queues if needed,
+and disables requeue. CPU jobs set `total_vram_gb` to zero and must set
+`supports_gpu_sharding` to false; they use the configured CPU partition and QoS.
+
+Save the example as `train.sh`, then preview and submit it:
+
+```bash
+chmod +x train.sh
+slurmx submit --dry-run -- ./train.sh --epochs 3
+slurmx submit -- ./train.sh --epochs 3
+```
+
+The MCP equivalent is `submit_job(script_path="/path/to/train.sh",
+args=["--epochs", "3"], dry_run=true)`. Relative script paths resolve against
+`workdir` when supplied, otherwise the caller's working directory. Reusable
+scripts whose hardware needs vary by argument should have concrete wrapper
+scripts with headers for the resources each invocation needs.
+
+Submission normally waits for the job to start; `--no-wait` (MCP
+`wait_until_running=false`) returns after `sbatch`. A start timeout leaves the
+job queued. Safe jobs cancel on quota errors: a golden per-account quota race
+retries once on main, while a per-user quota fails without retry. Unsafe jobs
+remain queued on quota errors. Scratch storage is removed on exit, so save
+checkpoints outside `$SCRATCH_DIR`.
 
 Wrap shell pipelines and compound commands in a metadata-bearing script. This
 keeps the submit interface auditable and prevents callers from bypassing the
@@ -153,7 +181,7 @@ how many golden tickets your group owns.
 | `MAIL_USER` | Your cluster email for SLURM notifications. Defaults to `$USER@post.bgu.ac.il`. |
 | `MAIL_TYPE` | Which events mail you, passed to `sbatch --mail-type`. A checklist in the form (`⏎` opens it, space ticks an event). Defaults to `["END", "FAIL"]`; unticking everything, or ticking `NONE`, turns mail off entirely. `SLURM_MAIL_TYPE="BEGIN,END"` overrides it for one shell. |
 | `GOLDEN_QOS` | List of your QoS, e.g. `["yisroel"]` or `["yisroel", "shared"]`. First entry is primary for job submission. |
-| `GOLDEN_POLICY` | Legacy default for advisory tools. It defaults to `allow_main`; submitted jobs take their preemption policy from their script metadata. |
+| `GOLDEN_POLICY` | Retained legacy setting, default `allow_main`. Current submission and recommendation tools do not read it; submitted jobs take their policy from script metadata. |
 | `GPU_DEFINITIONS_BY_QOS` | Dict keyed by QoS name; each value is a list of `(name, display_name, vram_gb, golden_tickets, golden_partition)` tuples for that QoS. |
 
 Edit through the form where you can: it validates. `sbatch` keeps a `--mail-type`
@@ -208,7 +236,7 @@ Set `WINDOWS = []` when no maintenance is scheduled. Job time limits are automat
 The server embeds usage rules that Claude reads automatically. Ask naturally:
 
 - "Check GPU availability"
-- "Submit a training job needing 48GB VRAM"
+- "Preview train.sh, then submit it with --epochs 3"
 - "What happened to job 12345?"
 - "Show me a cluster summary"
 

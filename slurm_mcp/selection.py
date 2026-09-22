@@ -65,7 +65,11 @@ def select_resources(
 
 
 def select_gpu(vram_gb: int, golden_only: bool = False):
-    """Backward-compatible advisory one-GPU selection."""
+    """Recommend one GPU; this advisory helper never submits a job.
+
+    Submissions choose resources from the executable script's metadata.
+    CPU scripts declare total_vram_gb=0 and supports_gpu_sharding=false.
+    """
     choice = select_resources(
         vram_gb, supports_gpu_sharding=False, preemption_safe=not golden_only,
         require_node_capacity=False,

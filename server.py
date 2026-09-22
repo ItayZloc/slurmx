@@ -65,11 +65,11 @@ def select_gpu(vram_gb: int) -> str:
 
     Selection here always takes the availability-driven path: the smallest
     fitting card with a free golden slot, else the smallest fitting card free
-    anywhere, reported on the main pool with qos "normal". submit_job defaults
-    to golden_only=true and picks differently (smallest fitting card that has a
-    golden partition, no free-slot check, queued rather than downgraded), so
-    the Partition/QoS line here can name a pool a default submit_job would
-    refuse. For the card a real submission gets, call submit_job dry_run=true.
+    anywhere, reported on the main pool with qos "normal". Submission uses
+    the executable script's metadata and also checks node capacity; it may
+    select two cards when the script supports sharding. Unsafe scripts queue
+    in a golden partition even when no card is free. To preview the resources
+    for a specific script, call submit_job with its path and dry_run=true.
 
     Only cards given a non-zero golden quota in config.py count as golden, so a
     small ask is upgraded to a bigger owned card whenever that card has a free
@@ -86,7 +86,7 @@ def select_gpu(vram_gb: int) -> str:
     fixed CPU-only note without touching the cluster, an ask bigger than every
     configured card returns "No GPU has >= NGB VRAM", and nothing free right
     now returns "No GPU with >= NGB VRAM is currently free" plus a per-card
-    list. That last one is a snapshot, not a verdict — a golden_only submission
+    list. That last one is a snapshot, not a verdict: an unsafe submission
     still queues and starts when a slot frees.
 
     cluster_summary view="gpu" is the fuller picture: every card, every
@@ -97,7 +97,7 @@ def select_gpu(vram_gb: int) -> str:
             card short-circuit to the fixed strings above.
     """
     if vram_gb == 0:
-        return "CPU-only work uses a script whose slurmx header sets total_vram_gb to 0."
+        return "CPU-only work requires an executable script with total_vram_gb=0 and supports_gpu_sharding=false in its slurmx header."
 
     selection = slurm_mcp.select_gpu(vram_gb)
     avail = slurm_mcp.check_availability()
@@ -354,97 +354,74 @@ def submit_job(
     wait_until_running: bool = True,
     dry_run: bool = False,
 ) -> str:
-    """Submit a SLURM batch job and wait for it to start running.
+    """Submit an executable metadata-bearing script and wait for it to start.
 
-    Call once with dry_run=true, read the generated sbatch script, then call
-    again with dry_run=false. A real submission BLOCKS: after sbatch returns,
-    the job is polled every 5s until it's RUNNING or config.START_TIMEOUT
-    expires, so the call can take minutes. It waits for the job to START, not
-    to finish — use wait_for_job for that.
+    Preview with dry_run=true before submitting. The script must be a regular
+    executable file, start with a shebang, and put one strict JSON metadata
+    line immediately after it:
+    # slurmx: {"total_vram_gb": 48, "supports_gpu_sharding": false, "preemption_safe": false}
 
-    Omitting golden_only resolves it from the user's configured GOLDEN_POLICY,
-    which is stated in this server's instructions. Under the "ask" policy an
-    omitted golden_only is refused outright — "GOLDEN_POLICY is 'ask' ..." in
-    message, nothing submitted, dry runs included — so ask the user which pool
-    they want and pass it explicitly. An explicit value always wins, whatever
-    the policy.
+    Those are the only header keys. total_vram_gb is a non-negative integer
+    (not a boolean); the other values are booleans. Zero requests a CPU job
+    and requires supports_gpu_sharding=false. CPU jobs use the configured
+    CPU partition and QoS. Put shell pipelines in an executable wrapper with
+    its own header; neither raw commands nor caller resource overrides work.
 
-    GPU choice: with golden_only=true you get the smallest card with enough
-    VRAM that has a golden partition configured, on the primary golden QoS,
-    with no availability check — if that partition is full the job simply
-    queues and starts when a slot frees, never downgraded to the preemptible
-    main pool. Note "golden" is a weaker test here than in select_gpu and
-    cluster_summary: those need a non-zero golden quota, this only needs a
-    configured golden partition, so golden_only can force a quota-0 card that
-    select_gpu will never recommend. golden_only=false instead reads live
-    availability and takes the smallest fitting card with a free golden slot,
-    else the smallest fitting free card on the main pool, and refuses to submit
-    when nothing is free, returning the availability table.
+    GPU jobs receive one card, or up to two of the same type on one node when
+    supports_gpu_sharding=true. Combined VRAM must meet total_vram_gb. Within
+    each pool, selection minimizes allocated VRAM, then GPU count, per-card
+    VRAM, and card name. A script must handle the selected GPU count itself.
 
-    golden_only also changes what happens to a pending job. Under
-    golden_only=true a GPU job is never cancelled for a quota reason — only
-    unrecoverable ones (InvalidQOS, DependencyNeverSatisfied, PartitionDown,
-    ...) cancel. Under golden_only=false a per-account quota reason cancels the
-    job and resubmits it on the main pool, but only if the first attempt was on
-    the golden QoS (the job_id you get back is then the second job's); one
-    already on the main pool is cancelled with no retry, and a per-user GPU
-    limit cancels with no retry either way. CPU jobs are the exception: they
-    always poll under the golden_only=false rules, so a quota reason cancels
-    them whatever was asked for.
+    With preemption_safe=true, selection checks live free capacity in the
+    primary golden pool first, then main/normal. The batch requests requeue
+    and a USR1 warning 120 seconds before its time limit, forwards USR1 and
+    TERM to the child, and waits until it exits. The script must checkpoint
+    and resume its own state; these signals alone do not make it safe.
 
-    The rest of the script comes from config.py and has no argument: the time
-    limit (config.TIME_LIMIT, capped to end 15 minutes before the next window
-    in maintenance.WINDOWS), --mem (MAX_MEM_GB for GPU jobs, CPU_MEM/CPU_CPUS
-    for CPU ones), --nodes=1, mail on all events, and $SCRATCH_DIR
-    (/scratch/$USER/$SLURM_JOB_ID, falling back to /tmp) which is deleted when
-    the job exits — write anything you want to keep somewhere else. An
-    --exclude line appears only when config.EXCLUDE_NODES is non-empty.
+    With preemption_safe=false, selection uses the best configured golden
+    partition without checking availability, so the job can queue there.
+    The batch disables requeue and executes the script directly.
 
-    Returns plain text, not JSON: one line each for success, job_id, gpu_type,
-    partition, qos, message, plus the whole script under "--- sbatch script
-    ---" on a dry run. Nearly every failure arrives as "success: false" with
-    the reason in message rather than as an error — unknown gpu_type, a card
-    smaller than vram_gb, num_gpus>2, nothing free, an sbatch rejection, a
-    quota cancel, a job that died before it ran. A maintenance window is the
-    exception and raises. And "success: true" does not mean running: a job
-    still queued at the start timeout also reports success, with "still pending
-    ... remains queued" in message. Read message before concluding anything.
+    A real submission polls every 5 seconds until RUNNING, a terminal/fatal
+    state, or START_TIMEOUT. Safe jobs cancel on quota errors: a golden
+    per-account quota race retries once on main, while a per-user limit
+    fails without retry. Unsafe jobs remain queued on quota errors. A start
+    timeout leaves the job queued and returns success with that fact in
+    message. This call does not wait for completion; use wait_for_job.
+
+    Time, memory, CPU count, mail events, and excluded nodes come from the
+    configuration. Maintenance caps the time limit and can block submission.
+    The batch creates $SCRATCH_DIR under /scratch, falling back to /tmp, and
+    removes it on exit. Save checkpoints and other durable output elsewhere.
+
+    Returns plain text fields: success, job_id, gpu_type, partition, qos,
+    message, and the generated script on dry runs. Validation, unavailable
+    resources, sbatch rejection, and polling failures return success: false.
+    Maintenance rejection raises. Always read success and message.
 
     Args:
-        cmd: Shell command run on the compute node, e.g. 'python train.py
-            --lr 1e-4'. With num_gpus=2 the command has to fan out itself
-            ('torchrun --nproc_per_node=2 train.py').
-        vram_gb: VRAM per GPU in GB. 0 routes to the configured CPU
-            partition/QoS, but only when gpu_type is also None — 0 with an
-            explicit gpu_type is still a GPU job.
-        job_name: Defaults to the basename of cmd's first token with dots
-            dashed out, so '.venv/bin/python train.py' becomes "python". Pass
-            something real: it's the name in cluster_summary and part of the
-            log filename.
-        num_gpus: 1 or 2 (default 1). 3 or more returns success: false without
-            building a script, even under dry_run. Both cards land on one node.
-        workdir: cd'd into inside the script before cmd runs. None leaves the
-            job in the directory the MCP server process started in.
-        output_dir: Log directory; the file is
-            {output_dir}/slurm-{job_name}-%J.out (default 'logs'). A relative
-            path resolves against the server process's cwd, not workdir, so
-            prefer an absolute one — and make sure it exists, because SLURM
-            opens the log before the script's own mkdir runs. Pass the same
-            value to read_job_log and diagnose_job or they won't find it.
-        gpu_type: Exact card name from the configured GPU catalog. Skips
-            auto-selection and is validated against vram_gb. Leave None unless
-            the user named a card.
-        golden_only: true is what you want for training you don't want
-            preempted; false opts into the fallback above. Fails if the chosen
-            card has no golden partition configured. Ignored for CPU jobs.
-            Omit it to take the user's GOLDEN_POLICY, but see the "ask" policy
-            above — under it, omitting is a refusal, not a default.
-        dependency: sbatch dependency expression, e.g. 'afterok:12345'. Also
-            used to estimate the start time when capping for maintenance.
-        dry_run: true returns the script without submitting and without
-            waiting. Under golden_only=false a dry run still queries live
-            availability, so it can fail when the cluster is busy, and under
-            the "ask" policy it is refused like a real submission.
+        script_path: Executable script to submit. A relative path resolves
+            against workdir when supplied, otherwise the server process cwd.
+        args: Literal script arguments, shell-quoted without interpreting
+            pipelines, substitutions, or redirects.
+        job_name: Defaults to the script filename stem with dots replaced
+            by hyphens. Use letters, digits, dots, underscores, or hyphens,
+            starting with a letter or digit.
+        workdir: Directory entered before the script runs. None preserves
+            the server process's submission directory.
+        output_dir: Log directory, default "logs". Uses
+            {output_dir}/slurm-{job_name}-%J.out. A relative path is relative
+            to the server cwd, not workdir. Create it before submitting:
+            SLURM opens the log before the batch's mkdir runs. Use the same
+            directory for read_job_log and diagnose_job. Paths accept
+            letters, digits, dots, underscores, hyphens, and slashes.
+        dependency: "singleton" or a supported after* dependency followed
+            by numeric IDs, e.g. "afterok:12345:12346". Also used when
+            estimating start time for maintenance.
+        wait_until_running: Default true. False returns after sbatch.
+        dry_run: Return the generated batch without submitting or waiting.
+            Safe GPU dry runs still inspect live availability and can fail
+            when no suitable configuration is currently free.
     """
     result = slurm_mcp.submit_job(
         script_path=script_path,

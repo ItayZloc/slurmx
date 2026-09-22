@@ -13,9 +13,9 @@ MCP TOOLS (invoked by Claude in chat)
   submit_job               submit an executable metadata-bearing script;
                            its header selects GPU/CPU resources and the
                            preemption policy; blocks until it is RUNNING
-  select_gpu               recommend a GPU for a VRAM requirement (advisory;
-                           reports the non-golden pick, so it can differ
-                           from what a default submit_job uses)
+  select_gpu               recommend one GPU from current availability
+                           (golden first, then main); preview a specific
+                           script with submit_job dry_run=true
   get_job_status           one job's status as JSON, incl. the pending reason
   wait_for_job             block until a job reaches a terminal state
   read_job_log             read a job's SLURM log (output_dir must be the
@@ -54,7 +54,7 @@ HOW TO USE WITH AGENTS
   Code session in this terminal can call the tools by name. Phrase
   requests naturally — the tool docstrings tell the agent what to ask:
       "Check GPU availability."
-      "Submit a training job that needs 48GB of VRAM."
+      "Preview train.sh, then submit it with --epochs 3."
       "Diagnose job 12345."
       "Cancel my pending jobs."
 

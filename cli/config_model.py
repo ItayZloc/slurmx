@@ -176,11 +176,11 @@ MAIL_EVENT_HELP = {
 # clears them: "no mail" and "every event" don't combine with a specific event.
 MAIL_EXCLUSIVE = ("NONE", "ALL")
 
-# What each golden policy does, in the words the form shows next to the radio.
+# Historical values, retained for editing existing configuration files.
 GOLDEN_POLICY_HELP = {
-    "golden_only": "always preemption-immune; queue rather than downgrade",
-    "allow_main": "golden first, then the preemptible main pool",
-    "ask": "no default — Claude has to ask you, the CLI prompts",
+    "golden_only": "legacy value; submission uses script metadata",
+    "allow_main": "legacy default; submission uses script metadata",
+    "ask": "legacy value; current tools do not prompt for a pool",
 }
 
 # Per-field option help, so the form doesn't special-case field names.
@@ -225,7 +225,7 @@ FIELDS: tuple[Field, ...] = (
     Field("MAIL_TYPE", "list", "SLURM mail events; empty or NONE = no mail",
           _v_mail_types, options=MAIL_EVENTS),
     Field("GOLDEN_QOS", "list", "golden QoS list; the first is primary", _v_word_list),
-    Field("GOLDEN_POLICY", "choice", "what an unspecified golden_only becomes",
+    Field("GOLDEN_POLICY", "choice", "legacy setting; submission uses script metadata",
           _v_policy, options=GOLDEN_POLICIES),
     Field("EXCLUDE_NODES", "list", "nodes to keep jobs off", _v_word_list_or_empty),
     Field("MAX_MEM_GB", "int", "memory ceiling for a GPU job", _v_posint),

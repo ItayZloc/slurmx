@@ -6,28 +6,14 @@ import inspect
 import os
 import sys
 import types
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-_config = types.ModuleType("config")
-_config.MAIL_USER = "test@example.com"
-_config.MAX_MEM_GB = 80
-_config.TIME_LIMIT = "1-0:00:00"
-_config.START_TIMEOUT = 1
-_config.CPU_MEM = "16G"
-_config.CPU_CPUS = 4
-_config.GOLDEN_QOS = ["yisroel"]
-_config.EXCLUDE_NODES = []
-_config.GPU_DEFINITIONS = [
-    ("rtx_pro_6000", "RTX Pro 6000", 96, 16, "rtx_pro_6000"),
-    ("rtx_6000", "RTX 6000", 48, 12, "rtx6000"),
-    ("rtx_3090", "RTX 3090", 24, 0, "rtx3090"),
-]
-_config.GPU_DEFINITIONS_BY_QOS = {"yisroel": _config.GPU_DEFINITIONS}
-sys.modules.setdefault("config", _config)
-
-from slurm_mcp.submission import parse_script_metadata, submit_job
-from slurm_mcp.types import Availability, GPUAvailability
+from slurm_mcp.submission import (
+    _build_sbatch_script, _wait_for_running, parse_script_metadata, submit_job,
+)
+from slurm_mcp.types import Availability, GPUAvailability, JobResult, JobStatus
 
 
 def _script(tmp_path, header: str, body: str = "echo hello"):
@@ -61,6 +47,51 @@ def test_metadata_requires_exact_schema_and_types(tmp_path):
     assert error == "slurmx metadata total_vram_gb must be a non-negative integer."
 
 
+@pytest.mark.parametrize("metadata,error_fragment", [
+    ('{}', "exactly"),
+    ('[]', "exactly"),
+    ('{"total_vram_gb": 8, "supports_gpu_sharding": false}', "exactly"),
+    ('{"total_vram_gb": 8, "supports_gpu_sharding": false, "preemption_safe": true, "qos": "normal"}', "exactly"),
+    ('{"total_vram_gb": -1, "supports_gpu_sharding": false, "preemption_safe": true}', "non-negative integer"),
+    ('{"total_vram_gb": 8.5, "supports_gpu_sharding": false, "preemption_safe": true}', "non-negative integer"),
+    ('{"total_vram_gb": 8, "supports_gpu_sharding": 1, "preemption_safe": true}', "supports_gpu_sharding must be a boolean"),
+    ('{"total_vram_gb": 8, "supports_gpu_sharding": false, "preemption_safe": "true"}', "preemption_safe must be a boolean"),
+    ('{"total_vram_gb": 8, "total_vram_gb": 16, "supports_gpu_sharding": false, "preemption_safe": true}', "strict JSON"),
+    ('{"total_vram_gb": 8, "supports_gpu_sharding": false, "preemption_safe": true,}', "strict JSON"),
+])
+def test_invalid_metadata_is_rejected(tmp_path, metadata, error_fragment):
+    script = _script(tmp_path, "# slurmx: " + metadata)
+    result = submit_job(str(script), dry_run=True)
+    assert not result.success
+    assert error_fragment in result.message
+    assert result.sbatch_script == ""
+
+
+@pytest.mark.parametrize("problem,error_fragment", [
+    ("missing", "not a regular file"),
+    ("directory", "not a regular file"),
+    ("not_executable", "not executable"),
+    ("no_shebang", "shebang"),
+    ("late_header", "immediately after the shebang"),
+])
+def test_script_must_be_executable_with_an_immediate_header(tmp_path, problem, error_fragment):
+    path = tmp_path / "job.sh"
+    header = '# slurmx: {"total_vram_gb": 0, "supports_gpu_sharding": false, "preemption_safe": false}'
+    if problem == "directory":
+        path.mkdir()
+    elif problem != "missing":
+        path = _script(tmp_path, header)
+        if problem == "not_executable":
+            path.chmod(0o644)
+        elif problem == "no_shebang":
+            path.write_text(header + "\necho hello\n")
+        elif problem == "late_header":
+            path.write_text("#!/bin/bash\n\n" + header + "\necho hello\n")
+    result = submit_job(str(path), dry_run=True)
+    assert not result.success
+    assert error_fragment in result.message
+
+
 def test_metadata_must_follow_shebang_and_reject_cpu_sharding(tmp_path):
     """The only accepted header position prevents accidental metadata parsing."""
     script = _script(
@@ -89,7 +120,7 @@ def test_submit_resolves_relative_executable_and_quotes_arguments(tmp_path, monk
     assert "#SBATCH --no-requeue" in result.sbatch_script
 
 
-def test_safe_job_prefers_live_golden_then_uses_main(monkeypatch, tmp_path):
+def test_safe_job_prefers_available_golden_over_main(monkeypatch, tmp_path):
     """Safe jobs may use main, but only after a live golden option is exhausted."""
     script = _script(
         tmp_path,
@@ -184,12 +215,51 @@ def test_unsafe_job_queues_on_best_golden_candidate_without_availability(monkeyp
     assert "#SBATCH --no-requeue" in result.sbatch_script
 
 
+@pytest.mark.parametrize("vram,sharding,success", [
+    (100, True, True),
+    (100, False, False),
+    (193, True, False),
+])
+def test_metadata_allocation_respects_sharding_and_two_card_limit(tmp_path, vram, sharding, success):
+    script = _script(
+        tmp_path,
+        '# slurmx: {"total_vram_gb": ' + str(vram)
+        + ', "supports_gpu_sharding": ' + str(sharding).lower()
+        + ', "preemption_safe": false}',
+    )
+    result = submit_job(str(script), dry_run=True)
+    assert result.success is success
+    if success:
+        assert "#SBATCH --gres=gpu:rtx_pro_6000:2" in result.sbatch_script
+        assert "#SBATCH --nodes=1" in result.sbatch_script
+    else:
+        assert f"No GPU configuration can satisfy {vram}GB" in result.message
+
+
 def test_submission_has_only_the_script_metadata_interface():
     """Callers cannot override metadata policy through public resource parameters."""
     assert list(inspect.signature(submit_job).parameters) == [
         "script_path", "args", "job_name", "workdir", "output_dir", "dependency",
         "wait_until_running", "dry_run",
     ]
+
+
+def test_batch_builder_requires_an_explicit_preemption_policy():
+    with pytest.raises(TypeError, match="preemption_safe"):
+        _build_sbatch_script(
+            cmd="/tmp/job.sh", partition="cpu", qos="normal", gpu_type="",
+            num_gpus=0, job_name="job", output_path="out.log", workdir=None,
+        )
+
+
+def test_wait_requires_an_explicit_preemption_policy(monkeypatch):
+    monkeypatch.setattr(
+        "slurm_mcp.monitoring.get_job_status",
+        lambda job_id: JobStatus(job_id=job_id, state="RUNNING"),
+    )
+    job = JobResult(True, 123, "cpu", "cpu", "normal", "submitted", "")
+    with pytest.raises(TypeError, match="preemption_safe"):
+        _wait_for_running(job, timeout=1)
 
 
 def test_submission_rejects_directive_injection(tmp_path):
@@ -236,19 +306,25 @@ def test_mcp_and_cli_expose_script_arguments_without_resource_flags(monkeypatch)
     monkeypatch.setitem(sys.modules, "mcp", mcp_module)
     monkeypatch.setitem(sys.modules, "mcp.server", mcp_server)
     monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp)
-    import server
-    from cli.submit import add_arguments
-    import argparse
+    previous_server = sys.modules.pop("server", None)
+    try:
+        import server
+        from cli.submit import add_arguments
+        import argparse
 
-    parser = argparse.ArgumentParser()
-    add_arguments(parser)
-    parsed = parser.parse_args(["--dry-run", "--", "./job.sh", "--epochs", "3"])
+        parser = argparse.ArgumentParser()
+        add_arguments(parser)
+        parsed = parser.parse_args(["--dry-run", "--", "./job.sh", "--epochs", "3"])
 
-    assert list(inspect.signature(server.submit_job).parameters) == [
-        "script_path", "args", "job_name", "workdir", "output_dir", "dependency",
-        "wait_until_running", "dry_run",
-    ]
-    assert parsed.script == ["--", "./job.sh", "--epochs", "3"]
-    with __import__("pytest").raises(SystemExit):
-        parser.parse_args(["--vram", "48", "--", "./job.sh"])
-    monkeypatch.delitem(sys.modules, "server", raising=False)
+        assert list(inspect.signature(server.submit_job).parameters) == [
+            "script_path", "args", "job_name", "workdir", "output_dir", "dependency",
+            "wait_until_running", "dry_run",
+        ]
+        assert parsed.script == ["--", "./job.sh", "--epochs", "3"]
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--vram", "48", "--", "./job.sh"])
+    finally:
+        if previous_server is None:
+            sys.modules.pop("server", None)
+        else:
+            sys.modules["server"] = previous_server

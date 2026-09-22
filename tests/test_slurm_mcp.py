@@ -11,6 +11,7 @@ Run live only:   python3 -m pytest tests/ -v -k "live"
 """
 
 import argparse
+import json
 import os
 import sys
 import re
@@ -35,6 +36,32 @@ from slurm_mcp import (
 from slurm_mcp.availability import (
     _SINFO_FIELDS, _GOLDEN_FIELDS, _QUEUE_FIELDS, _node_is_usable,
 )
+
+
+@pytest.fixture
+def submission_script(tmp_path):
+    def create(total_vram_gb=48, *, preemption_safe=False,
+               supports_gpu_sharding=False, name="train.sh", body="echo hello"):
+        path = tmp_path / name
+        metadata = dict(total_vram_gb=total_vram_gb,
+                        supports_gpu_sharding=supports_gpu_sharding,
+                        preemption_safe=preemption_safe)
+        path.write_text(f"#!/bin/bash\n# slurmx: {json.dumps(metadata)}\n{body}\n")
+        path.chmod(0o755)
+        return str(path)
+    return create
+
+
+@pytest.fixture
+def available_golden_gpu(monkeypatch):
+    monkeypatch.setattr(
+        "slurm_mcp.selection.availability.check_availability",
+        lambda: Availability(
+            golden={"rtx_6000": GPUAvailability("rtx_6000", 12, 0, 1)},
+            cluster={"rtx_6000": GPUAvailability("rtx_6000", 8, 0, 1)},
+            node_free={"rtx6000": {"rtx_6000": 1}, "main": {"rtx_6000": 1}},
+        ),
+    )
 
 
 def _fixed_width_row(values, fields) -> str:
@@ -658,7 +685,8 @@ class TestSelectGPUGoldenOnly:
 # ============================================================
 
 class TestBuildSbatchScript:
-    def test_basic_script(self):
+    @pytest.mark.parametrize("safe", [False, True])
+    def test_basic_script(self, safe):
         script = _build_sbatch_script(
             cmd="python train.py",
             partition="rtx_pro_6000",
@@ -667,7 +695,7 @@ class TestBuildSbatchScript:
             num_gpus=1,
             job_name="test-job",
             output_path="./slurm-test-job-%J.out",
-            workdir=None,
+            workdir=None, preemption_safe=safe,
         )
         assert "#!/bin/bash" in script
         assert "#SBATCH --partition rtx_pro_6000" in script
@@ -680,7 +708,20 @@ class TestBuildSbatchScript:
         assert "#SBATCH --output ./slurm-test-job-%J.out" in script
         assert f"#SBATCH --mail-user={MAIL_USER}" in script
         assert f"#SBATCH --mail-type={','.join(MAIL_TYPE)}" in script
-        assert "python train.py" in script
+        if safe:
+            assert "#SBATCH --requeue" in script
+            assert "#SBATCH --no-requeue" not in script
+            assert "#SBATCH --signal=B:USR1@120" in script
+            assert "python train.py &" in script
+            assert 'trap \'kill -USR1 "$child_pid"' in script
+            assert 'trap \'kill -TERM "$child_pid"' in script
+            assert 'wait "$child_pid"' in script
+            assert 'kill -0 "$child_pid" 2>/dev/null || break' in script
+        else:
+            assert "#SBATCH --no-requeue" in script
+            assert "#SBATCH --signal" not in script
+            assert "child_pid" not in script
+            assert script.endswith("python train.py\n")
 
     @pytest.mark.parametrize("mail_type,expected", [
         (["END", "FAIL"], "END,FAIL"),
@@ -692,7 +733,7 @@ class TestBuildSbatchScript:
             script = _build_sbatch_script(
                 cmd="python train.py", partition="main", qos="normal",
                 gpu_type="rtx_4090", num_gpus=1, job_name="test",
-                output_path="out.log", workdir=None,
+                output_path="out.log", workdir=None, preemption_safe=False,
             )
         assert f"#SBATCH --mail-type={expected}" in script
 
@@ -702,7 +743,7 @@ class TestBuildSbatchScript:
             script = _build_sbatch_script(
                 cmd="python train.py", partition="main", qos="normal",
                 gpu_type="rtx_4090", num_gpus=1, job_name="test",
-                output_path="out.log", workdir=None,
+                output_path="out.log", workdir=None, preemption_safe=False,
             )
         assert "--mail-type" not in script
         assert "--mail-user" not in script
@@ -713,20 +754,21 @@ class TestBuildSbatchScript:
             script = _build_sbatch_script(
                 cmd="python train.py", partition="main", qos="normal",
                 gpu_type="rtx_4090", num_gpus=1, job_name="test",
-                output_path="out.log", workdir=None,
+                output_path="out.log", workdir=None, preemption_safe=False,
             )
         assert "--mail-user" not in script
         assert "--mail-type" not in script
 
-    def test_scratch_dir_setup(self):
+    @pytest.mark.parametrize("safe", [False, True])
+    def test_scratch_dir_setup(self, safe):
         script = _build_sbatch_script(
             cmd="python train.py", partition="main", qos="normal",
             gpu_type="rtx_4090", num_gpus=1, job_name="test",
-            output_path="out.log", workdir=None,
+            output_path="out.log", workdir=None, preemption_safe=safe,
         )
         assert "export SCRATCH_DIR=/scratch/$USER/$SLURM_JOB_ID" in script
         assert 'mkdir -p "$SCRATCH_DIR"' in script
-        assert "trap" in script
+        assert 'trap \'rm -rf "$SCRATCH_DIR"\' EXIT' in script
         # Scratch setup should come before the command
         scratch_pos = script.index("SCRATCH_DIR")
         cmd_pos = script.index("python train.py")
@@ -737,7 +779,7 @@ class TestBuildSbatchScript:
             cmd="python train.py", partition="main", qos="normal",
             gpu_type="rtx_4090", num_gpus=1, job_name="test",
             output_path="out.log",
-            workdir="/tmp/test-project",
+            workdir="/tmp/test-project", preemption_safe=False,
         )
         assert "cd /tmp/test-project" in script
         cd_pos = script.index("cd /tmp/test-project")
@@ -747,10 +789,10 @@ class TestBuildSbatchScript:
     def test_multi_gpu(self):
         script = _build_sbatch_script(
             cmd="torchrun train.py", partition="rtx_pro_6000", qos="yisroel",
-            gpu_type="rtx_pro_6000", num_gpus=4, job_name="multi",
-            output_path="out.log", workdir=None,
+            gpu_type="rtx_pro_6000", num_gpus=2, job_name="multi",
+            output_path="out.log", workdir=None, preemption_safe=False,
         )
-        assert "#SBATCH --gres=gpu:rtx_pro_6000:4" in script
+        assert "#SBATCH --gres=gpu:rtx_pro_6000:2" in script
         assert "#SBATCH --nodes=1" in script
 
 
@@ -758,334 +800,112 @@ class TestBuildSbatchScript:
 # Unit Tests: submit_job (mocked)
 # ============================================================
 
-class _RemovedRawSubmitJobTests:
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_dry_run_returns_script(self, mock_select):
-        mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
-        result = submit_job(
-            cmd="python train.py",
-            vram_gb=48,
-            dry_run=True,
-        )
+class TestSubmitJobMocked:
+    def test_dry_run_returns_script(self, submission_script):
+        path = submission_script()
+        result = submit_job(path, dry_run=True)
         assert result.success is True
         assert result.job_id is None
         assert result.gpu_type == "rtx_6000"
         assert result.partition == "rtx6000"
         assert result.qos == "yisroel"
-        assert "python train.py" in result.sbatch_script
+        assert path in result.sbatch_script
         assert "#SBATCH --partition rtx6000" in result.sbatch_script
 
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_dry_run_with_workdir(self, mock_select):
-        mock_select.return_value = ("rtx_pro_6000", "rtx_pro_6000", "yisroel")
+    def test_dry_run_with_workdir(self, submission_script, tmp_path):
+        submission_script(96)
         result = submit_job(
-            cmd="python train.py --lr 1e-4",
-            vram_gb=96,
-            workdir="/tmp/test-project",
-            output_dir="/tmp/logs",
-            job_name="train-bert",
-            dry_run=True,
+            "train.sh", args=["--lr", "1e-4"], workdir=str(tmp_path),
+            output_dir="/tmp/logs", job_name="train-bert", dry_run=True,
         )
         assert result.success is True
-        assert "cd /tmp/test-project" in result.sbatch_script
+        assert f"cd {tmp_path}" in result.sbatch_script
         assert "/tmp/logs/slurm-train-bert-%J.out" in result.sbatch_script
         assert "#SBATCH --mem=80G" in result.sbatch_script
         assert "#SBATCH --time 7-0:00:00" in result.sbatch_script
         assert "SCRATCH_DIR" in result.sbatch_script
+        assert f"{tmp_path}/train.sh --lr 1e-4" in result.sbatch_script
 
-    def test_manual_gpu_type_override(self):
-        result = submit_job(
-            cmd="python eval.py",
-            vram_gb=48,
-            gpu_type="rtx_pro_6000",
-            dry_run=True,
-        )
-        assert result.success is True
-        assert result.gpu_type == "rtx_pro_6000"
-        assert result.qos == "yisroel"
-        assert result.partition == "rtx_pro_6000"
-
-    def test_manual_gpu_type_with_qos_override(self):
-        result = submit_job(
-            cmd="python eval.py",
-            vram_gb=24,
-            gpu_type="rtx_4090",
-            qos="normal",
-            golden_only=False,  # qos override only applies in the fallback path
-            dry_run=True,
-        )
-        assert result.success is True
-        assert result.gpu_type == "rtx_4090"
-        assert result.qos == "normal"
-        assert result.partition == "main"
-
-    def test_manual_gpu_type_invalid(self):
-        result = submit_job(
-            cmd="echo hi", vram_gb=8, gpu_type="rtx_9999", dry_run=True
-        )
+    def test_vram_too_high_no_configuration_exists(self, submission_script):
+        result = submit_job(submission_script(200), dry_run=True)
         assert result.success is False
-        assert "Unknown GPU type" in result.message
+        assert "No GPU configuration can satisfy 200GB" in result.message
 
-    def test_manual_gpu_type_insufficient_vram(self):
-        result = submit_job(
-            cmd="echo hi", vram_gb=50, gpu_type="rtx_4090", dry_run=True
+    @patch("slurm_mcp.selection.availability.check_availability")
+    def test_nothing_available_returns_error(self, mock_avail, submission_script):
+        mock_avail.return_value = Availability(
+            golden={"rtx_6000": GPUAvailability("rtx_6000", 12, 12, 0)},
+            cluster={"rtx_6000": GPUAvailability("rtx_6000", 100, 100, 0)},
         )
+        result = submit_job(submission_script(preemption_safe=True), dry_run=True)
         assert result.success is False
-        assert "24GB VRAM" in result.message
-        assert "50GB requested" in result.message
+        assert "No GPU configuration can satisfy 48GB" in result.message
 
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_vram_too_high_no_gpu_type_exists(self, mock_select):
-        mock_select.return_value = None
-        result = submit_job(cmd="echo hi", vram_gb=200, dry_run=True)
-        assert result.success is False
-        assert "No GPU type has >= 200GB VRAM" in result.message
+    def test_default_job_name_from_script(self, submission_script):
+        result = submit_job(submission_script(name="train.model.sh"), dry_run=True)
+        assert "#SBATCH --job-name train-model" in result.sbatch_script
 
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_nothing_available_shows_availability(self, mock_select):
-        mock_select.return_value = None
-        with patch("slurm_mcp.check_availability") as mock_avail:
-            avail = Availability()
-            avail.golden["rtx_6000"] = GPUAvailability("rtx_6000", 12, 12, 0)
-            avail.golden["rtx_pro_6000"] = GPUAvailability("rtx_pro_6000", 16, 16, 0)
-            avail.cluster["rtx_6000"] = GPUAvailability("rtx_6000", 100, 100, 0)
-            avail.cluster["rtx_pro_6000"] = GPUAvailability("rtx_pro_6000", 40, 40, 0)
-            mock_avail.return_value = avail
-
-            result = submit_job(cmd="echo hi", vram_gb=48, dry_run=True)
-            assert result.success is False
-            assert "currently free" in result.message
-            assert "rtx_6000" in result.message
-
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_default_job_name_from_command(self, mock_select):
-        mock_select.return_value = ("gtx_1080", "main", "normal")
-        result = submit_job(cmd="python train.py --lr 1e-4", vram_gb=8, dry_run=True)
-        assert "#SBATCH --job-name python" in result.sbatch_script
-
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_custom_job_name(self, mock_select):
-        mock_select.return_value = ("gtx_1080", "main", "normal")
-        result = submit_job(
-            cmd="python train.py", vram_gb=8, job_name="my-training", dry_run=True
-        )
+    def test_custom_job_name(self, submission_script):
+        result = submit_job(submission_script(), job_name="my-training", dry_run=True)
         assert "#SBATCH --job-name my-training" in result.sbatch_script
 
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_multi_gpu_request(self, mock_select):
-        mock_select.return_value = ("rtx_pro_6000", "rtx_pro_6000", "yisroel")
-        result = submit_job(
-            cmd="torchrun train.py", vram_gb=96, num_gpus=2, dry_run=True
-        )
-        assert "#SBATCH --gres=gpu:rtx_pro_6000:2" in result.sbatch_script
-        assert "#SBATCH --nodes=1" in result.sbatch_script
-
-    def test_num_gpus_cap(self):
-        result = submit_job(
-            cmd="torchrun train.py", vram_gb=48, num_gpus=3, dry_run=True
-        )
-        assert result.success is False
-        assert "exceeds cluster limit" in result.message
+    @pytest.mark.parametrize("safe", [False, True])
+    def test_cpu_uses_configured_resources(self, submission_script, safe):
+        result = submit_job(submission_script(0, preemption_safe=safe), dry_run=True)
+        assert result.success is True
+        assert (result.gpu_type, result.partition, result.qos) == ("cpu", "cpu", "normal")
+        assert "#SBATCH --cpus-per-task=4" in result.sbatch_script
+        assert "#SBATCH --mem=16G" in result.sbatch_script
+        assert "--gres" not in result.sbatch_script
 
     @patch("slurm_mcp.shell._run")
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_actual_submit_parses_job_id(self, mock_select, mock_run):
-        mock_select.return_value = ("gtx_1080", "main", "normal")
+    def test_actual_submit_parses_job_id(self, mock_run, submission_script):
         mock_run.return_value = "Submitted batch job 12345678\n"
-        result = submit_job(cmd="echo hi", vram_gb=8, wait_until_running=False)
+        result = submit_job(submission_script(), wait_until_running=False)
         assert result.success is True
         assert result.job_id == 12345678
 
     @patch("slurm_mcp.shell._run")
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_submit_failure_returns_error(self, mock_select, mock_run):
-        mock_select.return_value = ("gtx_1080", "main", "normal")
+    def test_submit_failure_returns_error(self, mock_run, submission_script):
         mock_run.side_effect = RuntimeError("sbatch: error: invalid partition")
-        result = submit_job(cmd="echo hi", vram_gb=8, wait_until_running=False)
+        result = submit_job(submission_script(), wait_until_running=False)
         assert result.success is False
         assert "invalid partition" in result.message
 
+    @pytest.mark.parametrize("failure", [False, True])
+    def test_temporary_batch_file_is_removed(self, submission_script, monkeypatch, failure):
+        batch_files = []
 
-# ============================================================
-# Unit Tests: submit_job golden_only (mocked)
-# ============================================================
+        def sbatch(command):
+            assert command[0] == "sbatch"
+            path = command[1]
+            assert os.path.isfile(path) and os.access(path, os.X_OK)
+            with open(path) as handle:
+                assert "#SBATCH --no-requeue" in handle.read()
+            batch_files.append(path)
+            if failure:
+                raise RuntimeError("sbatch failed")
+            return "Submitted batch job 12345\n"
 
-class _RemovedManualPoolTests:
-    """golden_only=True: force qos=yisroel + dedicated partition, never main."""
-
-    def test_golden_only_96gb_forces_pro_partition(self):
-        result = submit_job(cmd="python train.py", vram_gb=96,
-                            golden_only=True, dry_run=True)
-        assert result.success is True
-        assert result.gpu_type == "rtx_pro_6000"
-        assert result.partition == "rtx_pro_6000"
-        assert result.qos == "yisroel"
-        assert "#SBATCH --partition rtx_pro_6000" in result.sbatch_script
-        assert "#SBATCH --qos=yisroel" in result.sbatch_script
-
-    def test_golden_only_48gb(self):
-        result = submit_job(cmd="python train.py", vram_gb=48,
-                            golden_only=True, dry_run=True)
-        assert result.partition == "rtx6000"
-        assert result.qos == "yisroel"
-
-    def test_golden_only_24gb_small_card(self):
-        result = submit_job(cmd="python train.py", vram_gb=24,
-                            golden_only=True, dry_run=True)
-        assert result.gpu_type in ("rtx_3090", "rtx_4090")
-        assert result.partition in ("rtx3090", "rtx4090")
-        assert result.qos == "yisroel"
-
-    def test_golden_only_explicit_small_card(self):
-        result = submit_job(cmd="python train.py", vram_gb=24, gpu_type="rtx_4090",
-                            golden_only=True, dry_run=True)
-        assert result.gpu_type == "rtx_4090"
-        assert result.partition == "rtx4090"
-        assert result.qos == "yisroel"
-
-    def test_golden_only_overrides_qos_arg(self):
-        # golden_only wins over an explicit qos override.
-        result = submit_job(cmd="python x.py", vram_gb=48, gpu_type="rtx_6000",
-                            qos="normal", golden_only=True, dry_run=True)
-        assert result.qos == "yisroel"
-        assert result.partition == "rtx6000"
-
-    def test_golden_only_ignored_for_cpu(self):
-        result = submit_job(cmd="echo hi", vram_gb=0,
-                            golden_only=True, dry_run=True)
-        assert result.success is True
-        assert result.partition == "cpu"
-        assert result.qos == "normal"
+        monkeypatch.setattr("slurm_mcp.shell._run", sbatch)
+        result = submit_job(submission_script(), wait_until_running=False)
+        assert result.success is not failure
+        assert len(batch_files) == 1
+        assert not os.path.exists(batch_files[0])
 
 
-# ============================================================
-# Unit Tests: GOLDEN_POLICY (what an omitted golden_only becomes)
-# ============================================================
-
-def _policy(name):
-    return patch("slurm_mcp.submission.GOLDEN_POLICY", name)
-
-
-class _RemovedGoldenPolicyTests:
-    """The policy is a default, not a hard rule: an explicit argument wins."""
-
-    @pytest.mark.parametrize("policy,expected", [
-        ("golden_only", True),
-        ("allow_main", False),
-        ("ask", None),
+class TestSubmitJobUnsafe:
+    @pytest.mark.parametrize("vram,gpu,partition", [
+        (96, "rtx_pro_6000", "rtx_pro_6000"),
+        (48, "rtx_6000", "rtx6000"),
+        (24, "rtx_3090", "rtx3090"),
     ])
-    def test_omitted_resolves_from_policy(self, policy, expected):
-        with _policy(policy):
-            assert resolve_golden_only(None) is expected
-
-    @pytest.mark.parametrize("policy", ["golden_only", "allow_main", "ask"])
-    @pytest.mark.parametrize("explicit", [True, False])
-    def test_explicit_always_wins(self, policy, explicit):
-        with _policy(policy):
-            assert resolve_golden_only(explicit) is explicit
-
-
-class _RemovedGoldenPolicySubmissionTests:
-    def test_default_policy_is_golden(self):
-        with _policy("golden_only"):
-            result = submit_job(cmd="python train.py", vram_gb=96, dry_run=True)
+    def test_unsafe_job_queues_in_golden_partition(self, submission_script, vram, gpu, partition):
+        result = submit_job(submission_script(vram), dry_run=True)
         assert result.success is True
-        assert result.partition == "rtx_pro_6000"
-        assert result.qos == "yisroel"
-
-    def test_allow_main_takes_the_fallback_path(self):
-        # rtx_4090 is a card the group doesn't own (golden_quota 0), so the two
-        # paths separate cleanly with no availability mocking: golden-only forces
-        # the dedicated partition, the fallback drops to the preemptible pool.
-        with _policy("allow_main"):
-            fallback = submit_job(cmd="python train.py", vram_gb=24,
-                                  gpu_type="rtx_4090", dry_run=True)
-        with _policy("golden_only"):
-            golden = submit_job(cmd="python train.py", vram_gb=24,
-                                gpu_type="rtx_4090", dry_run=True)
-        assert fallback.success is True
-        assert (fallback.qos, fallback.partition) == ("normal", "main")
-        assert (golden.qos, golden.partition) == ("yisroel", "rtx4090")
-
-    def test_ask_refuses_a_gpu_job(self):
-        with _policy("ask"):
-            result = submit_job(cmd="python train.py", vram_gb=96, dry_run=True)
-        assert result.success is False
-        assert result.message == ASK_POLICY_MESSAGE
-        assert result.job_id is None
-        assert result.sbatch_script == ""
-
-    @patch("slurm_mcp.submission._do_submit")
-    def test_ask_never_reaches_sbatch(self, mock_submit):
-        with _policy("ask"):
-            submit_job(cmd="python train.py", vram_gb=96, dry_run=False,
-                       wait_until_running=False)
-        mock_submit.assert_not_called()
-
-    @pytest.mark.parametrize("explicit,expected_qos", [(True, "yisroel")])
-    def test_ask_accepts_an_explicit_choice(self, explicit, expected_qos):
-        with _policy("ask"):
-            result = submit_job(cmd="python train.py", vram_gb=96,
-                                golden_only=explicit, dry_run=True)
-        assert result.success is True
-        assert result.qos == expected_qos
-
-    def test_ask_lets_cpu_jobs_through(self):
-        """golden_only is ignored for CPU jobs, so asking would be noise."""
-        with _policy("ask"):
-            result = submit_job(cmd="echo hi", vram_gb=0, dry_run=True)
-        assert result.success is True
-        assert result.partition == "cpu"
-
-    def test_ask_still_gates_a_vram0_job_with_an_explicit_card(self):
-        """vram_gb=0 plus gpu_type is a GPU job, so the gate applies."""
-        with _policy("ask"):
-            result = submit_job(cmd="python x.py", vram_gb=0,
-                                gpu_type="rtx_4090", dry_run=True)
-        assert result.success is False
-        assert result.message == ASK_POLICY_MESSAGE
-
-    def test_ask_message_names_both_choices(self):
-        assert "golden_only=true" in ASK_POLICY_MESSAGE
-        assert "golden_only=false" in ASK_POLICY_MESSAGE
-        assert "slurmx config" in ASK_POLICY_MESSAGE
-
-
-class _RemovedGoldenPolicyInstructionTests:
-    """The MCP instructions are the only thing an agent reads before its first
-    call, so the policy has to be stated there as well as enforced."""
-
-    def _bullet(self, policy):
-        import server
-        text = server.build_instructions(policy)
-        return next(l for l in text.splitlines() if "golden" in l.lower())
-
-    def test_each_policy_gets_its_own_rule(self):
-        bullets = {p: self._bullet(p)
-                   for p in ("golden_only", "allow_main", "ask")}
-        assert len(set(bullets.values())) == 3
-
-    def test_ask_tells_the_agent_to_ask(self):
-        import server
-        text = server.build_instructions("ask")
-        assert "ask the user" in text.lower()
-        assert "golden_only" in text
-
-    def test_default_policy_still_says_golden_only_is_the_default(self):
-        assert "DEFAULT" in self._bullet("golden_only")
-
-    def test_the_rest_of_the_instructions_are_untouched(self):
-        import server
-        for policy in ("golden_only", "allow_main", "ask"):
-            text = server.build_instructions(policy)
-            assert "Always use dry_run=true first" in text
-            assert "Max 2 GPUs per cluster policy" in text
-
-    def test_the_server_is_built_with_the_configured_policy(self):
-        # Not "..._live_policy": -k "not live" would silently deselect it.
-        import server
-        assert server.mcp.instructions == server.build_instructions(
-            slurm_mcp.GOLDEN_POLICY)
+        assert (result.gpu_type, result.partition, result.qos) == (gpu, partition, "yisroel")
+        assert f"#SBATCH --partition {partition}" in result.sbatch_script
+        assert "#SBATCH --no-requeue" in result.sbatch_script
 
 
 # ============================================================
@@ -1174,7 +994,7 @@ class TestBuildSbatchScriptDependency:
         script = _build_sbatch_script(
             cmd="python eval.py", partition="main", qos="normal",
             gpu_type="rtx_4090", num_gpus=1, job_name="eval",
-            output_path="out.log", workdir=None,
+            output_path="out.log", workdir=None, preemption_safe=False,
             dependency="afterok:12345",
         )
         assert "#SBATCH --dependency=afterok:12345" in script
@@ -1183,7 +1003,7 @@ class TestBuildSbatchScriptDependency:
         script = _build_sbatch_script(
             cmd="python eval.py", partition="main", qos="normal",
             gpu_type="rtx_4090", num_gpus=1, job_name="eval",
-            output_path="out.log", workdir=None,
+            output_path="out.log", workdir=None, preemption_safe=False,
             dependency=None,
         )
         assert "--dependency" not in script
@@ -1192,16 +1012,14 @@ class TestBuildSbatchScriptDependency:
         script = _build_sbatch_script(
             cmd="python eval.py", partition="main", qos="normal",
             gpu_type="rtx_4090", num_gpus=1, job_name="eval",
-            output_path="out.log", workdir=None,
+            output_path="out.log", workdir=None, preemption_safe=False,
             dependency="afterok:111:222:333",
         )
         assert "#SBATCH --dependency=afterok:111:222:333" in script
 
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_dependency_in_submit_job_dry_run(self, mock_select):
-        mock_select.return_value = ("rtx_4090", "main", "normal")
+    def test_dependency_in_submit_job_dry_run(self, submission_script):
         result = submit_job(
-            cmd="python eval.py", vram_gb=24,
+            submission_script(24),
             dependency="afterok:99999", dry_run=True,
         )
         assert result.success is True
@@ -1400,7 +1218,7 @@ class TestWaitForJobMocked:
 # Unit Tests: _wait_for_running (mocked)
 # ============================================================
 
-class _RemovedRawSubmitWaitTests:
+class TestWaitForRunningMocked:
     def _make_job_result(self, job_id=12345):
         return JobResult(
             success=True, job_id=job_id,
@@ -1415,7 +1233,7 @@ class _RemovedRawSubmitWaitTests:
         mock_status.return_value = JobStatus(
             job_id=12345, state="RUNNING", node="ise-6000p-01",
         )
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=60)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=60)
         assert outcome == "running"
         assert result.success is True
         assert "RUNNING" in result.message
@@ -1429,7 +1247,7 @@ class _RemovedRawSubmitWaitTests:
             JobStatus(job_id=12345, state="PENDING", reason="Resources"),
             JobStatus(job_id=12345, state="RUNNING", node="cs-4090-01"),
         ]
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=300)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=300)
         assert outcome == "running"
         assert result.success is True
         assert "RUNNING" in result.message
@@ -1442,7 +1260,7 @@ class _RemovedRawSubmitWaitTests:
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="QOSMaxGRESPerAccount",
         )
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=300)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=300)
         assert outcome == "quota"
         assert result.success is False
         assert "QOSMaxGRESPerAccount" in result.message
@@ -1455,7 +1273,7 @@ class _RemovedRawSubmitWaitTests:
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="QOSMaxGRESPerUser",
         )
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=300)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=300)
         assert outcome == "user_quota"
         assert result.success is False
         assert "per-user limit" in result.message
@@ -1469,7 +1287,7 @@ class _RemovedRawSubmitWaitTests:
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="DependencyNeverSatisfied",
         )
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=300)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=300)
         assert outcome == "fatal"
         assert result.success is False
         assert "DependencyNeverSatisfied" in result.message
@@ -1480,7 +1298,7 @@ class _RemovedRawSubmitWaitTests:
         mock_status.return_value = JobStatus(
             job_id=12345, state="FAILED", exit_code=1, finished=True,
         )
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=300)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=300)
         assert outcome == "finished"
         assert result.success is False
         assert "FAILED" in result.message
@@ -1491,7 +1309,7 @@ class _RemovedRawSubmitWaitTests:
         mock_status.return_value = JobStatus(
             job_id=12345, state="CANCELLED", finished=True,
         )
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=300)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=300)
         assert outcome == "finished"
         assert result.success is False
         assert "CANCELLED" in result.message
@@ -1505,7 +1323,7 @@ class _RemovedRawSubmitWaitTests:
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="Resources",
         )
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=300)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=300)
         assert outcome == "still_pending"
         assert result.success is True  # job is still alive
         assert "still pending" in result.message
@@ -1519,24 +1337,23 @@ class _RemovedRawSubmitWaitTests:
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="Priority",
         )
-        result, outcome = _wait_for_running(self._make_job_result(), timeout=300)
+        result, outcome = _wait_for_running(self._make_job_result(), preemption_safe=True, timeout=300)
         assert outcome == "still_pending"
         assert "Priority" in result.message
 
     @patch("slurm_mcp.shell._run")
     @patch("slurm_mcp.submission.time.sleep")
     @patch("slurm_mcp.monitoring.get_job_status")
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_submit_job_with_wait_until_running(self, mock_select, mock_status, mock_sleep, mock_run):
+    @pytest.mark.usefixtures("available_golden_gpu")
+    def test_submit_job_with_wait_until_running(self, mock_status, mock_sleep, mock_run, submission_script):
         """Integration test: submit_job with wait_until_running=True."""
-        mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
         mock_run.return_value = "Submitted batch job 12345\n"
         mock_status.side_effect = [
             JobStatus(job_id=12345, state="PENDING", reason="Resources"),
             JobStatus(job_id=12345, state="RUNNING", node="ise-6000-01"),
         ]
         result = submit_job(
-            cmd="python train.py", vram_gb=48,
+            submission_script(preemption_safe=True),
             wait_until_running=True,
         )
         assert result.success is True
@@ -1547,10 +1364,9 @@ class _RemovedRawSubmitWaitTests:
     @patch("slurm_mcp.submission.time.sleep")
     @patch("slurm_mcp.monitoring.get_job_status")
     @patch("slurm_mcp.shell._run_quiet")
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_submit_job_quota_hit_falls_back_to_normal(self, mock_select, mock_rq, mock_status, mock_sleep, mock_run):
+    @pytest.mark.usefixtures("available_golden_gpu")
+    def test_submit_job_quota_hit_falls_back_to_normal(self, mock_rq, mock_status, mock_sleep, mock_run, submission_script):
         """Quota hit on golden -> cancel, resubmit on normal QoS, then runs."""
-        mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
         # First sbatch (golden), then second sbatch (fallback)
         mock_run.side_effect = [
             "Submitted batch job 12345\n",
@@ -1563,44 +1379,44 @@ class _RemovedRawSubmitWaitTests:
             JobStatus(job_id=12346, state="RUNNING", node="cs-6000-01"),
         ]
         result = submit_job(
-            cmd="python train.py", vram_gb=48,
-            golden_only=False,  # fallback is opt-in now (default is golden-only)
+            submission_script(preemption_safe=True),
             wait_until_running=True,
         )
         assert result.success is True
         assert result.job_id == 12346
         assert result.qos == "normal"
         assert result.partition == "main"
+        mock_rq.assert_called_once_with(["scancel", "12345"])
+        assert mock_run.call_count == 2
+        assert "#SBATCH --requeue" in result.sbatch_script
 
     @patch("slurm_mcp.shell._run")
     @patch("slurm_mcp.submission.time.sleep")
     @patch("slurm_mcp.monitoring.get_job_status")
     @patch("slurm_mcp.shell._run_quiet")
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_submit_job_user_quota_does_not_fallback(self, mock_select, mock_rq, mock_status, mock_sleep, mock_run):
+    @pytest.mark.usefixtures("available_golden_gpu")
+    def test_submit_job_user_quota_does_not_fallback(self, mock_rq, mock_status, mock_sleep, mock_run, submission_script):
         """QOSMaxGRESPerUser should NOT trigger fallback — it's a per-user limit across all QoS."""
-        mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
         mock_run.return_value = "Submitted batch job 12345\n"
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="QOSMaxGRESPerUser",
         )
         result = submit_job(
-            cmd="python train.py", vram_gb=48,
-            golden_only=False,  # even with fallback allowed, per-user quota must not fall back
+            submission_script(preemption_safe=True),
             wait_until_running=True,
         )
         assert result.success is False
         assert "per-user limit" in result.message
         # Should only have submitted ONCE (no fallback)
         assert mock_run.call_count == 1
+        mock_rq.assert_called_once_with(["scancel", "12345"])
 
     @patch("slurm_mcp.shell._run")
-    @patch("slurm_mcp.selection.select_gpu")
-    def test_submit_job_without_wait_still_works(self, mock_select, mock_run):
+    @pytest.mark.usefixtures("available_golden_gpu")
+    def test_submit_job_without_wait_still_works(self, mock_run, submission_script):
         """submit_job without wait_until_running should return immediately."""
-        mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
         mock_run.return_value = "Submitted batch job 12345\n"
-        result = submit_job(cmd="python train.py", vram_gb=48, wait_until_running=False)
+        result = submit_job(submission_script(preemption_safe=True), wait_until_running=False)
         assert result.success is True
         assert result.job_id == 12345
 
@@ -1608,33 +1424,33 @@ class _RemovedRawSubmitWaitTests:
     @patch("slurm_mcp.submission.time.sleep")
     @patch("slurm_mcp.monitoring.get_job_status")
     @patch("slurm_mcp.shell._run_quiet")
-    def test_golden_only_quota_does_not_cancel(self, mock_rq, mock_status, mock_sleep, mock_time):
-        """golden_only=True: a quota reason leaves the job queued (no scancel)."""
+    def test_unsafe_quota_does_not_cancel(self, mock_rq, mock_status, mock_sleep, mock_time):
+        """preemption_safe=False: a quota reason leaves the job queued (no scancel)."""
         mock_time.side_effect = [0, 301]  # start, past timeout
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="QOSMaxGRESPerAccount",
         )
         result, outcome = _wait_for_running(
-            self._make_job_result(), timeout=300, golden_only=True,
+            self._make_job_result(), timeout=300, preemption_safe=False,
         )
         assert outcome == "still_pending"
         assert result.success is True
-        mock_rq.assert_not_called()  # never scancel a golden_only job for quota
+        mock_rq.assert_not_called()  # leave an unsafe job queued for quota
 
     @patch("slurm_mcp.shell._run")
     @patch("slurm_mcp.submission.time.time")
     @patch("slurm_mcp.submission.time.sleep")
     @patch("slurm_mcp.monitoring.get_job_status")
     @patch("slurm_mcp.shell._run_quiet")
-    def test_submit_job_golden_only_no_fallback(self, mock_rq, mock_status, mock_sleep, mock_time, mock_run):
-        """golden_only=True: golden quota full -> stays queued, NO normal fallback."""
+    def test_submit_job_unsafe_no_fallback(self, mock_rq, mock_status, mock_sleep, mock_time, mock_run, submission_script):
+        """preemption_safe=False: golden quota full -> stays queued, NO normal fallback."""
         mock_time.side_effect = [0, 301]
         mock_run.return_value = "Submitted batch job 12345\n"
         mock_status.return_value = JobStatus(
             job_id=12345, state="PENDING", reason="QOSMaxGRESPerAccount",
         )
         result = submit_job(
-            cmd="python train.py", vram_gb=48, golden_only=True,
+            submission_script(preemption_safe=False),
             wait_until_running=True,
         )
         assert result.qos == "yisroel"
@@ -2118,171 +1934,52 @@ class TestWatchDashboard:
 # Unit Tests: CLI --json output
 # ============================================================
 
-class _RemovedRawSubmitCLIJsonTests:
-    def test_json_dry_run(self):
-        # Pin --gpu-type so the result is deterministic — the subprocess can't
-        # see a mocked select_gpu, and live golden availability shifts underfoot.
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--gpu-type", "rtx_6000", "--vram", "48", "--dry-run", "--json",
-             "--", "python", "train.py"],
-            capture_output=True, text=True, timeout=10,
-        )
-        assert result.returncode == 0
-        import json
-        data = json.loads(result.stdout)
-        assert data["success"] is True
-        assert data["gpu_type"] == "rtx_6000"
-        assert "sbatch_script" in data
-
-    def test_json_golden_only_is_default(self):
-        """golden-only is the default: dedicated partition + yisroel QoS, no flag."""
-        import subprocess, json
-        result = subprocess.run(
-            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--gpu-type", "rtx_4090", "--vram", "24",
-             "--dry-run", "--json", "--", "python", "train.py"],
-            capture_output=True, text=True, timeout=10,
-        )
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
-        assert data["success"] is True
-        assert data["partition"] == "rtx4090"
-        assert data["qos"] == "yisroel"
-
-    def test_json_allow_main_restores_fallback(self):
-        """--allow-main opts a non-owned card back onto main/normal."""
-        import subprocess, json
-        result = subprocess.run(
-            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--gpu-type", "rtx_4090", "--vram", "24", "--allow-main",
-             "--dry-run", "--json", "--", "python", "train.py"],
-            capture_output=True, text=True, timeout=10,
-        )
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
-        assert data["success"] is True
-        assert data["partition"] == "main"
-        assert data["qos"] == "normal"
-
-    def _submit(self, *args, env=None, stdin=None):
-        import subprocess
-        full = dict(os.environ)
-        full.update(env or {})
+class TestCLIJson:
+    def _submit(self, script_path, *options, script_args=()):
         return subprocess.run(
-            [sys.executable,
-             os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--gpu-type", "rtx_4090", "--vram", "24", "--dry-run", "--json",
-             *args, "--", "python", "train.py"],
-            capture_output=True, text=True, timeout=10,
-            input=stdin, env=full,
+            [sys.executable, "-m", "cli.submit",
+             "--dry-run", "--json", *options, "--", script_path, *script_args],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            capture_output=True, text=True, timeout=30,
         )
 
-    def test_json_golden_only_flag_is_explicit(self):
-        """--golden-only says out loud what the default policy already does."""
-        import json
-        result = self._submit("--golden-only")
-        assert result.returncode == 0
-        data = json.loads(result.stdout)
-        assert (data["partition"], data["qos"]) == ("rtx4090", "yisroel")
-
-    def test_the_two_pool_flags_are_mutually_exclusive(self):
-        result = self._submit("--golden-only", "--allow-main")
-        assert result.returncode != 0
-        assert "not allowed with" in result.stderr
-
-    @pytest.mark.parametrize("policy,expected", [
-        ("golden_only", ("rtx4090", "yisroel")),
-        ("allow_main", ("main", "normal")),
-    ])
-    def test_the_cli_follows_the_policy(self, policy, expected):
-        import json
-        result = self._submit(env={"SLURM_GOLDEN_POLICY": policy})
+    def test_json_dry_run(self, submission_script):
+        path = submission_script()
+        result = self._submit(path, script_args=["--lr", "two words"])
         assert result.returncode == 0, result.stderr
         data = json.loads(result.stdout)
-        assert (data["partition"], data["qos"]) == expected
+        assert data["success"] is True
+        assert data["job_id"] is None
+        assert data["gpu_type"] == "rtx_6000"
+        assert f"{path} --lr 'two words'" in data["sbatch_script"]
 
-    def test_an_explicit_flag_beats_the_policy(self):
-        import json
-        result = self._submit("--golden-only",
-                              env={"SLURM_GOLDEN_POLICY": "allow_main"})
+    def test_json_cpu_job(self, submission_script):
+        result = self._submit(submission_script(0))
+        assert result.returncode == 0, result.stderr
         data = json.loads(result.stdout)
-        assert (data["partition"], data["qos"]) == ("rtx4090", "yisroel")
+        assert data["success"] is True
+        assert data["partition"] == "cpu"
+        assert data["gpu_type"] == "cpu"
 
-    def test_ask_without_a_tty_errors_instead_of_hanging(self):
-        """stdin is a pipe here, so a prompt would block forever."""
-        result = self._submit(env={"SLURM_GOLDEN_POLICY": "ask"}, stdin="")
+    def test_json_submission_failure(self, tmp_path):
+        result = self._submit(str(tmp_path / "missing.sh"))
         assert result.returncode == 1
-        assert "--golden-only" in result.stderr and "--allow-main" in result.stderr
-        assert result.stdout.strip() == ""
+        data = json.loads(result.stdout)
+        assert data["success"] is False
+        assert "not a regular file" in data["message"]
 
-    @pytest.mark.parametrize("answer,expected", [
-        ("g\n", ("rtx4090", "yisroel")),
-        ("m\n", ("main", "normal")),
-        ("x\ng\n", ("rtx4090", "yisroel")),      # reprompts, doesn't guess
-    ])
-    def test_ask_prompts_when_a_human_is_there(self, answer, expected):
-        import json, pty, subprocess
-        master, slave = pty.openpty()             # a real tty on stdin
-        try:
-            proc = subprocess.Popen(
-                [sys.executable,
-                 os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-                 "--gpu-type", "rtx_4090", "--vram", "24", "--dry-run", "--json",
-                 "--", "python", "train.py"],
-                stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, env=dict(os.environ, SLURM_GOLDEN_POLICY="ask"),
-            )
-            os.write(master, answer.encode())
-            out, err = proc.communicate(timeout=10)
-        finally:
-            os.close(master)
-            os.close(slave)
-        assert proc.returncode == 0, err
-        assert "[g/m]" in err, "the prompt belongs on stderr, not in --json stdout"
-        data = json.loads(out)
-        assert (data["partition"], data["qos"]) == expected
-
-    def test_ask_does_not_prompt_for_a_cpu_job(self):
-        """golden_only means nothing for a CPU job, so the question is noise."""
-        import json, subprocess
-        env = dict(os.environ, SLURM_GOLDEN_POLICY="ask")
-        result = subprocess.run(
-            [sys.executable,
-             os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--vram", "0", "--dry-run", "--json", "--", "echo", "hi"],
-            capture_output=True, text=True, timeout=10, input="", env=env,
-        )
+    def test_after_shorthand_builds_afterok(self, submission_script):
+        result = self._submit(submission_script(), "--after", "111", "222")
         assert result.returncode == 0, result.stderr
-        assert json.loads(result.stdout)["partition"] == "cpu"
-
-    def test_after_shorthand_builds_afterok(self):
-        """--after 111 222 -> #SBATCH --dependency=afterok:111:222 in the script."""
-        import subprocess, json
-        result = subprocess.run(
-            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--gpu-type", "rtx_6000", "--vram", "48", "--after", "111", "222",
-             "--dry-run", "--json", "--", "python", "train.py"],
-            capture_output=True, text=True, timeout=10,
-        )
-        assert result.returncode == 0
         data = json.loads(result.stdout)
         assert "#SBATCH --dependency=afterok:111:222" in data["sbatch_script"]
 
-    def test_after_and_dependency_conflict_errors(self):
-        """--after and --dependency together is a user error (non-zero exit)."""
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "cli", "submit.py"),
-             "--gpu-type", "rtx_6000", "--vram", "48",
-             "--after", "111", "--dependency", "afterany:222",
-             "--dry-run", "--json", "--", "python", "train.py"],
-            capture_output=True, text=True, timeout=10,
+    def test_after_and_dependency_conflict_errors(self, submission_script):
+        result = self._submit(
+            submission_script(), "--after", "111", "--dependency", "afterany:222",
         )
         assert result.returncode != 0
         assert "not both" in result.stderr
-
 
 # ============================================================
 # Unit Tests: refactored slurm_mcp.diagnose_job / job_history
@@ -2346,7 +2043,7 @@ class TestDiagnoseAndHistoryRefactor:
 # Unit Tests: the 7 new CLI subcommands (parity with MCP tools)
 # ============================================================
 
-class _RemovedRawSubmitCLITests:
+class TestCLI:
     def test_all_registered_in_parser(self):
         from cli import slurmx
         parser = slurmx.build_parser()
@@ -2821,49 +2518,32 @@ class TestSelectGPULive:
 
 
 @live
-class _RemovedRawSubmitLiveTests:
-    def test_dry_run_48gb(self):
-        result = submit_job(
-            cmd="echo hello",
-            vram_gb=48,
-            dry_run=True,
-        )
-        # Should succeed (dry run) or fail with "not free" — both are valid
+class TestSubmitJobLive:
+    def test_dry_run_48gb(self, submission_script):
+        path = submission_script(preemption_safe=True)
+        result = submit_job(path, dry_run=True)
         if result.success:
             assert result.gpu_type in GPU_BY_NAME
             assert GPU_BY_NAME[result.gpu_type].vram_gb >= 48
-            assert "echo hello" in result.sbatch_script
+            assert path in result.sbatch_script
+        else:
+            assert "No GPU configuration can satisfy 48GB" in result.message
 
-    def test_dry_run_with_all_options(self):
+    def test_dry_run_with_all_options(self, submission_script, tmp_path):
+        path = submission_script(preemption_safe=True)
         result = submit_job(
-            cmd="python train.py --lr 1e-4",
-            vram_gb=48,
-            job_name="test-all-opts",
-            num_gpus=1,
-            workdir="/tmp",
-            output_dir="/tmp",
-            dry_run=True,
+            path, args=["--lr", "1e-4"], job_name="test-all-opts",
+            workdir=str(tmp_path), output_dir=str(tmp_path), dry_run=True,
         )
         if result.success:
             assert "#SBATCH --job-name test-all-opts" in result.sbatch_script
             assert "#SBATCH --mem=80G" in result.sbatch_script
             assert "#SBATCH --time 7-0:00:00" in result.sbatch_script
             assert "SCRATCH_DIR" in result.sbatch_script
-            assert "cd /tmp" in result.sbatch_script
-            assert "/tmp/slurm-test-all-opts-%J.out" in result.sbatch_script
-
-    def test_dry_run_manual_gpu_type(self):
-        result = submit_job(
-            cmd="echo test",
-            vram_gb=0,
-            gpu_type="rtx_4090",
-            dry_run=True,
-        )
-        assert result.success is True
-        assert result.gpu_type == "rtx_4090"
-        assert "#SBATCH --gres=gpu:rtx_4090:1" in result.sbatch_script
-        assert "#SBATCH --nodes=1" in result.sbatch_script
-
+            assert f"cd {tmp_path}" in result.sbatch_script
+            assert f"{tmp_path}/slurm-test-all-opts-%J.out" in result.sbatch_script
+        else:
+            assert "No GPU configuration can satisfy 48GB" in result.message
 
 @live
 class TestMyJobsLive:

@@ -62,13 +62,11 @@ MAIL_TYPE = (
     if _mail_type_env else _from_config("MAIL_TYPE", list(MAIL_TYPE_DEFAULT))
 )
 
-# Default for legacy advisory selection. Submitted scripts declare their own
-# preemption policy in their required slurmx metadata header.
+# Retained legacy setting. Current submission and recommendation tools ignore
+# it; submitted scripts declare their policy in the required metadata header.
 GOLDEN_POLICIES = ("golden_only", "allow_main", "ask")
 GOLDEN_POLICY_DEFAULT = "allow_main"
-# The env override is read here rather than in the templates, because a
-# config.py written before this key exists still needs a way to set the policy
-# for one shell (a non-interactive script under the 'ask' policy, say).
+# Keep reading old config values and the env override for the config editor.
 _golden_policy = (os.environ.get("SLURM_GOLDEN_POLICY")
                   or _from_config("GOLDEN_POLICY", GOLDEN_POLICY_DEFAULT))
 # A hand-edited typo falls back to the default. `slurmx config` warns when that happens.
