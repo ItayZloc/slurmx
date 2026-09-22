@@ -27,11 +27,9 @@ GOLDEN_QOS = [
     for q in os.environ.get("SLURM_GOLDEN_QOS", "yisroel").split(",")
     if q.strip()
 ]
-# What submit_job / `slurmx submit` do when golden_only isn't passed:
-#   "golden_only" - preemption-immune; queue on golden rather than downgrade
-#   "allow_main"  - golden first, then the preemptible main pool
-#   "ask"         - refuse to guess: Claude has to ask you, the CLI prompts
-GOLDEN_POLICY = "golden_only"
+# Legacy default for advisory selection. Submit scripts declare their own
+# preemption policy in their required slurmx metadata header.
+GOLDEN_POLICY = "allow_main"
 
 # --- Excluded nodes ---
 # Nodes to exclude from job placement (sbatch --exclude). Override via

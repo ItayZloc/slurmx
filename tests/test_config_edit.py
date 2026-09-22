@@ -1103,7 +1103,7 @@ class TestGoldenPolicyField:
         import config_defaults
         doc = cm.load(write(tmp_path, MANGLED))
         assert doc.slots["GOLDEN_POLICY"].provenance == "absent"
-        assert doc.display_value("GOLDEN_POLICY") == "golden_only"
+        assert doc.display_value("GOLDEN_POLICY") == "allow_main"
         assert doc.value("GOLDEN_POLICY") == config_defaults.GOLDEN_POLICY_DEFAULT
 
     def test_absent_is_tagged_default_in_both_surfaces(self, tmp_path):

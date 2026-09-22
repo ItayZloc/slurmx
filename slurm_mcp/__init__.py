@@ -25,7 +25,8 @@ from .shell import _run, _run_quiet
 from .availability import check_availability, golden_queue, golden_queues
 from .selection import select_gpu
 from .submission import (
-    submit_job, resolve_golden_only, ASK_POLICY_MESSAGE,
+    submit_job, parse_script_metadata, ScriptMetadata, resolve_golden_only,
+    ASK_POLICY_MESSAGE,
     _build_sbatch_script, _wait_for_running,
 )
 from .jobs import my_jobs, cancel_jobs, squeue_me

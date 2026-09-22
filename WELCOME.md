@@ -4,17 +4,15 @@
 
 WHAT IT DOES
   Lets Claude Code (and you) submit, monitor, and manage SLURM GPU jobs
-  through a small set of MCP tools and CLI commands. Auto-picks the
-  smallest GPU that fits your VRAM budget, prefers golden tickets, and
-  falls back to cluster-wide.
+  through a small set of MCP tools and CLI commands. Submission scripts
+  declare GPU needs and preemption safety in a required metadata header.
 
 MCP TOOLS (invoked by Claude in chat)
   cluster_summary          your jobs + golden + cluster-wide GPU view
                            (lists pending jobs by user, in order, when a ticket is full)
-  submit_job               submit GPU/CPU jobs (auto-selects GPU by VRAM;
-                           an omitted golden_only follows your GOLDEN_POLICY,
-                           and under the "ask" policy Claude has to ask you
-                           first; blocks until the job is RUNNING)
+  submit_job               submit an executable metadata-bearing script;
+                           its header selects GPU/CPU resources and the
+                           preemption policy; blocks until it is RUNNING
   select_gpu               recommend a GPU for a VRAM requirement (advisory;
                            reports the non-golden pick, so it can differ
                            from what a default submit_job uses)
@@ -33,10 +31,9 @@ CLI COMMANDS
                              slurmx status                live colorized dashboard
                                                           (--once for a text snapshot;
                                                            -n N sets refresh seconds)
-                             slurmx submit [opts] -- CMD  submit a job (pool from
-                                                          GOLDEN_POLICY; --after JOBID
-                                                          to chain, --golden-only or
-                                                          --allow-main to pick a pool)
+                             slurmx submit [opts] -- SCRIPT [ARG ...]
+                                                          submit a metadata-bearing script;
+                                                          --after JOBID chains jobs
                              slurmx select-gpu --vram N   recommend a GPU
                              slurmx job-status ID         status of one job (alias: job)
                              slurmx wait ID               block until a job finishes
@@ -66,8 +63,6 @@ NEXT STEPS
   server with Claude Code. Anything it couldn't finish is listed under
   "DO THIS NEXT" below this page — that list is the authoritative one.
 
-  1. Run `slurmx config` to check MAIL_USER, MAIL_TYPE, your GOLDEN_QOS list
-     and GOLDEN_POLICY (set it to "ask" if you want to be asked, per job,
-     whether a job may land on the preemptible main pool).
+  1. Run `slurmx config` to check MAIL_USER, MAIL_TYPE, and your GOLDEN_QOS list.
   2. Check it talks to SLURM:  slurmx status --once
   3. Start a session: `claude` — then ask "show me a cluster summary".

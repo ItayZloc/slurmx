@@ -19,40 +19,9 @@ from cli import render
 from config_defaults import GOLDEN_POLICY
 from mcp.server.fastmcp import FastMCP
 
-# What the agent is told about the golden ticket, per configured policy. The
-# rule has to match the gate in slurm_mcp.submission, or the agent learns the
-# tool's behaviour by being refused.
-_GOLDEN_RULE = {
-    "golden_only": (
-        "- Golden-only is the DEFAULT (golden_only=true): jobs run preemption-immune on the\n"
-        "  golden partition and queue there if it's full, never dropping to the preemptible\n"
-        "  main pool. Pass golden_only=false only when the user explicitly wants to burst onto\n"
-        "  the shared main pool. Ignored for CPU jobs."
-    ),
-    "allow_main": (
-        "- The main-pool fallback is the DEFAULT here (golden_only=false): jobs take a golden\n"
-        "  slot when one is free and drop to the preemptible main pool when it isn't, so they\n"
-        "  start sooner but can be evicted. Pass golden_only=true for training the user does\n"
-        "  not want preempted. Ignored for CPU jobs."
-    ),
-    "ask": (
-        "- There is NO default pool on this cluster: ask the user whether to run golden-only\n"
-        "  (preemption-immune, queues when the golden ticket is full) or to allow the\n"
-        "  preemptible main pool, then pass golden_only=true or golden_only=false explicitly.\n"
-        "  A submit_job call that omits golden_only is refused, dry runs included. Ignored for\n"
-        "  CPU jobs, which never need the question."
-    ),
-}
-
-
 def build_instructions(policy: str = GOLDEN_POLICY) -> str:
-    """The server instructions, with the golden-ticket rule set by the policy.
-
-    A parameter rather than an inline f-string so all three variants are
-    testable without reimporting the module.
-    """
-    return _INSTRUCTIONS.format(
-        golden_rule=_GOLDEN_RULE.get(policy, _GOLDEN_RULE["golden_only"]))
+    """Return static submission guidance; policy now comes from script metadata."""
+    return _INSTRUCTIONS
 
 
 _INSTRUCTIONS = """\
@@ -63,13 +32,13 @@ Check with MCP cluster_summary or squeue, not ps aux.
 
 ### Key Rules
 - Always use dry_run=true first to preview the sbatch script before submitting.
-- For submit_job: always specify vram_gb — never pick GPU types manually unless
-  the user asks.
-- Default to 1 GPU. Use num_gpus=2 only when the user explicitly requests multi-GPU
-  or the workload requires it (e.g. model too large for a single card).
-  Max 2 GPUs per cluster policy; more comes back as success: false.
-{golden_rule}
-- For multi-GPU training, use `torchrun --nproc_per_node=2 train.py` as the command.
+- submit_job accepts only an executable script path and its arguments. The script
+  must put a strict `# slurmx: {...}` JSON header immediately after its shebang.
+  Its total_vram_gb, supports_gpu_sharding, and preemption_safe values select
+  resources and preemption behavior. Do not request a GPU, pool, or QoS directly.
+- Preemption-safe GPU jobs search live golden capacity first and then main. Unsafe
+  jobs are golden-only and queue if necessary. CPU jobs use the configured CPU pool.
+- Use a metadata-bearing wrapper script for shell pipelines or compound commands.
 - Maintenance windows are enforced automatically — job time limits are capped to finish
   before scheduled maintenance. If a window is imminent (<5 min), submissions are blocked.
 - Do NOT write raw sbatch scripts or Python code that imports slurm_mcp — always use MCP tools.
@@ -376,15 +345,13 @@ def diagnose_job(job_id: int, output_dir: str = "logs", log_lines: int = 50) -> 
 
 @mcp.tool()
 def submit_job(
-    cmd: str,
-    vram_gb: int,
+    script_path: str,
+    args: list[str] | None = None,
     job_name: str | None = None,
-    num_gpus: int = 1,
     workdir: str | None = None,
     output_dir: str = "logs",
-    gpu_type: str | None = None,
-    golden_only: bool | None = None,
     dependency: str | None = None,
+    wait_until_running: bool = True,
     dry_run: bool = False,
 ) -> str:
     """Submit a SLURM batch job and wait for it to start running.
@@ -480,16 +447,13 @@ def submit_job(
             the "ask" policy it is refused like a real submission.
     """
     result = slurm_mcp.submit_job(
-        cmd=cmd,
-        vram_gb=vram_gb,
+        script_path=script_path,
+        args=args,
         job_name=job_name,
-        num_gpus=num_gpus,
         workdir=workdir,
         output_dir=output_dir,
-        gpu_type=gpu_type,
-        golden_only=golden_only,
         dependency=dependency,
-        wait_until_running=not dry_run,  # don't block on dry runs
+        wait_until_running=wait_until_running and not dry_run,
         dry_run=dry_run,
     )
 

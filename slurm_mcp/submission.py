@@ -1,477 +1,213 @@
-"""Job submission — sbatch script generation, submit + poll, golden -> normal
-QoS fallback when quota hits."""
+"""Metadata-aware SLURM job submission and sbatch script generation."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import json
 import os
+from pathlib import Path
 import re
+import shlex
 import tempfile
 import time
-from typing import Optional
 
-from config import (
-    CPU_MEM, CPU_CPUS,
-    EXCLUDE_NODES, MAIL_USER, MAX_MEM_GB, START_TIMEOUT, TIME_LIMIT,
-)
-from config_defaults import CPU_PARTITION, CPU_QOS, GOLDEN_POLICY, MAIL_TYPE
+from config import CPU_CPUS, CPU_MEM, EXCLUDE_NODES, MAIL_USER, MAX_MEM_GB, START_TIMEOUT, TIME_LIMIT
+from config_defaults import CPU_PARTITION, CPU_QOS, MAIL_TYPE
 from maintenance import cap_time_limit
 
-from . import availability, monitoring, selection, shell
-from .gpu_catalog import GPU_BY_NAME, GPU_TYPES, PRIMARY_QOS
-from .monitoring import (
-    _FINISHED_STATES, _QOS_QUOTA_REASONS,
-    _UNRECOVERABLE_REASONS, _USER_QUOTA_REASONS,
-)
+from . import monitoring, shell
+from .monitoring import _FINISHED_STATES, _UNRECOVERABLE_REASONS
+from .selection import GPUChoice, select_resources
 from .types import JobResult
 
 
-_CPU_PARTITION = CPU_PARTITION
-_CPU_QOS = CPU_QOS
-_CPU_MEM = CPU_MEM
-_CPU_CPUS = CPU_CPUS
+_METADATA_KEYS = {"total_vram_gb", "supports_gpu_sharding", "preemption_safe"}
+# Kept as import compatibility for older callers of this private policy helper.
+# Submission no longer accepts a pool policy from callers.
+ASK_POLICY_MESSAGE = "Submission pool policy is declared in the script metadata header."
 
 
-ASK_POLICY_MESSAGE = (
-    "GOLDEN_POLICY is 'ask': this config requires an explicit choice. Ask the "
-    "user whether to run golden-only (preemption-immune, queues when the golden "
-    "ticket is full) or to allow the preemptible main pool, then call again with "
-    "golden_only=true or golden_only=false. `slurmx config` changes the policy."
-)
+def resolve_golden_only(golden_only: bool | None) -> bool | None:
+    """Legacy helper retained for import compatibility; not used by submission."""
+    return golden_only
 
 
-def resolve_golden_only(golden_only: Optional[bool]) -> Optional[bool]:
-    """The effective golden_only for a job.
+@dataclass(frozen=True)
+class ScriptMetadata:
+    total_vram_gb: int
+    supports_gpu_sharding: bool
+    preemption_safe: bool
 
-    The policy is a default, not a rule: an explicit argument always wins, so a
-    one-off "burst this onto main" doesn't mean editing config.py. None comes
-    back only under the 'ask' policy, meaning the caller has to choose.
-    """
-    if golden_only is not None:
-        return golden_only
-    if GOLDEN_POLICY == "ask":
-        return None
-    return GOLDEN_POLICY == "golden_only"
+
+def _json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key")
+        result[key] = value
+    return result
+
+
+def parse_script_metadata(script_path: str) -> tuple[ScriptMetadata | None, str | None]:
+    """Read and validate the mandatory SLURMx header in an executable script."""
+    path = Path(script_path)
+    if not path.is_file():
+        return None, f"Script is not a regular file: {path}"
+    if not os.access(path, os.X_OK):
+        return None, f"Script is not executable: {path}"
+    try:
+        with path.open(encoding="utf-8") as script:
+            if not script.readline().startswith("#!"):
+                return None, "Script must start with a shebang."
+            header = script.readline()
+    except OSError as exc:
+        return None, f"Could not read script: {exc}"
+    prefix = "# slurmx: "
+    if not header.startswith(prefix):
+        return None, "Script must put its slurmx metadata immediately after the shebang."
+    try:
+        values = json.loads(header[len(prefix):].rstrip("\n"), object_pairs_hook=_json_object)
+    except (json.JSONDecodeError, ValueError):
+        return None, "slurmx metadata must be strict JSON."
+    if not isinstance(values, dict) or set(values) != _METADATA_KEYS:
+        return None, "slurmx metadata must contain exactly total_vram_gb, supports_gpu_sharding, and preemption_safe."
+    total_vram_gb = values["total_vram_gb"]
+    if type(total_vram_gb) is not int or total_vram_gb < 0:
+        return None, "slurmx metadata total_vram_gb must be a non-negative integer."
+    for key in ("supports_gpu_sharding", "preemption_safe"):
+        if type(values[key]) is not bool:
+            return None, f"slurmx metadata {key} must be a boolean."
+    if total_vram_gb == 0 and values["supports_gpu_sharding"]:
+        return None, "slurmx metadata cannot enable GPU sharding for a CPU job."
+    return ScriptMetadata(**values), None
 
 
 def _build_sbatch_script(
-    cmd: str,
-    partition: str,
-    qos: str,
-    gpu_type: str,
-    num_gpus: int,
-    job_name: str,
-    output_path: str,
-    workdir: Optional[str],
-    dependency: Optional[str] = None,
+    cmd: str, partition: str, qos: str, gpu_type: str, num_gpus: int,
+    job_name: str, output_path: str, workdir: str | None,
+    preemption_safe: bool, dependency: str | None = None,
 ) -> str:
-    """Generate a sbatch script following the lab's conventions."""
-    is_cpu = not gpu_type
-
+    """Generate a batch script that preserves the header's preemption policy."""
     lines = [
-        "#!/bin/bash",
-        "",
-        "### --- Slurm Job Configuration ---",
-        "",
-        f"#SBATCH --partition {partition}",
-        f"#SBATCH --qos={qos}",
+        "#!/bin/bash", "", "### --- Slurm Job Configuration ---", "",
+        f"#SBATCH --partition {partition}", f"#SBATCH --qos={qos}",
         f"#SBATCH --time {cap_time_limit(TIME_LIMIT, dependency)}",
-        f"#SBATCH --job-name {job_name}",
-        f"#SBATCH --output {output_path}",
+        f"#SBATCH --job-name {job_name}", f"#SBATCH --output {output_path}",
+        "#SBATCH --requeue" if preemption_safe else "#SBATCH --no-requeue",
     ]
-
-    if is_cpu:
-        lines.append(f"#SBATCH --cpus-per-task={_CPU_CPUS}")
-        lines.append(f"#SBATCH --mem={_CPU_MEM}")
+    if preemption_safe:
+        lines.append("#SBATCH --signal=B:USR1@120")
+    if gpu_type:
+        lines += [f"#SBATCH --gres=gpu:{gpu_type}:{num_gpus}", "#SBATCH --nodes=1", f"#SBATCH --mem={MAX_MEM_GB}G"]
     else:
-        lines.append(f"#SBATCH --gres=gpu:{gpu_type}:{num_gpus}")
-        lines.append(f"#SBATCH --nodes=1")
-        lines.append(f"#SBATCH --mem={MAX_MEM_GB}G")
-
+        lines += [f"#SBATCH --cpus-per-task={CPU_CPUS}", f"#SBATCH --mem={CPU_MEM}"]
     if EXCLUDE_NODES:
         lines.append(f"#SBATCH --exclude={','.join(EXCLUDE_NODES)}")
-
     if dependency:
         lines.append(f"#SBATCH --dependency={dependency}")
-
-    # MAIL_TYPE = [] or ["NONE"] means no mail at all, and an empty MAIL_USER
-    # would emit a bare `--mail-user=`, which SLURM rejects. Either way, omit
-    # both lines rather than writing a half-configured pair.
-    mail_types = [t for t in MAIL_TYPE if t and t.upper() != "NONE"]
-    lines.append("")
+    mail_types = [item for item in MAIL_TYPE if item and item.upper() != "NONE"]
     if MAIL_USER and mail_types:
-        lines.append(f"#SBATCH --mail-user={MAIL_USER}")
-        lines.append(f"#SBATCH --mail-type={','.join(mail_types)}")
-
+        lines += [f"#SBATCH --mail-user={MAIL_USER}", f"#SBATCH --mail-type={','.join(mail_types)}"]
     lines += [
-        "",
-        "################ Following lines will be executed by the compute node ################",
-        "",
-        "# --- Scratch directory (fallback to /tmp if /scratch unavailable) ---",
+        "", "# --- Scratch directory (fallback to /tmp if /scratch unavailable) ---",
         "export SCRATCH_DIR=/scratch/$USER/$SLURM_JOB_ID",
         'mkdir -p "$SCRATCH_DIR" 2>/dev/null || { export SCRATCH_DIR=/tmp/$USER/slurm_$SLURM_JOB_ID; mkdir -p "$SCRATCH_DIR"; }',
-        "trap 'rm -rf \"$SCRATCH_DIR\"' EXIT",
-        "",
+        "trap 'rm -rf \"$SCRATCH_DIR\"' EXIT", "",
     ]
-
     log_dir = os.path.dirname(output_path)
     if log_dir and log_dir != ".":
-        lines.append(f'mkdir -p "{log_dir}"')
-        lines.append("")
-
+        lines += [f'mkdir -p "{log_dir}"', ""]
     if workdir:
-        lines.append(f"cd {workdir}")
-        lines.append("")
+        lines += [f"cd {shlex.quote(workdir)}", ""]
+    if preemption_safe:
+        lines += [
+            f"{cmd} &", "child_pid=$!",
+            "trap 'kill -USR1 \"$child_pid\" 2>/dev/null || true' USR1",
+            "trap 'kill -TERM \"$child_pid\" 2>/dev/null || true' TERM",
+            "while true; do", "  wait \"$child_pid\"", "  status=$?",
+            "  kill -0 \"$child_pid\" 2>/dev/null || break", "done", "exit \"$status\"",
+        ]
+    else:
+        lines.append(cmd)
+    return "\n".join(lines) + "\n"
 
-    lines.append(cmd)
-    lines.append("")
-    return "\n".join(lines)
 
-
-def _wait_for_running(
-    job_result: JobResult, timeout: int, golden_only: bool = False,
-) -> tuple[JobResult, str]:
-    """
-    Poll a submitted job until it reaches RUNNING state or hits an issue.
-
-    Outcomes: "running", "finished", "fatal", "quota", "user_quota", "still_pending".
-
-    When golden_only=True, quota-limit reasons (golden partition full) do NOT
-    cancel the job — it is left queued and reported as "still_pending" so it
-    starts automatically when a golden slot frees. Unrecoverable reasons
-    (e.g. InvalidQOS) still cancel as usual.
-    """
-    poll_interval = 5
+def _wait_for_running(job_result: JobResult, timeout: int) -> tuple[JobResult, str]:
+    """Poll until a job starts, finishes, is fatal, or stays pending."""
     start = time.time()
-
     while True:
         status = monitoring.get_job_status(job_result.job_id)
-
         if status.state == "RUNNING":
-            job_result.message = (
-                f"Job {job_result.job_id} is RUNNING on {status.node}"
-            )
+            job_result.message = f"Job {job_result.job_id} is RUNNING on {status.node}"
             return job_result, "running"
-
         if status.state in _FINISHED_STATES:
             job_result.success = False
-            job_result.message = (
-                f"Job {job_result.job_id} ended before running: "
-                f"{status.state} (exit_code={status.exit_code})"
-            )
+            job_result.message = f"Job {job_result.job_id} ended before running: {status.state} (exit_code={status.exit_code})"
             return job_result, "finished"
-
         if status.reason in _UNRECOVERABLE_REASONS:
             shell._run_quiet(["scancel", str(job_result.job_id)])
             job_result.success = False
-            job_result.message = (
-                f"Job {job_result.job_id} cancelled — fatal error: "
-                f"{status.reason}"
-            )
+            job_result.message = f"Job {job_result.job_id} cancelled - fatal error: {status.reason}"
             return job_result, "fatal"
-
-        if status.reason in _USER_QUOTA_REASONS and not golden_only:
-            shell._run_quiet(["scancel", str(job_result.job_id)])
-            job_result.success = False
-            job_result.message = (
-                f"Job {job_result.job_id} cancelled — per-user limit: "
-                f"{status.reason}. You have too many GPUs allocated "
-                f"across all partitions. Wait for running jobs to "
-                f"finish or cancel some."
-            )
-            return job_result, "user_quota"
-
-        if status.reason in _QOS_QUOTA_REASONS and not golden_only:
-            shell._run_quiet(["scancel", str(job_result.job_id)])
-            job_result.success = False
-            job_result.message = (
-                f"Job {job_result.job_id} cancelled — quota limit: "
-                f"{status.reason}"
-            )
-            return job_result, "quota"
-
         elapsed = time.time() - start
         if timeout > 0 and elapsed >= timeout:
-            reason_str = status.reason or "unknown"
-            job_result.message = (
-                f"Job {job_result.job_id} still pending after {int(elapsed)}s "
-                f"(reason: {reason_str}). Job remains queued."
-            )
+            job_result.message = f"Job {job_result.job_id} still pending after {int(elapsed)}s (reason: {status.reason or 'unknown'}). Job remains queued."
             return job_result, "still_pending"
+        time.sleep(5)
 
-        time.sleep(poll_interval)
 
-
-def _do_submit(
-    script: str,
-    gpu_type: str,
-    partition: str,
-    qos: str,
-) -> JobResult:
-    """Write script to temp file, submit via sbatch, return JobResult."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".sh", prefix="slurm-submit-",
-        dir="/tmp", delete=False
-    ) as f:
-        f.write(script)
-        tmpfile = f.name
-
+def _do_submit(script: str, choice: GPUChoice | None, partition: str, qos: str) -> JobResult:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", prefix="slurm-submit-", dir="/tmp", delete=False) as handle:
+        handle.write(script)
+        tmpfile = handle.name
+    gpu_type = choice.gpu_type if choice else "cpu"
     try:
         os.chmod(tmpfile, 0o755)
-        result = shell._run(["sbatch", tmpfile])
-        m = re.search(r"(\d+)", result)
-        job_id = int(m.group(1)) if m else None
-        return JobResult(
-            success=True,
-            job_id=job_id,
-            gpu_type=gpu_type,
-            partition=partition,
-            qos=qos,
-            message=result.strip(),
-            sbatch_script=script,
-        )
-    except RuntimeError as e:
-        return JobResult(
-            success=False,
-            job_id=None,
-            gpu_type=gpu_type,
-            partition=partition,
-            qos=qos,
-            message=str(e),
-            sbatch_script=script,
-        )
+        message = shell._run(["sbatch", tmpfile])
+        match = re.search(r"(\d+)", message)
+        return JobResult(True, int(match.group(1)) if match else None, gpu_type, partition, qos, message.strip(), script)
+    except RuntimeError as exc:
+        return JobResult(False, None, gpu_type, partition, qos, str(exc), script)
     finally:
         os.unlink(tmpfile)
 
 
+def _failure(message: str) -> JobResult:
+    return JobResult(False, None, "", "", "", message, "")
+
+
 def submit_job(
-    cmd: str,
-    vram_gb: int,
-    job_name: Optional[str] = None,
-    num_gpus: int = 1,
-    workdir: Optional[str] = None,
+    script_path: str,
+    args: list[str] | None = None,
+    job_name: str | None = None,
+    workdir: str | None = None,
     output_dir: str = "logs",
-    gpu_type: Optional[str] = None,
-    qos: Optional[str] = None,
-    golden_only: Optional[bool] = None,
-    dependency: Optional[str] = None,
+    dependency: str | None = None,
     wait_until_running: bool = True,
     dry_run: bool = False,
 ) -> JobResult:
-    """
-    Smart job submission. Auto-selects GPU based on VRAM if gpu_type not specified.
-
-    Every job automatically gets a scratch directory at /scratch/$USER/$SLURM_JOB_ID,
-    exported as $SCRATCH_DIR. It is cleaned up when the job finishes.
-
-    Args:
-        cmd: Command to run on the compute node (e.g., "python train.py --lr 1e-4")
-        vram_gb: GPU VRAM needed in GB
-        job_name: Job name (default: first word of cmd)
-        num_gpus: Number of GPUs (default: 1)
-        workdir: Working directory on compute node
-        output_dir: Directory for SLURM log files (default: "logs")
-        gpu_type: Override automatic GPU selection
-        qos: Override automatic QoS selection
-        golden_only: If True, force the golden ticket — qos=yisroel on the card's
-            dedicated per-GPU partition (preemption-immune) — and NEVER fall back
-            to the preemptible main pool. The job is left queued if the golden
-            partition is saturated (starts automatically as slots free) instead of
-            being downgraded. Overrides `qos`. Ignored for CPU jobs (vram_gb=0).
-            False takes the golden-first-then-main fallback. Leave it None (the
-            default) to resolve from config's GOLDEN_POLICY; under the 'ask'
-            policy a None here refuses the submission with ASK_POLICY_MESSAGE
-            rather than guessing.
-        dependency: Job dependency expression (e.g., "afterok:12345")
-        wait_until_running: If True, poll until the job reaches RUNNING state.
-            On quota limits (e.g., golden tickets full), auto-cancels and
-            retries on normal QoS. On benign pending (e.g., Resources),
-            returns without cancelling — job stays queued. Only cancels
-            on truly unrecoverable errors. (default: True)
-        dry_run: If True, return the script without submitting
-
-    Returns:
-        JobResult with success status, job_id, and the generated script.
-    """
-    if not job_name:
-        first_word = cmd.strip().split()[0] if cmd.strip() else "job"
-        job_name = os.path.basename(first_word).replace(".", "-")
-
-    if num_gpus > 2:
-        return JobResult(False, None, "", "", "",
-                         f"num_gpus={num_gpus} exceeds cluster limit of 2 GPUs per job.", "")
-
-    # CPU-only job (vram_gb=0 and no explicit GPU requested). An explicit
-    # gpu_type means the caller wants that card even if vram_gb was left at 0,
-    # so fall through to the GPU path in that case.
-    is_cpu_job = vram_gb == 0 and not gpu_type
-
-    effective = resolve_golden_only(golden_only)
-    if effective is None and not is_cpu_job:
-        # Policy 'ask'. Refuse before anything is built, dry runs included: the
-        # whole point is that the caller asks the user first, and the dry run is
-        # the first call it makes. CPU jobs are exempt — golden_only means
-        # nothing for them, so asking would be noise.
-        return JobResult(False, None, "", "", "", ASK_POLICY_MESSAGE, "")
-    golden_only = bool(effective)
-
-    if is_cpu_job:
-        selected_gpu = ""
-        selected_partition = _CPU_PARTITION
-        selected_qos = _CPU_QOS
-
-        output_path = os.path.join(output_dir, f"slurm-{job_name}-%J.out")
-        script = _build_sbatch_script(
-            cmd=cmd,
-            partition=selected_partition,
-            qos=selected_qos,
-            gpu_type=selected_gpu,
-            num_gpus=0,
-            job_name=job_name,
-            output_path=output_path,
-            workdir=workdir,
-            dependency=dependency,
-        )
-
-        if dry_run:
-            return JobResult(
-                success=True, job_id=None,
-                gpu_type="cpu", partition=selected_partition,
-                qos=selected_qos,
-                message=f"[DRY RUN] Would submit CPU job to {selected_partition}/{selected_qos}",
-                sbatch_script=script,
-            )
-
-        job_result = _do_submit(script, "cpu", selected_partition, selected_qos)
-        if not job_result.success:
-            return job_result
-
-        if wait_until_running and job_result.job_id is not None:
-            job_result, outcome = _wait_for_running(job_result, START_TIMEOUT)
-
-        return job_result
-
-    # GPU selection
-    if gpu_type:
-        if gpu_type not in GPU_BY_NAME:
-            return JobResult(False, None, gpu_type, "", "",
-                             f"Unknown GPU type: {gpu_type}. "
-                             f"Valid: {', '.join(GPU_BY_NAME.keys())}", "")
-
-        gpu_info = GPU_BY_NAME[gpu_type]
-        if gpu_info.vram_gb < vram_gb:
-            return JobResult(False, None, gpu_type, "", "",
-                             f"{gpu_type} has {gpu_info.vram_gb}GB VRAM, "
-                             f"but {vram_gb}GB requested", "")
-
-        if golden_only:
-            if not gpu_info.golden_partition:
-                return JobResult(False, None, gpu_type, "", "",
-                                 f"golden_only=True but {gpu_type} has no golden "
-                                 f"partition configured.", "")
-            selected_qos = PRIMARY_QOS
-            selected_partition = gpu_info.golden_partition
-        else:
-            if qos:
-                selected_qos = qos
-            elif gpu_info.golden_quota > 0:
-                selected_qos = PRIMARY_QOS
-            else:
-                selected_qos = "normal"
-
-            if selected_qos == PRIMARY_QOS and gpu_info.golden_partition:
-                selected_partition = gpu_info.golden_partition
-            else:
-                selected_partition = "main"
-
-        selected_gpu = gpu_type
+    """Submit only an executable script whose metadata selects its resources."""
+    resolved_path = os.path.abspath(script_path if os.path.isabs(script_path) else os.path.join(workdir or os.getcwd(), script_path))
+    metadata, error = parse_script_metadata(resolved_path)
+    if error:
+        return _failure(error)
+    assert metadata is not None
+    job_name = job_name or Path(resolved_path).stem.replace(".", "-") or "job"
+    command = shlex.join([resolved_path, *(args or [])])
+    if metadata.total_vram_gb == 0:
+        choice = None
+        partition, qos = CPU_PARTITION, CPU_QOS
     else:
-        sel = selection.select_gpu(vram_gb, golden_only=golden_only)
-        if sel is None:
-            capable_gpus = [g for g in GPU_TYPES if g.vram_gb >= vram_gb]
-            if not capable_gpus:
-                max_gpu = max(GPU_TYPES, key=lambda g: g.vram_gb)
-                msg_parts = [
-                    f"No GPU type has >= {vram_gb}GB VRAM.",
-                    f"Maximum available: {max_gpu.vram_gb}GB ({max_gpu.name}).",
-                ]
-            else:
-                avail = availability.check_availability()
-                msg_parts = [f"No GPU with >= {vram_gb}GB VRAM is currently free."]
-                msg_parts.append("")
-                msg_parts.append("Current availability:")
-                for gpu in capable_gpus:
-                    golden = avail.golden.get(gpu.name)
-                    cluster = avail.cluster.get(gpu.name)
-                    golden_str = f"golden: {golden.free}/{golden.total}" if golden else "no golden"
-                    cluster_str = f"cluster: {cluster.free}/{cluster.total}" if cluster else "N/A"
-                    msg_parts.append(f"  {gpu.name} ({gpu.vram_gb}GB): {golden_str}, {cluster_str}")
-
-            return JobResult(False, None, "", "", "", "\n".join(msg_parts), "")
-
-        selected_gpu, selected_partition, selected_qos = sel
-
-    if qos and not gpu_type and not golden_only:
-        selected_qos = qos
-        gpu_info = GPU_BY_NAME[selected_gpu]
-        if selected_qos == PRIMARY_QOS and gpu_info.golden_partition:
-            selected_partition = gpu_info.golden_partition
-        else:
-            selected_partition = "main"
-
+        choice = select_resources(metadata.total_vram_gb, metadata.supports_gpu_sharding, metadata.preemption_safe)
+        if choice is None:
+            return _failure(f"No GPU configuration can satisfy {metadata.total_vram_gb}GB under this script's policy.")
+        partition, qos = choice.partition, choice.qos
     output_path = os.path.join(output_dir, f"slurm-{job_name}-%J.out")
-
-    script = _build_sbatch_script(
-        cmd=cmd,
-        partition=selected_partition,
-        qos=selected_qos,
-        gpu_type=selected_gpu,
-        num_gpus=num_gpus,
-        job_name=job_name,
-        output_path=output_path,
-        workdir=workdir,
-        dependency=dependency,
-    )
-
+    script = _build_sbatch_script(command, partition, qos, choice.gpu_type if choice else "", choice.num_gpus if choice else 0, job_name, output_path, workdir, metadata.preemption_safe, dependency)
+    gpu_type = choice.gpu_type if choice else "cpu"
     if dry_run:
-        return JobResult(
-            success=True,
-            job_id=None,
-            gpu_type=selected_gpu,
-            partition=selected_partition,
-            qos=selected_qos,
-            message=f"[DRY RUN] Would submit to {selected_gpu} "
-                    f"(partition={selected_partition}, qos={selected_qos})",
-            sbatch_script=script,
-        )
-
-    job_result = _do_submit(script, selected_gpu, selected_partition, selected_qos)
-    if not job_result.success:
-        return job_result
-
-    if wait_until_running and job_result.job_id is not None:
-        job_result, outcome = _wait_for_running(
-            job_result, START_TIMEOUT, golden_only=golden_only,
-        )
-
-        if outcome == "user_quota":
-            return job_result
-
-        if outcome == "quota" and selected_qos == PRIMARY_QOS and not golden_only:
-            fallback_script = _build_sbatch_script(
-                cmd=cmd, partition="main", qos="normal",
-                gpu_type=selected_gpu, num_gpus=num_gpus,
-                job_name=job_name, output_path=output_path,
-                workdir=workdir, dependency=dependency,
-            )
-            job_result = _do_submit(
-                fallback_script, selected_gpu, "main", "normal",
-            )
-            if not job_result.success:
-                return job_result
-
-            if job_result.job_id is not None:
-                job_result, outcome = _wait_for_running(
-                    job_result, START_TIMEOUT,
-                )
-
-    return job_result
+        return JobResult(True, None, gpu_type, partition, qos, "[DRY RUN] Would submit job", script)
+    result = _do_submit(script, choice, partition, qos)
+    if result.success and wait_until_running and result.job_id is not None:
+        result, _ = _wait_for_running(result, START_TIMEOUT)
+    return result
