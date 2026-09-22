@@ -107,6 +107,17 @@ def test_probe_ignores_unrelated_cpu_job_detail_mismatch(monkeypatch):
     assert "candidate: node=node-a gpu=rtx_6000" in probe_preemption()
 
 
+def test_probe_uses_plain_single_node_listing_without_hostnames_query(monkeypatch):
+    """A plain node name needs no per-job scheduler expansion to prove disjointness."""
+    from slurm_mcp.preemption import probe_preemption
+
+    responses = _scan_responses()
+    responses[JOB_LIST] = "21545493|probe-user|normal|RUNNING|cpu-a\n"
+    _reply(monkeypatch, responses)
+
+    assert "candidate: node=node-a gpu=rtx_6000" in probe_preemption()
+
+
 @pytest.mark.parametrize("job_id,state", [("garbage", "RUNNING"), ("21455143", "RUNNIGN")])
 def test_probe_refuses_malformed_unrelated_running_job_row(monkeypatch, job_id, state):
     """An invalid listing cannot establish that a candidate node is empty."""

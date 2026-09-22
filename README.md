@@ -149,7 +149,8 @@ Before submitting the victim, it rechecks isolation: the node must be in `main` 
 the chosen golden partition, have exactly one free GPU of that type, be in a
 known usable state, and have no running job of any QoS. This includes CPU-only
 work and existing golden jobs. The scan includes hidden partitions and resolves
-compressed node lists. It checks node occupancy from the running-job listing,
+compressed node lists, while plain single-node names need no extra scheduler
+query. It checks node occupancy from the running-job listing,
 without requiring detailed records for jobs on other nodes. An unreadable job
 listing or node list refuses the probe. It cross-checks `squeue` against
 `scontrol` for its own victim, using the array task's numeric job ID, and fails

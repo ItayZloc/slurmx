@@ -284,6 +284,8 @@ def _node_is_usable(state: str) -> bool:
 def _expand_nodelist(value: str, budget: _Budget | None = None) -> set[str]:
     if not value or any(char.isspace() or ord(char) < 32 for char in value):
         raise _QueryFailure("unsafe or empty scheduler nodelist")
+    if _SAFE_ATOM.fullmatch(value):
+        return {value}
     nodes = {line.strip() for line in _required(("scontrol", "show", "hostnames", value), budget).splitlines() if line.strip()}
     if not nodes or any(not _SAFE_ATOM.fullmatch(node) for node in nodes):
         raise _QueryFailure("unparseable expanded scheduler nodelist")
