@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -11,6 +13,12 @@ NODES_ONE_FREE = "NodeName=node-a State=MIXED Partitions=main,rtx6000 Gres=gpu:r
 NODES_FULL = "NodeName=node-a State=ALLOCATED Partitions=main,rtx6000 Gres=gpu:rtx_6000:2 GresUsed=gpu:rtx_6000:2\n"
 NO_JOBS = ""
 VICTIM_RUNNING = "101|probe-user|normal|RUNNING|node-a|gpu:rtx_6000:1\n"
+JOB_LIST = ("squeue", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")
+NODE_DETAIL = ("scontrol", "show", "node", "-d", "-o")
+
+
+def _job_detail(job_id, user, qos, state, nodes, tres_job="gres/gpu:rtx_6000=1", tres_node=""):
+    return f"JobId={job_id} UserId={user}(1) QOS={qos} JobState={state} NodeList={nodes} TresPerJob={tres_job} TresPerNode={tres_node} AllocTRES={tres_job}\n"
 
 
 def _reply(monkeypatch, responses):
@@ -35,10 +43,18 @@ def _reply(monkeypatch, responses):
 
 
 def _scan_responses(nodes=NODES_ONE_FREE, jobs=NO_JOBS):
-    return {
-        ("scontrol", "show", "node", "-o"): nodes,
-        ("squeue", "-h", "-o", "%i|%u|%q|%T|%N|%b"): jobs,
+    responses = {
+        ("scontrol", "show", "config"): CONFIG,
+        ("sacctmgr", "-nP", "show", "qos", "format=Name,Preempt,PreemptMode,GraceTime"): QOS,
+        NODE_DETAIL: nodes,
+        JOB_LIST: NO_JOBS,
     }
+    if jobs:
+        job_id, user, qos, state, node, _gpu = jobs.strip().split("|")
+        responses[JOB_LIST] = "|".join((job_id, user, qos, state, node)) + "\n"
+        responses[("scontrol", "show", "job", "-o", job_id)] = _job_detail(job_id, user, qos, state, node)
+        responses[("scontrol", "show", "hostnames", node)] = node + "\n"
+    return responses
 
 
 def test_preemption_info_parses_controller_and_qos_settings(monkeypatch):
@@ -57,7 +73,7 @@ def test_preemption_info_parses_controller_and_qos_settings(monkeypatch):
     assert "PreemptParameters: send_user_signal" in result
     assert "JobRequeue: 1" in result
     assert "KillWait: 30" in result
-    assert "normal: preempts <none>; PreemptMode=REQUEUE; GraceTime=0" in result
+    assert "normal: preempts <none configured>; PreemptMode=REQUEUE; GraceTime=0" in result
     assert "yisroel: preempts normal; PreemptMode=REQUEUE; GraceTime=120" in result
 
 
@@ -110,88 +126,47 @@ def test_probe_dry_run_reports_internal_pinning_scripts_and_evidence(monkeypatch
     assert "#SBATCH --nodelist=node-a" in result
     assert "#SBATCH --qos=normal" in result
     assert "#SBATCH --qos=yisroel" in result
-    assert "safety evidence: one free rtx_6000 GPU; no running normal-QoS GPU job" in result
+    assert "safety evidence: one free GPU; no running QoS that the primary golden QoS can preempt" in result
     assert not any(command[0] == "sbatch" for command in calls)
 
 
-def test_probe_rechecks_after_victim_and_refuses_a_race(monkeypatch, tmp_path):
-    """A second normal job after victim start must prevent the preemptor submit."""
-    from slurm_mcp.preemption import probe_preemption
+def test_victim_verification_requires_exact_identity_owner_qos_node_state_and_gpu(monkeypatch):
+    """Relaxing any post-victim identity field would allow an unrelated job to trigger preemption."""
+    from slurm_mcp.preemption import _Candidate, _Job, _Policy, _verify_victim
 
-    responses = _scan_responses()
-    responses[("sbatch",)] = "101;cluster\n"
-    responses[("squeue", "-h", "-j", "101", "-o", "%i|%u|%q|%T|%N|%b")] = VICTIM_RUNNING
-    responses[("scontrol", "show", "node", "-o")] = [NODES_ONE_FREE, NODES_ONE_FREE, NODES_FULL]
-    responses[("squeue", "-h", "-o", "%i|%u|%q|%T|%N|%b")] = [NO_JOBS, NO_JOBS, VICTIM_RUNNING + "102|other|normal|RUNNING|node-a|gpu:rtx_6000:1\n"]
-    responses[("squeue", "-h", "-j", "101", "-o", "%i|%u|%q")] = "101|probe-user|normal\n"
-    responses[("scancel", "101")] = ""
-    calls = _reply(monkeypatch, responses)
-    monkeypatch.setattr("slurm_mcp.preemption.PROBE_ROOT", tmp_path)
-    monkeypatch.setattr("slurm_mcp.preemption.os.environ", {"USER": "probe-user"})
+    victim = _Job("101", "probe-user", "normal", "RUNNING", "node[01-02]", ({"rtx_6000": 1},))
+    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda job_id: [victim])
+    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda _: {"node-01", "node-02"})
+    candidate = _Candidate("node-01", "rtx_6000", "rtx6000")
+    policy = _Policy("normal", frozenset({"normal", "alternate"}))
 
-    result = probe_preemption(dry_run=False, max_seconds=2)
-
-    assert result.startswith("refused: post-victim safety check failed")
-    assert [command[0] for command in calls].count("sbatch") == 1
-    assert [command[0] for command in calls].count("scontrol") == 3
-    assert ["scancel", "101"] in calls
+    assert _verify_victim(101, candidate, policy, "probe-user")
+    assert not _verify_victim(101, candidate, policy, "other-user")
 
 
-def test_probe_records_requeue_measurement_and_cleans_verified_jobs(monkeypatch, tmp_path):
-    """A signal and later heartbeat must produce a one-second-precision estimate."""
-    from slurm_mcp.preemption import probe_preemption
+def test_post_victim_check_refuses_an_alternate_preemptible_race(monkeypatch):
+    """A second QoS in the controller-derived preemptible set blocks the golden submit."""
+    from slurm_mcp.preemption import _Candidate, _Job, _Policy, _post_victim_safe
 
-    responses = _scan_responses()
-    responses[("sbatch",)] = ["101;cluster\n", "102;cluster\n"]
-    responses[("squeue", "-h", "-j", "101", "-o", "%i|%u|%q|%T|%N|%b")] = VICTIM_RUNNING
-    responses[("scontrol", "show", "node", "-o")] = [NODES_ONE_FREE, NODES_ONE_FREE, NODES_FULL]
-    responses[("squeue", "-h", "-o", "%i|%u|%q|%T|%N|%b")] = [NO_JOBS, NO_JOBS, VICTIM_RUNNING]
-    responses[("squeue", "-h", "-j", "101", "-o", "%i|%u|%q")] = "101|probe-user|normal\n"
-    responses[("squeue", "-h", "-j", "102", "-o", "%i|%u|%q")] = "102|probe-user|yisroel\n"
-    responses[("scancel", "101")] = ""
-    responses[("scancel", "102")] = ""
-    calls = _reply(monkeypatch, responses)
-    monkeypatch.setattr("slurm_mcp.preemption.PROBE_ROOT", tmp_path)
-    monkeypatch.setattr("slurm_mcp.preemption.os.environ", {"USER": "probe-user"})
+    jobs = [
+        _Job("101", "probe-user", "normal", "RUNNING", "node-a", ({"rtx_6000": 1},)),
+        _Job("102", "other", "alternate", "RUNNING", "node-a", ({"rtx_6000": 1},)),
+    ]
+    monkeypatch.setattr("slurm_mcp.preemption._node_snapshot", lambda: [{"NodeName": "node-a", "State": "ALLOCATED", "Gres": "gpu:rtx_6000:2", "GresUsed": "gpu:rtx_6000:2"}])
+    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda: jobs)
+    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value: {value})
 
-    written = {"done": False}
-
-    def sleep(_):
-        if not written["done"]:
-            probe_dir = next(tmp_path.iterdir())
-            (probe_dir / "victim-events.log").write_text("heartbeat 100\nsignal USR1 105\nheartbeat 112\nrestart 113\n")
-            written["done"] = True
-
-    monkeypatch.setattr("slurm_mcp.preemption.time.sleep", sleep)
-    result = probe_preemption(dry_run=False, max_seconds=5)
-
-    assert "warning/grace estimate: 7s (one-second precision)" in result
-    assert "victim restart observed" in result
-    assert ["scancel", "101"] in calls
-    assert ["scancel", "102"] in calls
+    assert not _post_victim_safe(_Candidate("node-a", "rtx_6000", "rtx6000"), 101, _Policy("normal", frozenset({"normal", "alternate"})))
 
 
-def test_probe_timeout_cleans_only_verified_disposable_jobs(monkeypatch, tmp_path):
-    """A timeout must not cancel a job whose live owner/QoS check disagrees."""
-    from slurm_mcp.preemption import probe_preemption
+def test_measurement_requires_a_received_preemption_signal(tmp_path):
+    """A restart without TERM/USR1 cannot fabricate a warning/grace interval."""
+    from slurm_mcp.preemption import _measurement
 
-    responses = _scan_responses()
-    responses[("sbatch",)] = ["101;cluster\n", "102;cluster\n"]
-    responses[("squeue", "-h", "-j", "101", "-o", "%i|%u|%q|%T|%N|%b")] = VICTIM_RUNNING
-    responses[("scontrol", "show", "node", "-o")] = [NODES_ONE_FREE, NODES_ONE_FREE, NODES_FULL]
-    responses[("squeue", "-h", "-o", "%i|%u|%q|%T|%N|%b")] = [NO_JOBS, NO_JOBS, VICTIM_RUNNING]
-    responses[("squeue", "-h", "-j", "101", "-o", "%i|%u|%q")] = "101|probe-user|normal\n"
-    responses[("squeue", "-h", "-j", "102", "-o", "%i|%u|%q")] = "102|other-user|yisroel\n"
-    responses[("scancel", "101")] = ""
-    calls = _reply(monkeypatch, responses)
-    monkeypatch.setattr("slurm_mcp.preemption.PROBE_ROOT", tmp_path)
-    monkeypatch.setattr("slurm_mcp.preemption.os.environ", {"USER": "probe-user"})
+    events = tmp_path / "victim-events.log"
+    events.write_text("heartbeat 100\nheartbeat 112\nrestart 113\n")
 
-    result = probe_preemption(dry_run=False, max_seconds=1)
-
-    assert result.startswith("timeout: no requeue signal observed")
-    assert ["scancel", "101"] in calls
-    assert ["scancel", "102"] not in calls
+    assert _measurement(events) == (None, None, True)
 
 
 def test_cli_exposes_inspection_and_dry_run_probe(monkeypatch, capsys):
@@ -244,3 +219,104 @@ def test_mcp_exposes_preemption_operations(monkeypatch):
             sys.modules.pop("server", None)
         else:
             sys.modules["server"] = previous
+
+
+def test_preemption_info_marks_empty_controller_and_qos_values_unavailable(monkeypatch):
+    """Blank controller/QoS fields must not be rendered as known settings."""
+    from slurm_mcp.preemption import preemption_info
+
+    _reply(monkeypatch, {
+        ("scontrol", "show", "config"): "SLURM_VERSION = \nPreemptType = \nPreemptMode = \nPreemptParameters = \nJobRequeue = \nKillWait = \n",
+        ("sacctmgr", "-nP", "show", "qos", "format=Name,Preempt,PreemptMode,GraceTime"): "normal|||\nyisroel|||\n",
+    })
+
+    result = preemption_info()
+
+    assert "PreemptType: unavailable (field missing or empty)" in result
+    assert "normal: preempts <none configured>; PreemptMode=unavailable (unset); GraceTime=unavailable (unset)" in result
+
+
+def test_tres_job_parser_treats_untyped_gpu_as_real_usage_and_rejects_malformed_rows():
+    """Changing a running untyped GPU row into an ignored row would make isolation unsafe."""
+    from slurm_mcp.preemption import _parse_job_rows
+
+    rows = _parse_job_rows("88|other|alternate|RUNNING|node[01-02]|gres/gpu=1|\n")
+
+    assert rows[0].uses_gpu
+    assert rows[0].gpu_sources == ({"": 1},)
+    with pytest.raises(Exception):
+        _parse_job_rows("not a complete scheduler row\n")
+
+
+def test_tres_job_parser_uses_allocated_tres_when_job_and_node_requests_are_empty():
+    """Allocation detail is still GPU use when request-source fields are absent."""
+    from slurm_mcp.preemption import _parse_job_rows
+
+    rows = _parse_job_rows("88|other|alternate|RUNNING|node-a|||gres/gpu=1\n")
+
+    assert rows[0].uses_gpu
+
+
+def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(monkeypatch):
+    """A compressed allocation on the candidate node must block every preemptible QoS."""
+    from slurm_mcp.preemption import _Candidate, _Policy, _find_candidate, _parse_job_rows
+
+    nodes = [{
+        "NodeName": "node-01", "State": "MIXED", "Partitions": "main,rtx6000",
+        "Gres": "gpu:rtx_6000:2", "GresUsed": "gpu:rtx_6000:1",
+    }]
+    jobs = _parse_job_rows("88|other|alternate|RUNNING|node[01-02]|gres/gpu=1|\n")
+    policy = _Policy(victim_qos="normal", preemptible_qos=frozenset({"normal", "alternate"}))
+    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value: {"node-01", "node-02"})
+
+    assert _find_candidate(nodes, jobs, policy) is None
+
+
+@pytest.mark.parametrize("state", ["DOWN", "DRAINING", "FAIL", "MAINT", "NO_RESPOND", "POWER_DOWN", "UNKNOWN"])
+def test_candidate_rejects_non_usable_node_states(state):
+    """A node state outside the explicitly usable set cannot host a probe."""
+    from slurm_mcp.preemption import _node_is_usable
+
+    assert not _node_is_usable(state)
+
+
+def test_candidate_requires_detailed_gres_used_field():
+    """Missing GresUsed must not be interpreted as an unused GPU."""
+    from slurm_mcp.preemption import _Policy, _find_candidate
+
+    nodes = [{"NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000", "Gres": "gpu:rtx_6000:2"}]
+    assert _find_candidate(nodes, [], _Policy("normal", frozenset({"normal"}))) is None
+
+
+def test_authenticated_probe_root_ignores_malicious_home_and_rejects_bad_account_path(monkeypatch):
+    """Inherited HOME must not control a generated SBATCH output directive."""
+    import types
+    from slurm_mcp.preemption import _authenticated_probe_root
+
+    monkeypatch.setattr("slurm_mcp.preemption.os.environ", {"HOME": "/tmp/evil\n#SBATCH --qos=evil"})
+    monkeypatch.setattr("slurm_mcp.preemption.os.getuid", lambda: 123)
+    monkeypatch.setattr("slurm_mcp.preemption.pwd.getpwuid", lambda _: types.SimpleNamespace(pw_name="probe-user", pw_dir="/home/probe-user"))
+    assert _authenticated_probe_root() == "/home/probe-user/.slurmx/probes"
+    monkeypatch.setattr("slurm_mcp.preemption.pwd.getpwuid", lambda _: types.SimpleNamespace(pw_name="probe-user", pw_dir="/home/probe-user\n#SBATCH --qos=evil"))
+    with pytest.raises(Exception):
+        _authenticated_probe_root()
+
+
+def test_victim_script_has_no_time_limit_usr1_and_records_distinct_preemption_signals(tmp_path):
+    """A scheduled time-limit warning would contaminate the preemption measurement."""
+    from slurm_mcp.preemption import _Candidate, _probe_scripts
+
+    victim, _ = _probe_scripts(_Candidate("node-a", "rtx_6000", "rtx6000"), Path("/home/probe-user/.slurmx/probes/example"), max_seconds=600, victim_qos="normal")
+
+    assert "#SBATCH --signal=" not in victim
+    assert "trap 'record_signal TERM; exit 0' TERM" in victim
+    assert "trap 'record_signal USR1' USR1" in victim
+    assert "#SBATCH --time=00:15:00" in victim
+
+
+def test_probe_scripts_reject_directive_injection_from_scheduler_fields():
+    """A malicious scheduler/config value must not become a second SBATCH directive."""
+    from slurm_mcp.preemption import _Candidate, _Refusal, _probe_scripts
+
+    with pytest.raises(_Refusal):
+        _probe_scripts(_Candidate("node-a", "rtx_6000", "rtx6000\n#SBATCH --qos=evil"), Path("/home/probe-user/.slurmx/probes/run"), max_seconds=600, victim_qos="normal")

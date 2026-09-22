@@ -228,9 +228,10 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
 
     Dry run is the default and submits nothing. It reports the isolated node,
     safety evidence, and the two generated scripts. Real mode repeats the
-    safety scan, uses internal node pinning, submits only disposable jobs, and
-    cancels only IDs it can re-verify as owned by this user with the expected
-    QoS. Probe logs are retained under ~/.slurmx/probes/.
+    safety scan, resolves node-list membership, uses internal node pinning,
+    submits only disposable jobs, and cancels only IDs it can re-verify as
+    owned by the authenticated user with the expected QoS. Probe logs are
+    retained under /home/<user>/.slurmx/probes/ rather than inherited $HOME.
 
     Args:
         dry_run: Keep true unless a real scheduler diagnostic is authorized.

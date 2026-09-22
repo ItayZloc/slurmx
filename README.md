@@ -132,8 +132,8 @@ preemption policy.
 
 `preemption_info` (or `slurmx preemption-info`) is read-only. It reports the
 controller's preemption settings and the normal plus configured golden QoS
-relationships. A query that fails is labeled unavailable, so an empty-looking
-result never implies a default policy.
+relationships. Query failures, missing values, and unset QoS fields are shown
+separately, so an empty-looking result never implies a default policy.
 
 `probe_preemption` is a scheduler diagnostic, not a normal submission path.
 It defaults to dry run and reports a candidate node, safety evidence, and its
@@ -146,12 +146,16 @@ slurmx probe-preemption --real --max-seconds 600
 
 Real mode is only appropriate after an explicit decision to test the scheduler.
 It rechecks isolation before each submission: the node must be in `main` and
-the chosen golden partition, have exactly one free GPU of that type, and have
-no running normal-QoS GPU job. It pins only its disposable victim and
-preemptor internally; `submit_job` still accepts no caller resource or node
+the chosen golden partition, have exactly one free GPU of that type, be in a
+known usable state, and have no running GPU job in any QoS the primary golden
+QoS can preempt. It resolves compressed node lists and fails closed if the
+scheduler leaves allocation detail unclear. It pins only its disposable victim
+and preemptor internally; `submit_job` still accepts no caller resource or node
 overrides. The probe cancels only created IDs that live scheduler output
-confirms belong to the current user with the expected QoS. Its scripts and
-event logs stay in `~/.slurmx/probes/` for diagnosis.
+confirms belong to the authenticated user with the expected QoS. Its scripts
+and event logs use the authenticated account's fixed
+`/home/<user>/.slurmx/probes/` directory, not `$HOME`, and remain there for
+diagnosis.
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
 card's pending GPUs by user in dispatch order — like the Running block but
