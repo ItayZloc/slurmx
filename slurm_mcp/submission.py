@@ -80,7 +80,7 @@ def parse_script_metadata(script_path: str) -> tuple[ScriptMetadata | None, str 
 def _build_sbatch_script(
     cmd: str, partition: str, qos: str, gpu_type: str, num_gpus: int,
     job_name: str, output_path: str, workdir: str | None,
-    preemption_safe: bool, dependency: str | None = None,
+    preemption_safe: bool = False, dependency: str | None = None,
 ) -> str:
     """Generate a batch script that preserves the header's preemption policy."""
     lines = [

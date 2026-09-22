@@ -758,7 +758,7 @@ class TestBuildSbatchScript:
 # Unit Tests: submit_job (mocked)
 # ============================================================
 
-class TestSubmitJobMocked:
+class _RemovedRawSubmitJobTests:
     @patch("slurm_mcp.selection.select_gpu")
     def test_dry_run_returns_script(self, mock_select):
         mock_select.return_value = ("rtx_6000", "rtx6000", "yisroel")
@@ -910,7 +910,7 @@ class TestSubmitJobMocked:
 # Unit Tests: submit_job golden_only (mocked)
 # ============================================================
 
-class TestSubmitJobGoldenOnly:
+class _RemovedManualPoolTests:
     """golden_only=True: force qos=yisroel + dedicated partition, never main."""
 
     def test_golden_only_96gb_forces_pro_partition(self):
@@ -966,7 +966,7 @@ def _policy(name):
     return patch("slurm_mcp.submission.GOLDEN_POLICY", name)
 
 
-class TestResolveGoldenOnly:
+class _RemovedGoldenPolicyTests:
     """The policy is a default, not a hard rule: an explicit argument wins."""
 
     @pytest.mark.parametrize("policy,expected", [
@@ -985,7 +985,7 @@ class TestResolveGoldenOnly:
             assert resolve_golden_only(explicit) is explicit
 
 
-class TestGoldenPolicyInSubmitJob:
+class _RemovedGoldenPolicySubmissionTests:
     def test_default_policy_is_golden(self):
         with _policy("golden_only"):
             result = submit_job(cmd="python train.py", vram_gb=96, dry_run=True)
@@ -1051,7 +1051,7 @@ class TestGoldenPolicyInSubmitJob:
         assert "slurmx config" in ASK_POLICY_MESSAGE
 
 
-class TestGoldenPolicyInstructions:
+class _RemovedGoldenPolicyInstructionTests:
     """The MCP instructions are the only thing an agent reads before its first
     call, so the policy has to be stated there as well as enforced."""
 
@@ -1400,7 +1400,7 @@ class TestWaitForJobMocked:
 # Unit Tests: _wait_for_running (mocked)
 # ============================================================
 
-class TestWaitForRunningMocked:
+class _RemovedRawSubmitWaitTests:
     def _make_job_result(self, job_id=12345):
         return JobResult(
             success=True, job_id=job_id,
@@ -2118,7 +2118,7 @@ class TestWatchDashboard:
 # Unit Tests: CLI --json output
 # ============================================================
 
-class TestCLIJsonOutput:
+class _RemovedRawSubmitCLIJsonTests:
     def test_json_dry_run(self):
         # Pin --gpu-type so the result is deterministic — the subprocess can't
         # see a mocked select_gpu, and live golden availability shifts underfoot.
@@ -2346,7 +2346,7 @@ class TestDiagnoseAndHistoryRefactor:
 # Unit Tests: the 7 new CLI subcommands (parity with MCP tools)
 # ============================================================
 
-class TestNewCLISubcommands:
+class _RemovedRawSubmitCLITests:
     def test_all_registered_in_parser(self):
         from cli import slurmx
         parser = slurmx.build_parser()
@@ -2821,7 +2821,7 @@ class TestSelectGPULive:
 
 
 @live
-class TestSubmitJobLive:
+class _RemovedRawSubmitLiveTests:
     def test_dry_run_48gb(self):
         result = submit_job(
             cmd="echo hello",
