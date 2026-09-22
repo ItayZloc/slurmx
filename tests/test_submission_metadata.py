@@ -19,6 +19,7 @@ _config.CPU_CPUS = 4
 _config.GOLDEN_QOS = ["yisroel"]
 _config.EXCLUDE_NODES = []
 _config.GPU_DEFINITIONS = [
+    ("rtx_pro_6000", "RTX Pro 6000", 96, 16, "rtx_pro_6000"),
     ("rtx_6000", "RTX 6000", 48, 12, "rtx6000"),
     ("rtx_3090", "RTX 3090", 24, 0, "rtx3090"),
 ]
@@ -151,16 +152,16 @@ def test_sharded_choice_rejects_fragmented_cards_and_uses_viable_larger_card(mon
         lambda: _availability(
             cluster={
                 "rtx_3090": GPUAvailability("rtx_3090", 9, 0, 2),
-                "rtx_6000": GPUAvailability("rtx_6000", 8, 0, 1),
+                "rtx_pro_6000": GPUAvailability("rtx_pro_6000", 8, 0, 1),
             },
-            node_free={"main": {"rtx_3090": 1, "rtx_6000": 1}},
+            node_free={"main": {"rtx_3090": 1, "rtx_pro_6000": 1}},
         ),
     )
 
     result = submit_job(str(script), dry_run=True)
 
     assert result.success
-    assert result.gpu_type == "rtx_6000"
+    assert result.gpu_type == "rtx_pro_6000"
 
 
 def test_unsafe_job_queues_on_best_golden_candidate_without_availability(monkeypatch, tmp_path):
@@ -204,6 +205,20 @@ def test_submission_rejects_directive_injection(tmp_path):
     assert result.message == "job_name cannot contain control characters."
 
 
+def test_submission_rejects_shell_and_dependency_injection(tmp_path):
+    """Directive fields reject shell syntax and non-SLURM dependency text."""
+    script = _script(
+        tmp_path,
+        '# slurmx: {"total_vram_gb": 0, "supports_gpu_sharding": false, "preemption_safe": true}',
+    )
+
+    dependency = submit_job(str(script), dependency="afterok:12 unexpected", dry_run=True)
+    output = submit_job(str(script), output_dir="logs$(printf unexpected)", dry_run=True)
+
+    assert dependency.message == "dependency must be a SLURM dependency token."
+    assert output.message == "output_dir contains unsafe path characters."
+
+
 def test_mcp_and_cli_expose_script_arguments_without_resource_flags(monkeypatch):
     """The public adapters cannot reintroduce a raw-command submission bypass."""
     mcp_module = types.ModuleType("mcp")
@@ -236,3 +251,4 @@ def test_mcp_and_cli_expose_script_arguments_without_resource_flags(monkeypatch)
     assert parsed.script == ["--", "./job.sh", "--epochs", "3"]
     with __import__("pytest").raises(SystemExit):
         parser.parse_args(["--vram", "48", "--", "./job.sh"])
+    monkeypatch.delitem(sys.modules, "server", raising=False)

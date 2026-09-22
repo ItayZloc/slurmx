@@ -31,7 +31,6 @@ from slurm_mcp import (
     get_job_status, read_job_log, wait_for_job, _wait_for_running,
     _FINISHED_STATES, _UNRECOVERABLE_REASONS, _QUOTA_REASONS,
     _QOS_QUOTA_REASONS, _USER_QUOTA_REASONS,
-    resolve_golden_only, ASK_POLICY_MESSAGE,
 )
 from slurm_mcp.availability import (
     _SINFO_FIELDS, _GOLDEN_FIELDS, _QUEUE_FIELDS, _node_is_usable,

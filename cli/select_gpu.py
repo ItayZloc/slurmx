@@ -24,7 +24,7 @@ def add_arguments(parser):
 
 def _recommend(vram_gb: int, golden_only: bool) -> str:
     if vram_gb == 0:
-        return "CPU-only job — no GPU needed. Use `slurmx submit --vram 0 -- <cmd>`."
+        return "CPU-only work uses a script whose slurmx header sets total_vram_gb to 0."
 
     selection = slurm_mcp.select_gpu(vram_gb, golden_only=golden_only)
     avail = slurm_mcp.check_availability()

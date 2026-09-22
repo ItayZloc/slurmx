@@ -38,6 +38,7 @@ def select_resources(
     total_vram_gb: int,
     supports_gpu_sharding: bool,
     preemption_safe: bool,
+    require_node_capacity: bool = True,
 ) -> GPUChoice | None:
     """Choose up to two same-type GPUs using the script's declared policy."""
     candidates = _candidates(total_vram_gb, supports_gpu_sharding)
@@ -52,13 +53,13 @@ def select_resources(
     for gpu, count in candidates:
         golden = avail.golden.get(gpu.name)
         node_free = avail.node_free.get(gpu.golden_partition, {}).get(gpu.name, 0)
-        if golden and golden.free >= count and node_free >= count and gpu.golden_partition:
+        if golden and golden.free >= count and (not require_node_capacity or node_free >= count) and gpu.golden_partition:
             return GPUChoice(gpu.name, count, gpu.golden_partition, PRIMARY_QOS)
 
     for gpu, count in candidates:
         cluster = avail.cluster.get(gpu.name)
         node_free = avail.node_free.get(MAIN_PARTITION, {}).get(gpu.name, 0)
-        if cluster and cluster.free >= count and node_free >= count:
+        if cluster and cluster.free >= count and (not require_node_capacity or node_free >= count):
             return GPUChoice(gpu.name, count, MAIN_PARTITION, "normal")
     return None
 
@@ -67,6 +68,7 @@ def select_gpu(vram_gb: int, golden_only: bool = False):
     """Backward-compatible advisory one-GPU selection."""
     choice = select_resources(
         vram_gb, supports_gpu_sharding=False, preemption_safe=not golden_only,
+        require_node_capacity=False,
     )
     if choice is None:
         return None

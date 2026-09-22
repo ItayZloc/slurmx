@@ -97,7 +97,7 @@ def select_gpu(vram_gb: int) -> str:
             card short-circuit to the fixed strings above.
     """
     if vram_gb == 0:
-        return "CPU-only job — no GPU needed. Use submit_job with vram_gb=0."
+        return "CPU-only work uses a script whose slurmx header sets total_vram_gb to 0."
 
     selection = slurm_mcp.select_gpu(vram_gb)
     avail = slurm_mcp.check_availability()

@@ -22,6 +22,9 @@ from .types import JobResult
 
 
 _METADATA_KEYS = {"total_vram_gb", "supports_gpu_sharding", "preemption_safe"}
+_JOB_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_PATH_RE = re.compile(r"(?:/|[A-Za-z0-9_.-])+\Z")
+_DEPENDENCY_RE = re.compile(r"(?:singleton|(?:after|afterany|afterok|afternotok|aftercorr):\d+(?::\d+)*)\Z")
 
 
 @dataclass(frozen=True)
@@ -108,7 +111,7 @@ def _build_sbatch_script(
     ]
     log_dir = os.path.dirname(output_path)
     if log_dir and log_dir != ".":
-        lines += [f'mkdir -p "{log_dir}"', ""]
+        lines += [f"mkdir -p {shlex.quote(log_dir)}", ""]
     if workdir:
         lines += [f"cd {shlex.quote(workdir)}", ""]
     if preemption_safe:
@@ -205,6 +208,12 @@ def submit_job(
         error = _directive_value(name, value)
         if error:
             return _failure(error)
+    if not _JOB_NAME_RE.fullmatch(job_name):
+        return _failure("job_name must be a safe single token.")
+    if not _PATH_RE.fullmatch(output_dir):
+        return _failure("output_dir contains unsafe path characters.")
+    if dependency is not None and not _DEPENDENCY_RE.fullmatch(dependency):
+        return _failure("dependency must be a SLURM dependency token.")
     command = shlex.join([resolved_path, *(args or [])])
     if metadata.total_vram_gb == 0:
         choice = None
