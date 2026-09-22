@@ -79,18 +79,9 @@ class _Job:
     qos: str
     state: str
     node_list: str
-    gpu_sources: tuple[dict[str, int], ...]
-    per_node_gpu: dict[str, int] | None = None
-    total_gpu: dict[str, int] | None = None
-    per_node_raw: str | None = None
-    per_job_raw: str | None = None
-    allocated_raw: str | None = None
-
-    @property
-    def uses_gpu(self) -> bool:
-        return any(sum(source.values()) > 0 for source in self.gpu_sources) or any(
-            sum(source.values()) > 0 for source in (self.per_node_gpu, self.total_gpu) if source
-        )
+    per_node_raw: str = ""
+    per_job_raw: str = ""
+    allocated_raw: str = ""
 
 
 def _required(cmd: list[str] | tuple[str, ...], budget: _Budget | None = None) -> str:
@@ -189,7 +180,10 @@ def _gpu_source(value: str) -> dict[str, int] | None:
         else:
             clean = fragment
         if "gpu" not in clean.lower():
-            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_./-]*(?:=|:)[A-Za-z0-9_.+:-]+", clean):
+            if not re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_./-]*(?:=|:)\d+(?:\.\d+)?(?:[KMGTPE](?:i?B)?)?",
+                clean, re.IGNORECASE,
+            ):
                 raise _QueryFailure(f"unparseable allocation fragment: {fragment}")
             continue
         match = re.fullmatch(r"(?:gres/)?gpu(?::([A-Za-z0-9_.-]+))?(?:=|:)(\d+)", clean)
@@ -205,9 +199,9 @@ def _gpu_source(value: str) -> dict[str, int] | None:
     if aggregate is not None and typed and aggregate != sum(typed.values()):
         raise _QueryFailure(f"inconsistent aggregate and typed GPU allocation: {value}")
     if typed:
-        return typed
+        return {gpu_type: count for gpu_type, count in typed.items() if count > 0}
     if aggregate is not None:
-        return {"": aggregate}
+        return {"": aggregate} if aggregate else {}
     return {}
 
 
@@ -236,36 +230,6 @@ def _node_fields(line: str) -> dict[str, str]:
     return dict(re.findall(r"(\w+)=([^\s]+)", line))
 
 
-def _parse_job_rows(raw: str) -> list[_Job]:
-    """Parse complete pipe-delimited job rows used by tests and job details."""
-    rows = []
-    for line in raw.splitlines():
-        if not line.strip():
-            continue
-        fields = [field.strip() for field in line.split("|")]
-        if len(fields) not in {7, 8} or any(not field for field in fields[:5]):
-            raise _QueryFailure("unparseable or incomplete running-job row")
-        parsed = [_gpu_source(value) for value in fields[5:]]
-        if all(source is None for source in parsed):
-            raise _QueryFailure("missing GPU allocation evidence for running job")
-        per_job, per_node = parsed[:2]
-        allocated = parsed[2] if len(parsed) == 3 else None
-        totals = [source for source in (per_job, allocated) if source is not None]
-        total = _normalize_allocation_sources(totals) if totals else None
-        if "[" not in fields[4] and per_node is not None and total is not None and per_node != total:
-            raise _QueryFailure("inconsistent single-node GPU allocation sources for running job")
-        sources = tuple(
-            total if source in totals else source
-            for source in parsed if source is not None
-        )
-        rows.append(_Job(
-            *fields[:5], gpu_sources=sources, per_node_gpu=per_node, total_gpu=total,
-            per_job_raw=fields[5], per_node_raw=fields[6],
-            allocated_raw=fields[7] if len(fields) == 8 else None,
-        ))
-    return rows
-
-
 def _detail_job(listed: list[str], budget: _Budget | None = None) -> _Job:
     if len(listed) != 5 or any(not field.strip() for field in listed):
         raise _QueryFailure("unparseable running-job listing")
@@ -280,10 +244,8 @@ def _detail_job(listed: list[str], budget: _Budget | None = None) -> _Job:
     if (job_id, user, qos, state) != tuple(listed[:4]):
         raise _QueryFailure(f"scheduler detail disagrees with job listing for {listed[0]}")
     values = (detail.get("TresPerJob", ""), detail.get("TresPerNode", ""), detail.get("AllocTRES", ""))
-    if not any(values):
-        raise _QueryFailure(f"missing GPU allocation detail for job {listed[0]}")
     return _Job(
-        job_id, user, qos, state, node_list, (), per_job_raw=values[0],
+        job_id, user, qos, state, node_list, per_job_raw=values[0],
         per_node_raw=values[1], allocated_raw=values[2],
     )
 
@@ -322,10 +284,6 @@ def _expand_nodelist(value: str, budget: _Budget | None = None) -> set[str]:
     return nodes
 
 
-def _job_on_node(job: _Job, node: str, budget: _Budget | None = None) -> bool:
-    return node in _expand_nodelist(job.node_list, budget)
-
-
 def _multiply_allocation(source: dict[str, int], nodes: int) -> dict[str, int]:
     return {gpu_type: count * nodes for gpu_type, count in source.items()}
 
@@ -334,30 +292,36 @@ def _job_gpu_on_nodes(job: _Job, nodes: set[str]) -> dict[str, int]:
     """Return one node's allocation only when scheduler fields prove it."""
     if not nodes:
         raise _QueryFailure("empty scheduler job allocation")
-    if job.per_node_raw is None and job.per_job_raw is None and job.allocated_raw is None:
-        if not job.gpu_sources:
-            raise _QueryFailure("missing GPU allocation evidence for running job")
-        if len({tuple(sorted(source.items())) for source in job.gpu_sources}) != 1:
-            raise _QueryFailure("inconsistent GPU allocation sources for running job")
-        return job.gpu_sources[0]
-
-    per_node = _gpu_source(job.per_node_raw or "")
+    per_node = _gpu_source(job.per_node_raw)
     totals = [
         source for value in (job.per_job_raw, job.allocated_raw)
-        if value is not None and (source := _gpu_source(value or "")) is not None
+        if (source := _gpu_source(value)) is not None
     ]
-    total = _normalize_allocation_sources(totals) if totals else None
-    if per_node is None and total is None:
+    if per_node is None and not totals:
         raise _QueryFailure("missing GPU allocation evidence for running job")
     if per_node is not None:
-        if total is not None and _multiply_allocation(per_node, len(nodes)) != total:
-            raise _QueryFailure("inconsistent per-node and total GPU allocation sources for running job")
-        return per_node
-    if total == {}:
-        return {}
-    if len(nodes) != 1:
+        totals.append(_multiply_allocation(per_node, len(nodes)))
+    total = _normalize_allocation_sources(totals)
+    if per_node is None and total and len(nodes) != 1:
         raise _QueryFailure("cannot attribute a multi-node total GPU allocation to one node")
-    return total or {}
+    if per_node is not None and "" in per_node and len(nodes) > 1 and len(total) > 1:
+        # Mixed job totals do not identify the GPU type placed on each node.
+        return per_node
+    return {gpu_type: count // len(nodes) for gpu_type, count in total.items()}
+
+
+def _node_gpu_allocations(fields: dict[str, str]) -> tuple[dict[str, int], dict[str, int]]:
+    total = _gpu_counts(fields.get("Gres", ""))
+    used = _gpu_counts(fields.get("GresUsed", ""))
+    if "" in total:
+        raise _QueryFailure("node GPU inventory does not identify GPU types")
+    if "" in used:
+        if len(total) != 1:
+            raise _QueryFailure("cannot attribute untyped GPU usage to a node GPU type")
+        used = {next(iter(total)): used[""]}
+    if any(count > total.get(gpu_type, 0) for gpu_type, count in used.items()):
+        raise _QueryFailure("node GPU usage exceeds its typed inventory")
+    return total, used
 
 
 def _job_gpu_on_candidate(job: _Job, node: str, budget: _Budget | None = None) -> dict[str, int] | None:
@@ -391,13 +355,12 @@ def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], policy: _Poli
         node = fields.get("NodeName", "")
         if not _SAFE_ATOM.fullmatch(node) or not _node_is_usable(fields.get("State", "")):
             continue
-        if "GresUsed" not in fields:
-            continue
         partitions = set(fields.get("Partitions", "").split(","))
-        total, used = _gpu_counts(fields.get("Gres", "")), _gpu_counts(fields.get("GresUsed", ""))
-        for gpu_type, golden_partition in golden.items():
-            if MAIN_PARTITION not in partitions or golden_partition not in partitions:
-                continue
+        relevant = {gpu_type: partition for gpu_type, partition in golden.items() if partition in partitions}
+        if MAIN_PARTITION not in partitions or not relevant:
+            continue
+        total, used = _node_gpu_allocations(fields)
+        for gpu_type, golden_partition in relevant.items():
             if total.get(gpu_type, 0) - used.get(gpu_type, 0) != 1:
                 continue
             occupied = False
@@ -483,7 +446,9 @@ def _submit(script: str, path: Path, budget: _Budget) -> int:
 
 
 def _exact_gpu(job: _Job, candidate: _Candidate, nodes: set[str]) -> bool:
-    return _job_gpu_on_nodes(job, nodes) == {candidate.gpu_type: 1}
+    allocation = _job_gpu_on_nodes(job, nodes)
+    # The probe submitted this exact ID with a typed, pinned one-GPU request.
+    return allocation in ({candidate.gpu_type: 1}, {"": 1})
 
 
 def _verify_victim(job_id: int, candidate: _Candidate, policy: _Policy, user: str, budget: _Budget | None = None) -> bool:
@@ -506,8 +471,8 @@ def _post_victim_safe(candidate: _Candidate, victim_id: int, policy: _Policy, bu
     if len(fields) != 1 or not _node_is_usable(fields[0].get("State", "")) or "GresUsed" not in fields[0]:
         return False
     try:
-        total = _gpu_counts(fields[0].get("Gres", "")).get(candidate.gpu_type, 0)
-        used = _gpu_counts(fields[0].get("GresUsed", "")).get(candidate.gpu_type, 0)
+        inventory, usage = _node_gpu_allocations(fields[0])
+        total, used = inventory.get(candidate.gpu_type, 0), usage.get(candidate.gpu_type, 0)
         preemptible = []
         for job in _job_snapshot(budget=budget):
             if job.qos not in policy.preemptible_qos:

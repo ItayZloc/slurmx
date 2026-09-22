@@ -157,6 +157,17 @@ and event logs use the authenticated account's fixed
 `/home/<user>/.slurmx/probes/` directory, not `$HOME`, and remain there for
 diagnosis.
 
+The scan filters node partitions before checking GPU accounting, so CPU nodes
+outside the required partitions do not block a GPU candidate. Relevant nodes
+and jobs must have conclusive allocation evidence; unknown nonempty values
+refuse the probe.
+Per-node requests and job totals must agree after accounting for the expanded
+node count. Matching aggregate and typed GPU counts describe the same GPUs.
+An untyped positive node usage count is usable only when the inventory has one
+GPU type; mixed inventories need typed evidence for positive usage. Victim
+verification accepts a consistent aggregate count of one using the probe's
+submitted typed request, and rejects conflicting counts or types.
+
 `max_seconds` accepts 1 through 3600 and bounds scheduler calls and every
 submission decision. It excludes a separate, fixed five-second cleanup window
 that can only inspect and cancel IDs created by this probe after matching their
