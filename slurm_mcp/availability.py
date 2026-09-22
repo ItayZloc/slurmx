@@ -222,7 +222,7 @@ def _count_gpus(gres: str) -> dict:
     return counts
 
 
-def _cluster_availability() -> dict:
+def _cluster_availability() -> tuple[dict, dict]:
     """{gpu_type -> GPUAvailability} for the cluster.
 
     `total` counts only GPUs a job could actually land on: the node has to sit in
@@ -249,6 +249,7 @@ def _cluster_availability() -> dict:
         entry["partitions"].add(partition.rstrip("*"))
 
     total, alloc, offline = {}, {}, {}
+    node_free = {}
     offline_nodes = {}
     for node, e in sorted(nodes.items()):
         if not e["partitions"] & allowed:
@@ -257,9 +258,14 @@ def _cluster_availability() -> dict:
         if not counts:
             continue
         if _node_is_usable(e["state"]):
+            used = _count_gpus(e["gres_used"])
             for gtype, n in counts.items():
                 total[gtype] = total.get(gtype, 0) + n
-            for gtype, n in _count_gpus(e["gres_used"]).items():
+                free = max(0, n - used.get(gtype, 0))
+                for partition in e["partitions"] & allowed:
+                    pool = node_free.setdefault(partition, {})
+                    pool[gtype] = max(pool.get(gtype, 0), free)
+            for gtype, n in used.items():
                 alloc[gtype] = alloc.get(gtype, 0) + n
         else:
             for gtype, n in counts.items():
@@ -278,7 +284,7 @@ def _cluster_availability() -> dict:
             offline=offline.get(gpu.name, 0),
             offline_nodes=offline_nodes.get(gpu.name, []),
         )
-    return cluster
+    return cluster, node_free
 
 
 def check_availability() -> Availability:
@@ -296,7 +302,7 @@ def check_availability() -> Availability:
         avail.golden_by_qos[qos] = _golden_availability_for_qos(qos)
 
     avail.golden = avail.golden_by_qos.get(PRIMARY_QOS, {})
-    avail.cluster = _cluster_availability()
+    avail.cluster, avail.node_free = _cluster_availability()
 
     return avail
 

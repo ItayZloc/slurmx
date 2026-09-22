@@ -12,24 +12,16 @@ import tempfile
 import time
 
 from config import CPU_CPUS, CPU_MEM, EXCLUDE_NODES, MAIL_USER, MAX_MEM_GB, START_TIMEOUT, TIME_LIMIT
-from config_defaults import CPU_PARTITION, CPU_QOS, MAIL_TYPE
+from config_defaults import CPU_PARTITION, CPU_QOS, MAIL_TYPE, MAIN_PARTITION
 from maintenance import cap_time_limit
 
 from . import monitoring, shell
-from .monitoring import _FINISHED_STATES, _UNRECOVERABLE_REASONS
+from .monitoring import _FINISHED_STATES, _QOS_QUOTA_REASONS, _UNRECOVERABLE_REASONS, _USER_QUOTA_REASONS
 from .selection import GPUChoice, select_resources
 from .types import JobResult
 
 
 _METADATA_KEYS = {"total_vram_gb", "supports_gpu_sharding", "preemption_safe"}
-# Kept as import compatibility for older callers of this private policy helper.
-# Submission no longer accepts a pool policy from callers.
-ASK_POLICY_MESSAGE = "Submission pool policy is declared in the script metadata header."
-
-
-def resolve_golden_only(golden_only: bool | None) -> bool | None:
-    """Legacy helper retained for import compatibility; not used by submission."""
-    return golden_only
 
 
 @dataclass(frozen=True)
@@ -132,7 +124,7 @@ def _build_sbatch_script(
     return "\n".join(lines) + "\n"
 
 
-def _wait_for_running(job_result: JobResult, timeout: int) -> tuple[JobResult, str]:
+def _wait_for_running(job_result: JobResult, timeout: int, preemption_safe: bool = True) -> tuple[JobResult, str]:
     """Poll until a job starts, finishes, is fatal, or stays pending."""
     start = time.time()
     while True:
@@ -149,6 +141,16 @@ def _wait_for_running(job_result: JobResult, timeout: int) -> tuple[JobResult, s
             job_result.success = False
             job_result.message = f"Job {job_result.job_id} cancelled - fatal error: {status.reason}"
             return job_result, "fatal"
+        if preemption_safe and status.reason in _USER_QUOTA_REASONS:
+            shell._run_quiet(["scancel", str(job_result.job_id)])
+            job_result.success = False
+            job_result.message = f"Job {job_result.job_id} cancelled - per-user limit: {status.reason}"
+            return job_result, "user_quota"
+        if preemption_safe and status.reason in _QOS_QUOTA_REASONS:
+            shell._run_quiet(["scancel", str(job_result.job_id)])
+            job_result.success = False
+            job_result.message = f"Job {job_result.job_id} cancelled - quota limit: {status.reason}"
+            return job_result, "quota"
         elapsed = time.time() - start
         if timeout > 0 and elapsed >= timeout:
             job_result.message = f"Job {job_result.job_id} still pending after {int(elapsed)}s (reason: {status.reason or 'unknown'}). Job remains queued."
@@ -176,6 +178,12 @@ def _failure(message: str) -> JobResult:
     return JobResult(False, None, "", "", "", message, "")
 
 
+def _directive_value(name: str, value: str | None) -> str | None:
+    if value is not None and any(ord(char) < 32 or ord(char) == 127 for char in value):
+        return f"{name} cannot contain control characters."
+    return None
+
+
 def submit_job(
     script_path: str,
     args: list[str] | None = None,
@@ -193,6 +201,10 @@ def submit_job(
         return _failure(error)
     assert metadata is not None
     job_name = job_name or Path(resolved_path).stem.replace(".", "-") or "job"
+    for name, value in (("job_name", job_name), ("output_dir", output_dir), ("dependency", dependency)):
+        error = _directive_value(name, value)
+        if error:
+            return _failure(error)
     command = shlex.join([resolved_path, *(args or [])])
     if metadata.total_vram_gb == 0:
         choice = None
@@ -209,5 +221,11 @@ def submit_job(
         return JobResult(True, None, gpu_type, partition, qos, "[DRY RUN] Would submit job", script)
     result = _do_submit(script, choice, partition, qos)
     if result.success and wait_until_running and result.job_id is not None:
-        result, _ = _wait_for_running(result, START_TIMEOUT)
+        result, outcome = _wait_for_running(result, START_TIMEOUT, metadata.preemption_safe)
+        if outcome == "quota" and metadata.preemption_safe and choice and choice.qos != "normal":
+            main_choice = GPUChoice(choice.gpu_type, choice.num_gpus, MAIN_PARTITION, "normal")
+            fallback = _build_sbatch_script(command, MAIN_PARTITION, "normal", main_choice.gpu_type, main_choice.num_gpus, job_name, output_path, workdir, True, dependency)
+            result = _do_submit(fallback, main_choice, MAIN_PARTITION, "normal")
+            if result.success and result.job_id is not None:
+                result, _ = _wait_for_running(result, START_TIMEOUT, True)
     return result

@@ -36,8 +36,15 @@ def _script(tmp_path, header: str, body: str = "echo hello"):
     return path
 
 
-def _availability(*, golden=None, cluster=None):
-    return Availability(golden=golden or {}, cluster=cluster or {})
+def _availability(*, golden=None, cluster=None, node_free=None):
+    golden = golden or {}
+    cluster = cluster or {}
+    if node_free is None:
+        node_free = {
+            "main": {name: item.free for name, item in cluster.items()},
+            "rtx6000": {name: item.free for name, item in golden.items()},
+        }
+    return Availability(golden=golden, cluster=cluster, node_free=node_free)
 
 
 def test_metadata_requires_exact_schema_and_types(tmp_path):
@@ -133,6 +140,29 @@ def test_safe_job_uses_two_same_type_main_cards_when_needed(monkeypatch, tmp_pat
     assert "#SBATCH --gres=gpu:rtx_3090:2" in result.sbatch_script
 
 
+def test_sharded_choice_rejects_fragmented_cards_and_uses_viable_larger_card(monkeypatch, tmp_path):
+    """Two aggregate free cards on separate nodes cannot satisfy one two-GPU job."""
+    script = _script(
+        tmp_path,
+        '# slurmx: {"total_vram_gb": 40, "supports_gpu_sharding": true, "preemption_safe": true}',
+    )
+    monkeypatch.setattr(
+        "slurm_mcp.selection.availability.check_availability",
+        lambda: _availability(
+            cluster={
+                "rtx_3090": GPUAvailability("rtx_3090", 9, 0, 2),
+                "rtx_6000": GPUAvailability("rtx_6000", 8, 0, 1),
+            },
+            node_free={"main": {"rtx_3090": 1, "rtx_6000": 1}},
+        ),
+    )
+
+    result = submit_job(str(script), dry_run=True)
+
+    assert result.success
+    assert result.gpu_type == "rtx_6000"
+
+
 def test_unsafe_job_queues_on_best_golden_candidate_without_availability(monkeypatch, tmp_path):
     """Unsafe work must never bypass golden even when no card is currently free."""
     script = _script(
@@ -161,7 +191,20 @@ def test_submission_has_only_the_script_metadata_interface():
     ]
 
 
-def test_mcp_and_cli_expose_script_arguments_without_resource_flags():
+def test_submission_rejects_directive_injection(tmp_path):
+    """Caller metadata cannot append a second SBATCH directive."""
+    script = _script(
+        tmp_path,
+        '# slurmx: {"total_vram_gb": 0, "supports_gpu_sharding": false, "preemption_safe": true}',
+    )
+
+    result = submit_job(str(script), job_name="ok\n#SBATCH --partition main", dry_run=True)
+
+    assert not result.success
+    assert result.message == "job_name cannot contain control characters."
+
+
+def test_mcp_and_cli_expose_script_arguments_without_resource_flags(monkeypatch):
     """The public adapters cannot reintroduce a raw-command submission bypass."""
     mcp_module = types.ModuleType("mcp")
     mcp_server = types.ModuleType("mcp.server")
@@ -175,10 +218,9 @@ def test_mcp_and_cli_expose_script_arguments_without_resource_flags():
             return lambda function: function
 
     fastmcp.FastMCP = FakeMCP
-    sys.modules.update({
-        "mcp": mcp_module, "mcp.server": mcp_server,
-        "mcp.server.fastmcp": fastmcp,
-    })
+    monkeypatch.setitem(sys.modules, "mcp", mcp_module)
+    monkeypatch.setitem(sys.modules, "mcp.server", mcp_server)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fastmcp)
     import server
     from cli.submit import add_arguments
     import argparse

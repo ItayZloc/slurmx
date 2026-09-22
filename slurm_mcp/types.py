@@ -37,6 +37,7 @@ class Availability:
     golden: dict = field(default_factory=dict)         # primary QoS: gpu_type -> GPUAvailability
     cluster: dict = field(default_factory=dict)        # gpu_type -> GPUAvailability
     golden_by_qos: dict = field(default_factory=dict)  # qos -> {gpu_type -> GPUAvailability}
+    node_free: dict = field(default_factory=dict)      # partition -> gpu_type -> largest node free count
 
 
 @dataclass

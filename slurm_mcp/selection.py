@@ -51,12 +51,14 @@ def select_resources(
     avail = availability.check_availability()
     for gpu, count in candidates:
         golden = avail.golden.get(gpu.name)
-        if golden and golden.free >= count and gpu.golden_partition:
+        node_free = avail.node_free.get(gpu.golden_partition, {}).get(gpu.name, 0)
+        if golden and golden.free >= count and node_free >= count and gpu.golden_partition:
             return GPUChoice(gpu.name, count, gpu.golden_partition, PRIMARY_QOS)
 
     for gpu, count in candidates:
         cluster = avail.cluster.get(gpu.name)
-        if cluster and cluster.free >= count:
+        node_free = avail.node_free.get(MAIN_PARTITION, {}).get(gpu.name, 0)
+        if cluster and cluster.free >= count and node_free >= count:
             return GPUChoice(gpu.name, count, MAIN_PARTITION, "normal")
     return None
 
