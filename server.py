@@ -45,6 +45,9 @@ Check with MCP cluster_summary or squeue, not ps aux.
 - Use cluster_summary as the single dashboard tool: it covers jobs AND GPU availability.
   Use view="jobs" or view="gpu" to narrow the output.
 - Use diagnose_job to classify failures (OOM, timeout, missing module, code error).
+- Use preemption_info for read-only controller/QoS preemption settings. The
+  probe_preemption tool is dry-run-first; do not use real mode unless a
+  scheduler diagnostic was explicitly authorized.
 - These tools report failure in their return value rather than raising, so read what
   comes back: "success: false" from submit_job, "No log file found ..." from
   read_job_log, state UNKNOWN from get_job_status. A call that returned is not a
@@ -205,6 +208,35 @@ def cluster_summary(
         parts.append(render.render_cluster_wide(avail))
 
     return "\n\n".join(p for p in parts if p)
+
+
+@mcp.tool()
+def preemption_info() -> str:
+    """Show SLURM controller and QoS preemption settings without changing jobs.
+
+    Reports SLURM version, controller PreemptType/PreemptMode/Parameters,
+    JobRequeue, KillWait, and normal plus primary-golden QoS preemption
+    relationships. A failed scontrol or sacctmgr query is marked unavailable,
+    never reported as an empty/default setting.
+    """
+    return slurm_mcp.preemption_info()
+
+
+@mcp.tool()
+def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
+    """Preview or explicitly run a tightly scoped normal-vs-golden preemption probe.
+
+    Dry run is the default and submits nothing. It reports the isolated node,
+    safety evidence, and the two generated scripts. Real mode repeats the
+    safety scan, uses internal node pinning, submits only disposable jobs, and
+    cancels only IDs it can re-verify as owned by this user with the expected
+    QoS. Probe logs are retained under ~/.slurmx/probes/.
+
+    Args:
+        dry_run: Keep true unless a real scheduler diagnostic is authorized.
+        max_seconds: Positive bound for the real probe's complete wait.
+    """
+    return slurm_mcp.probe_preemption(dry_run=dry_run, max_seconds=max_seconds)
 
 
 @mcp.tool()

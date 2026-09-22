@@ -37,6 +37,7 @@ try:
     from cli import log as log_mod
     from cli import diagnose as diagnose_mod
     from cli import cancel as cancel_mod
+    from cli import preemption as preemption_mod
     HAVE_CONFIG = True
 except ModuleNotFoundError as e:
     if e.name != "config":
@@ -123,6 +124,18 @@ def build_parser() -> argparse.ArgumentParser:
             subparsers, "cancel", cancel_mod,
             help="Cancel jobs by ID, or all your jobs.",
         )
+        p = subparsers.add_parser(
+            "preemption-info",
+            help="Show controller and QoS preemption settings without submitting jobs.",
+        )
+        preemption_mod.add_info_arguments(p)
+        p.set_defaults(_run=preemption_mod.run_info)
+        p = subparsers.add_parser(
+            "probe-preemption",
+            help="Preview, or explicitly run, a guarded disposable preemption probe.",
+        )
+        preemption_mod.add_probe_arguments(p)
+        p.set_defaults(_run=preemption_mod.run_probe)
     _add_subcommand(
         subparsers, "config", config_mod,
         help="Edit config.py in a terminal form (--show prints it as text).",

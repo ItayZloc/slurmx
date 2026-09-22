@@ -36,3 +36,4 @@ from .monitoring import (
 )
 from .diagnostics import diagnose_job
 from .history import job_history
+from .preemption import preemption_info, probe_preemption

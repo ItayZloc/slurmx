@@ -23,6 +23,9 @@ MCP TOOLS (invoked by Claude in chat)
   diagnose_job             classify a finished job's failure + log tail
   cancel_jobs              cancel by ID, all, or pending-only
   job_history              recent jobs from sacct, finished ones included
+  preemption_info          read controller and QoS preemption settings
+  probe_preemption         dry-run-first guarded preemption diagnostic;
+                           real mode retains disposable-probe logs
 
   None of them raise on failure — they return it. Read what comes back.
 
@@ -41,6 +44,11 @@ CLI COMMANDS
                              slurmx diagnose ID           classify a job failure
                              slurmx history               recent finished jobs (sacct)
                              slurmx cancel ID|--all       cancel jobs
+                             slurmx preemption-info        read preemption settings
+                             slurmx probe-preemption       preview guarded probe
+                             slurmx probe-preemption --real
+                                                          run it only after an
+                                                          explicit safety decision
                              slurmx config                edit config.py in a form
                                                           (--show prints it as text;
                                                            creates it on first run)

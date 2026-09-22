@@ -51,6 +51,8 @@ finishes.
 | `read_job_log` | Read a job's SLURM log. `output_dir` must be the exact directory the job's `--output` points at — no recursion. |
 | `diagnose_job` | Classify a *finished* job's failure (OOM, timeout, missing module, dependency, killed, code error) and show the log tail. Running/pending jobs short-circuit. |
 | `cancel_jobs` | Cancel by ID, or every job you own. The count returned is cancels requested, not confirmed. |
+| `preemption_info` | Read the controller and configured QoS preemption settings. Failed scheduler queries are shown as unavailable. |
+| `probe_preemption` | Default dry run for a guarded, node-pinned normal-vs-golden scheduler diagnostic. Real mode is explicit and retains logs under `~/.slurmx/probes/`. |
 
 Every tool reports failure in its return value instead of raising, so a call that
 returned isn't necessarily a call that worked. Each docstring spells out its own
@@ -125,6 +127,31 @@ return the generated script without invoking `sbatch`.
 Wrap shell pipelines and compound commands in a metadata-bearing script. This
 keeps the submit interface auditable and prevents callers from bypassing the
 preemption policy.
+
+## Checking preemption behavior
+
+`preemption_info` (or `slurmx preemption-info`) is read-only. It reports the
+controller's preemption settings and the normal plus configured golden QoS
+relationships. A query that fails is labeled unavailable, so an empty-looking
+result never implies a default policy.
+
+`probe_preemption` is a scheduler diagnostic, not a normal submission path.
+It defaults to dry run and reports a candidate node, safety evidence, and its
+two generated scripts without calling `sbatch`. The CLI equivalent is:
+
+```bash
+slurmx probe-preemption
+slurmx probe-preemption --real --max-seconds 600
+```
+
+Real mode is only appropriate after an explicit decision to test the scheduler.
+It rechecks isolation before each submission: the node must be in `main` and
+the chosen golden partition, have exactly one free GPU of that type, and have
+no running normal-QoS GPU job. It pins only its disposable victim and
+preemptor internally; `submit_job` still accepts no caller resource or node
+overrides. The probe cancels only created IDs that live scheduler output
+confirms belong to the current user with the expected QoS. Its scripts and
+event logs stay in `~/.slurmx/probes/` for diagnosis.
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
 card's pending GPUs by user in dispatch order — like the Running block but
