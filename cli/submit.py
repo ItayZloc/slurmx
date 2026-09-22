@@ -16,7 +16,7 @@ def add_arguments(parser):
     parser.add_argument("-w", "--workdir", default=None, help="Working directory on the compute node")
     parser.add_argument("-o", "--output-dir", default="logs", help="SLURM log directory (default: logs)")
     parser.add_argument("--after", nargs="+", type=int, metavar="JOBID", default=None, help="Require these jobs to succeed first")
-    parser.add_argument("-d", "--dependency", default=None, help="Raw SLURM dependency expression")
+    parser.add_argument("-d", "--dependency", default=None, help="singleton or TYPE:JOBID[:JOBID...] (TYPE: after, afterany, afterok, afternotok, aftercorr)")
     parser.add_argument("--no-wait", action="store_true", help="Do not wait for the job to start")
     parser.add_argument("--dry-run", action="store_true", help="Print the generated script without submitting")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Output result as JSON")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import subprocess
 import sys
 import types
 import pytest
@@ -287,6 +288,55 @@ def test_submission_rejects_shell_and_dependency_injection(tmp_path):
 
     assert dependency.message == "dependency must be a SLURM dependency token."
     assert output.message == "output_dir contains unsafe path characters."
+
+
+def test_submission_filters_inherited_sbatch_options(tmp_path, monkeypatch):
+    """Inherited option variables must not override the script's resource policy."""
+    script = _script(
+        tmp_path,
+        '# slurmx: {"total_vram_gb": 40, "supports_gpu_sharding": false, "preemption_safe": false}',
+    )
+    overrides = {
+        "SBATCH_PARTITION": "main",
+        "SBATCH_QOS": "normal",
+        "SBATCH_REQUEUE": "1",
+        "SBATCH_GRES": "gpu:rtx_4090:8",
+        "SBATCH_SIGNAL": "TERM@1",
+        "SBATCH_FUTURE_OPTION": "",
+        "SLURM_CLUSTERS": "other-cluster",
+        "SLURM_HINT": "memory_bound",
+    }
+    preserved = {
+        "SLURMX_TEST_BENIGN": "keep-me",
+        "SLURM_CONF": "/etc/slurm/slurm.conf",
+        "SLURM_JOB_ID": "12345",
+        "sbatch_partition": "ordinary-case-sensitive-variable",
+        "PATH": os.environ["PATH"],
+    }
+    for name, value in (overrides | preserved).items():
+        monkeypatch.setenv(name, value)
+    captured_env = {}
+
+    def capture_submission(cmd, **kwargs):
+        assert cmd[0] == "sbatch"
+        env = kwargs.get("env")
+        captured_env.update(os.environ if env is None else env)
+        return subprocess.CompletedProcess(cmd, 0, "Submitted batch job 67890\n", "")
+
+    monkeypatch.setattr("slurm_mcp.shell.subprocess.run", capture_submission)
+
+    preview = submit_job(str(script), dry_run=True)
+    assert preview.success
+    assert captured_env == {}
+    result = submit_job(str(script), wait_until_running=False)
+
+    assert result.success
+    assert result.job_id == 67890
+    leaked_options = overrides.keys() & captured_env.keys()
+    assert not leaked_options
+    assert {name: captured_env[name] for name in preserved} == preserved
+    assert {name: os.environ[name] for name in overrides} == overrides
+    assert result.sbatch_script == preview.sbatch_script
 
 
 def test_mcp_and_cli_expose_script_arguments_without_resource_flags(monkeypatch):

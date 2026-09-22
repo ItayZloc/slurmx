@@ -112,6 +112,16 @@ retries once on main, while a per-user quota fails without retry. Unsafe jobs
 remain queued on quota errors. Scratch storage is removed on exit, so save
 checkpoints outside `$SCRATCH_DIR`.
 
+SLURMx removes inherited `SBATCH_*` variables and the `SLURM_CLUSTERS` and
+`SLURM_HINT` option aliases from the `sbatch` environment so they cannot override
+the generated directives. Matching is case-sensitive; other variables, including
+`PATH`, `SLURM_CONF`, and runtime job identity, are preserved. Dry runs still
+return the generated script without invoking `sbatch`.
+
+`--dependency` accepts `singleton` or `TYPE:JOBID[:JOBID...]`, where `TYPE` is
+`after`, `afterany`, `afterok`, `afternotok`, or `aftercorr` and each ID is numeric.
+`--after JOBID [JOBID ...]` is shorthand for `afterok`.
+
 Wrap shell pipelines and compound commands in a metadata-bearing script. This
 keeps the submit interface auditable and prevents callers from bypassing the
 preemption policy.
