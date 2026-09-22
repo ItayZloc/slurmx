@@ -24,7 +24,6 @@ _CONFIG_KEYS = (
     ("PreemptMode", "PreemptMode"), ("PreemptParameters", "PreemptParameters"),
     ("JobRequeue", "JobRequeue"), ("KillWait", "KillWait"),
 )
-_GPU_TRES_RE = re.compile(r"(?:gres/)?gpu(?::([^,:=]+))?[:=](\d+)")
 _SAFE_ATOM = re.compile(r"^[A-Za-z0-9_.-]+$")
 _SAFE_USER = re.compile(r"^[a-z_][a-z0-9_-]*$")
 _USABLE_STATES = frozenset({"IDLE", "MIXED", "ALLOCATED"})
@@ -36,6 +35,28 @@ class _QueryFailure(RuntimeError):
 
 class _Refusal(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _Budget:
+    max_seconds: int
+    deadline: float = 0.0
+
+    def __post_init__(self):
+        object.__setattr__(self, "deadline", time.monotonic() + self.max_seconds)
+
+    def remaining(self) -> float:
+        return self.deadline - time.monotonic()
+
+    def before_mutation(self) -> None:
+        if self.remaining() <= 0:
+            raise _Refusal("probe deadline expired before scheduler mutation")
+
+    def query_timeout(self) -> float:
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise _Refusal("probe deadline expired before scheduler mutation")
+        return min(30.0, remaining)
 
 
 @dataclass(frozen=True)
@@ -65,9 +86,11 @@ class _Job:
         return any(sum(source.values()) > 0 for source in self.gpu_sources)
 
 
-def _required(cmd: list[str] | tuple[str, ...]) -> str:
+def _required(cmd: list[str] | tuple[str, ...], budget: _Budget | None = None) -> str:
     try:
-        return shell._run(list(cmd))
+        if budget is None:
+            return shell._run(list(cmd))
+        return shell._run(list(cmd), timeout=budget.query_timeout())
     except Exception as exc:
         raise _QueryFailure(str(exc)) from exc
 
@@ -125,17 +148,37 @@ def preemption_info() -> str:
     return "\n".join(lines)
 
 
-def _gpu_counts(value: str) -> dict[str, int]:
+def _gpu_source(value: str) -> dict[str, int] | None:
     value = value.strip()
     if not value or value in {"(null)", "N/A", "None"}:
-        return {}
-    counts: dict[str, int] = {}
-    for gpu_type, count in _GPU_TRES_RE.findall(value):
-        name = gpu_type or ""
-        counts[name] = counts.get(name, 0) + int(count)
-    if "gpu" in value.lower() and not counts:
-        raise _QueryFailure(f"unparseable GPU allocation: {value}")
-    return counts
+        return None
+    aggregate: int | None = None
+    typed: dict[str, int] = {}
+    for fragment in value.split(","):
+        clean = re.sub(r"\([^)]*\)$", "", fragment.strip())
+        if "gpu" not in clean.lower():
+            continue
+        match = re.fullmatch(r"(?:gres/)?gpu(?::([A-Za-z0-9_.-]+))?(?:=|:)(\d+)", clean)
+        if match is None:
+            raise _QueryFailure(f"unparseable GPU allocation fragment: {fragment}")
+        gpu_type, count = match.groups()
+        if gpu_type is None:
+            if aggregate is not None:
+                raise _QueryFailure(f"duplicate aggregate GPU allocation: {value}")
+            aggregate = int(count)
+        else:
+            typed[gpu_type] = typed.get(gpu_type, 0) + int(count)
+    if aggregate is not None and typed and aggregate != sum(typed.values()):
+        raise _QueryFailure(f"inconsistent aggregate and typed GPU allocation: {value}")
+    if typed:
+        return typed
+    if aggregate is not None:
+        return {"": aggregate}
+    return {}
+
+
+def _gpu_counts(value: str) -> dict[str, int]:
+    return _gpu_source(value) or {}
 
 
 def _node_fields(line: str) -> dict[str, str]:
@@ -151,15 +194,27 @@ def _parse_job_rows(raw: str) -> list[_Job]:
         fields = [field.strip() for field in line.split("|")]
         if len(fields) not in {7, 8} or any(not field for field in fields[:5]):
             raise _QueryFailure("unparseable or incomplete running-job row")
-        sources = tuple(source for source in (_gpu_counts(value) for value in fields[5:]) if source)
-        rows.append(_Job(*fields[:5], gpu_sources=sources))
+        parsed = [_gpu_source(value) for value in fields[5:]]
+        if all(source is None for source in parsed):
+            raise _QueryFailure("missing GPU allocation evidence for running job")
+        sources = [source for source in parsed if source]
+        typed = [source for source in sources if "" not in source]
+        aggregate = [source for source in sources if set(source) == {""}]
+        if typed:
+            canonical = typed[0]
+            if any(source != canonical for source in typed) or any(source[""] != sum(canonical.values()) for source in aggregate):
+                raise _QueryFailure("inconsistent GPU allocation sources for running job")
+            sources = [canonical for _ in sources]
+        if len({tuple(sorted(source.items())) for source in sources}) > 1:
+            raise _QueryFailure("inconsistent GPU allocation sources for running job")
+        rows.append(_Job(*fields[:5], gpu_sources=tuple(sources)))
     return rows
 
 
-def _detail_job(listed: list[str]) -> _Job:
+def _detail_job(listed: list[str], budget: _Budget | None = None) -> _Job:
     if len(listed) != 5 or any(not field.strip() for field in listed):
         raise _QueryFailure("unparseable running-job listing")
-    detail = _node_fields(_required(("scontrol", "show", "job", "-o", listed[0])))
+    detail = _node_fields(_required(("scontrol", "show", "job", "-o", listed[0]), budget))
     job_id = detail.get("JobId", "").split(".", 1)[0]
     user = detail.get("UserId", "").split("(", 1)[0]
     qos = detail.get("QOS", "")
@@ -175,23 +230,23 @@ def _detail_job(listed: list[str]) -> _Job:
     return _parse_job_rows("|".join([job_id, user, qos, state, node_list, *values]))[0]
 
 
-def _job_snapshot(job_id: int | None = None) -> list[_Job]:
+def _job_snapshot(job_id: int | None = None, budget: _Budget | None = None) -> list[_Job]:
     command = list(_LIST_JOBS)
     if job_id is not None:
         command = ["squeue", "-h", "-j", str(job_id), "-o", "%i|%u|%q|%T|%N"]
     listed = []
-    for line in _required(command).splitlines():
+    for line in _required(command, budget).splitlines():
         if not line.strip():
             continue
         fields = [field.strip() for field in line.split("|")]
         if len(fields) != 5 or any(not field for field in fields):
             raise _QueryFailure("unparseable or incomplete running-job row")
         listed.append(fields)
-    return [_detail_job(fields) for fields in listed]
+    return [_detail_job(fields, budget) for fields in listed]
 
 
-def _node_snapshot() -> list[dict[str, str]]:
-    return [_node_fields(line) for line in _required(("scontrol", "show", "node", "-d", "-o")).splitlines() if line.strip()]
+def _node_snapshot(budget: _Budget | None = None) -> list[dict[str, str]]:
+    return [_node_fields(line) for line in _required(("scontrol", "show", "node", "-d", "-o"), budget).splitlines() if line.strip()]
 
 
 def _node_is_usable(state: str) -> bool:
@@ -200,26 +255,26 @@ def _node_is_usable(state: str) -> bool:
     return upper in _USABLE_STATES and not any(word in upper for word in forbidden)
 
 
-def _expand_nodelist(value: str) -> set[str]:
+def _expand_nodelist(value: str, budget: _Budget | None = None) -> set[str]:
     if not value or any(char.isspace() or ord(char) < 32 for char in value):
         raise _QueryFailure("unsafe or empty scheduler nodelist")
-    nodes = {line.strip() for line in _required(("scontrol", "show", "hostnames", value)).splitlines() if line.strip()}
+    nodes = {line.strip() for line in _required(("scontrol", "show", "hostnames", value), budget).splitlines() if line.strip()}
     if not nodes or any(not _SAFE_ATOM.fullmatch(node) for node in nodes):
         raise _QueryFailure("unparseable expanded scheduler nodelist")
     return nodes
 
 
-def _job_on_node(job: _Job, node: str) -> bool:
-    return node in _expand_nodelist(job.node_list)
+def _job_on_node(job: _Job, node: str, budget: _Budget | None = None) -> bool:
+    return node in _expand_nodelist(job.node_list, budget)
 
 
-def _probe_policy() -> _Policy:
-    config = _config_values(_required(("scontrol", "show", "config")))
+def _probe_policy(budget: _Budget | None = None) -> _Policy:
+    config = _config_values(_required(("scontrol", "show", "config"), budget))
     if "preempt/qos" not in _setting(config, "PreemptType").lower():
         raise _Refusal("controller PreemptType does not enable QoS preemption")
     rows = {name: preempt for name, preempt, _mode, _grace in _qos_rows(_required((
         "sacctmgr", "-nP", "show", "qos", "format=Name,Preempt,PreemptMode,GraceTime",
-    )))}
+    ), budget))}
     preempt = rows.get(PRIMARY_QOS)
     if preempt is None or not preempt.strip():
         raise _Refusal(f"primary golden QoS {PRIMARY_QOS!r} has no configured preemption relationship")
@@ -231,7 +286,7 @@ def _probe_policy() -> _Policy:
     return _Policy(victim_qos="normal", preemptible_qos=frozenset(tokens))
 
 
-def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], policy: _Policy) -> _Candidate | None:
+def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], policy: _Policy, budget: _Budget | None = None) -> _Candidate | None:
     golden = {gpu.name: gpu.golden_partition for gpu in GPU_TYPES if gpu.golden_partition}
     for fields in nodes:
         node = fields.get("NodeName", "")
@@ -246,7 +301,7 @@ def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], policy: _Poli
                 continue
             if total.get(gpu_type, 0) - used.get(gpu_type, 0) != 1:
                 continue
-            if any(job.state == "RUNNING" and job.qos in policy.preemptible_qos and job.uses_gpu and _job_on_node(job, node) for job in jobs):
+            if any(job.state == "RUNNING" and job.qos in policy.preemptible_qos and job.uses_gpu and _job_on_node(job, node, budget) for job in jobs):
                 continue
             return _Candidate(node, gpu_type, golden_partition)
     return None
@@ -293,7 +348,7 @@ event_log={shlex.quote(str(event_log))}
 record_signal() {{ printf 'signal %s %s\\n' "$1" "$(date +%s)" >> "$event_log"; }}
 if test "${{SLURM_RESTART_COUNT:-0}}" -gt 0; then printf 'restart %s\\n' "$(date +%s)" >> "$event_log"; exit 0; fi
 trap 'record_signal USR1' USR1
-trap 'record_signal TERM; exit 0' TERM
+trap 'record_signal TERM' TERM
 while :; do printf 'heartbeat %s\\n' "$(date +%s)" >> "$event_log"; sleep 1; done
 """
     preemptor = f"""#!/bin/bash
@@ -309,10 +364,11 @@ sleep 30
     return victim, preemptor
 
 
-def _submit(script: str, path: Path) -> int:
+def _submit(script: str, path: Path, budget: _Budget) -> int:
+    budget.before_mutation()
     path.write_text(script)
     path.chmod(0o700)
-    output = _required(("sbatch", "--parsable", str(path))).strip()
+    output = _required(("sbatch", "--parsable", str(path)), budget).strip()
     match = re.fullmatch(r"(\d+)(?:;[^;\s]+)?", output)
     if not match:
         raise _QueryFailure(f"sbatch returned an unrecognized job ID: {output!r}")
@@ -324,21 +380,21 @@ def _exact_gpu(job: _Job, candidate: _Candidate) -> bool:
     return bool(nonempty) and all(source == {candidate.gpu_type: 1} for source in nonempty)
 
 
-def _verify_victim(job_id: int, candidate: _Candidate, policy: _Policy, user: str) -> bool:
-    rows = _job_snapshot(job_id)
+def _verify_victim(job_id: int, candidate: _Candidate, policy: _Policy, user: str, budget: _Budget | None = None) -> bool:
+    rows = _job_snapshot(job_id, budget)
     return len(rows) == 1 and (
         (job := rows[0]).job_id == str(job_id) and job.user == user and job.qos == policy.victim_qos
-        and job.state == "RUNNING" and _job_on_node(job, candidate.node) and _exact_gpu(job, candidate)
+        and job.state == "RUNNING" and _expand_nodelist(job.node_list, budget) == {candidate.node} and _exact_gpu(job, candidate)
     )
 
 
-def _post_victim_safe(candidate: _Candidate, victim_id: int, policy: _Policy) -> bool:
-    fields = [node for node in _node_snapshot() if node.get("NodeName") == candidate.node]
+def _post_victim_safe(candidate: _Candidate, victim_id: int, policy: _Policy, budget: _Budget | None = None) -> bool:
+    fields = [node for node in _node_snapshot(budget) if node.get("NodeName") == candidate.node]
     if len(fields) != 1 or not _node_is_usable(fields[0].get("State", "")) or "GresUsed" not in fields[0]:
         return False
     total = _gpu_counts(fields[0].get("Gres", "")).get(candidate.gpu_type, 0)
     used = _gpu_counts(fields[0].get("GresUsed", "")).get(candidate.gpu_type, 0)
-    preemptible = [job for job in _job_snapshot() if job.qos in policy.preemptible_qos and job.uses_gpu and _job_on_node(job, candidate.node)]
+    preemptible = [job for job in _job_snapshot(budget=budget) if job.qos in policy.preemptible_qos and job.uses_gpu and _job_on_node(job, candidate.node, budget)]
     return total > 0 and used == total and len(preemptible) == 1 and preemptible[0].job_id == str(victim_id)
 
 
@@ -362,29 +418,31 @@ def _measurement(event_log: Path) -> tuple[int | None, str | None, bool]:
     return (max(after) - at if after else 0), name, restarted
 
 
-def _cleanup(created: list[tuple[int, str]], user: str) -> list[str]:
+def _cleanup(created: list[tuple[int, str]], user: str, budget: _Budget) -> list[str]:
     results = []
     for job_id, qos in created:
         try:
-            raw = _required(("squeue", "-h", "-j", str(job_id), "-o", "%i|%u|%q"))
+            raw = _required(("squeue", "-h", "-j", str(job_id), "-o", "%i|%u|%q"), budget)
             owned = any(line.strip() == f"{job_id}|{user}|{qos}" for line in raw.splitlines())
             if not owned:
                 results.append(f"left {job_id}: ownership/QoS verification failed")
                 continue
-            _required(("scancel", str(job_id)))
+            budget.before_mutation()
+            _required(("scancel", str(job_id)), budget)
             results.append(f"cancelled {job_id}")
-        except _QueryFailure as exc:
+        except (_QueryFailure, _Refusal) as exc:
             results.append(f"left {job_id}: cleanup query failed: {exc}")
     return results
 
 
 def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     """Preview or run a disposable, internally pinned preemption diagnostic."""
-    if not 0 < max_seconds <= 3600:
+    if isinstance(max_seconds, bool) or not isinstance(max_seconds, int) or not 0 < max_seconds <= 3600:
         return "refused: max_seconds must be between 1 and 3600; no jobs submitted."
+    budget = _Budget(max_seconds)
     try:
-        policy = _probe_policy()
-        candidate = _find_candidate(_node_snapshot(), _job_snapshot(), policy)
+        policy = _probe_policy(budget)
+        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget), policy, budget)
     except _Refusal as exc:
         return f"refused: {exc}; no jobs submitted."
     except _QueryFailure as exc:
@@ -392,6 +450,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     if candidate is None:
         return "refused: no isolated node exists; no jobs submitted."
     try:
+        budget.before_mutation()
         root = _authenticated_probe_root()
         preview_dir = Path(root) / "DRY_RUN"
         victim_script, preemptor_script = _probe_scripts(candidate, preview_dir, max_seconds=max_seconds, victim_qos=policy.victim_qos)
@@ -400,34 +459,34 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     if dry_run:
         return "\n".join(("dry run: no jobs submitted.", f"candidate: node={candidate.node} gpu={candidate.gpu_type} golden_partition={candidate.golden_partition}", "safety evidence: one free GPU; no running QoS that the primary golden QoS can preempt", "--- victim script ---", victim_script, "--- preemptor script ---", preemptor_script))
 
-    user = pwd.getpwuid(os.getuid()).pw_name
-    try:
-        policy = _probe_policy()
-        candidate = _find_candidate(_node_snapshot(), _job_snapshot(), policy)
-    except (_QueryFailure, _Refusal) as exc:
-        return f"refused: scheduler safety query failed: {exc}; no jobs submitted."
-    if candidate is None:
-        return "refused: no isolated node exists; no jobs submitted."
-    probe_dir = Path(root) / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
-    probe_dir.mkdir(parents=True, mode=0o700)
-    victim_script, preemptor_script = _probe_scripts(candidate, probe_dir, max_seconds=max_seconds, victim_qos=policy.victim_qos)
+    probe_dir: Path | None = None
     created: list[tuple[int, str]] = []
     outcome = ""
     try:
-        victim_id = _submit(victim_script, probe_dir / "victim.sh")
+        user = pwd.getpwuid(os.getuid()).pw_name
+        budget.before_mutation()
+        policy = _probe_policy(budget)
+        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget), policy, budget)
+        if candidate is None:
+            raise _Refusal("no isolated node exists")
+        budget.before_mutation()
+        probe_dir = Path(root) / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        probe_dir.mkdir(parents=True, mode=0o700)
+        victim_script, preemptor_script = _probe_scripts(candidate, probe_dir, max_seconds=max_seconds, victim_qos=policy.victim_qos)
+        victim_id = _submit(victim_script, probe_dir / "victim.sh", budget)
         created.append((victim_id, policy.victim_qos))
-        deadline = time.monotonic() + max_seconds
-        while time.monotonic() < deadline:
-            if _verify_victim(victim_id, candidate, policy, user):
+        while budget.remaining() > 0:
+            if _verify_victim(victim_id, candidate, policy, user, budget):
                 break
             time.sleep(1)
         else:
             raise _Refusal("timeout waiting for an exactly verified disposable victim")
-        if not _post_victim_safe(candidate, victim_id, policy) or not _verify_victim(victim_id, candidate, policy, user):
+        if not _post_victim_safe(candidate, victim_id, policy, budget) or not _verify_victim(victim_id, candidate, policy, user, budget):
             raise _Refusal("post-victim safety check failed; preemptor was not submitted")
-        preemptor_id = _submit(preemptor_script, probe_dir / "preemptor.sh")
+        budget.before_mutation()
+        preemptor_id = _submit(preemptor_script, probe_dir / "preemptor.sh", budget)
         created.append((preemptor_id, PRIMARY_QOS))
-        while time.monotonic() < deadline:
+        while budget.remaining() > 0:
             estimate, signal, restarted = _measurement(probe_dir / "victim-events.log")
             if restarted:
                 outcome = "probe completed: victim restart observed; " + (f"{signal} warning/grace estimate: {estimate}s (one-second precision)" if signal is not None else "timing unavailable: no recorded preemption signal")
@@ -442,5 +501,10 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     except Exception as exc:
         outcome = f"refused: probe exception: {exc}"
     finally:
-        cleanup = _cleanup(created, user)
-    return "\n".join((outcome, f"probe logs retained: {probe_dir}", "cleanup: " + "; ".join(cleanup or ["no jobs created"])))
+        # Once the diagnostic budget is exhausted, cleanup still needs a short,
+        # separately bounded verification window. It never broadens the IDs it
+        # may cancel, and it avoids leaving a disposable victim behind.
+        cleanup_budget = budget if budget.remaining() > 0 else _Budget(5)
+        cleanup = _cleanup(created, user, cleanup_budget) if "user" in locals() else []
+    logs = str(probe_dir) if probe_dir is not None else "unavailable (probe directory was not created)"
+    return "\n".join((outcome, f"probe logs retained: {logs}", "cleanup: " + "; ".join(cleanup or ["no jobs created"])))

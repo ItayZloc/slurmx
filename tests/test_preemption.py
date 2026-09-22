@@ -27,7 +27,7 @@ def _reply(monkeypatch, responses):
 
     calls = []
 
-    def run(cmd):
+    def run(cmd, timeout=30):
         calls.append(cmd)
         response = responses.get(tuple(cmd), responses.get((cmd[0],)))
         if response is None:
@@ -134,9 +134,9 @@ def test_victim_verification_requires_exact_identity_owner_qos_node_state_and_gp
     """Relaxing any post-victim identity field would allow an unrelated job to trigger preemption."""
     from slurm_mcp.preemption import _Candidate, _Job, _Policy, _verify_victim
 
-    victim = _Job("101", "probe-user", "normal", "RUNNING", "node[01-02]", ({"rtx_6000": 1},))
-    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda job_id: [victim])
-    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda _: {"node-01", "node-02"})
+    victim = _Job("101", "probe-user", "normal", "RUNNING", "node-01", ({"rtx_6000": 1},))
+    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda *args, **kwargs: [victim])
+    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda *args, **kwargs: {"node-01"})
     candidate = _Candidate("node-01", "rtx_6000", "rtx6000")
     policy = _Policy("normal", frozenset({"normal", "alternate"}))
 
@@ -152,9 +152,9 @@ def test_post_victim_check_refuses_an_alternate_preemptible_race(monkeypatch):
         _Job("101", "probe-user", "normal", "RUNNING", "node-a", ({"rtx_6000": 1},)),
         _Job("102", "other", "alternate", "RUNNING", "node-a", ({"rtx_6000": 1},)),
     ]
-    monkeypatch.setattr("slurm_mcp.preemption._node_snapshot", lambda: [{"NodeName": "node-a", "State": "ALLOCATED", "Gres": "gpu:rtx_6000:2", "GresUsed": "gpu:rtx_6000:2"}])
-    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda: jobs)
-    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value: {value})
+    monkeypatch.setattr("slurm_mcp.preemption._node_snapshot", lambda *args, **kwargs: [{"NodeName": "node-a", "State": "ALLOCATED", "Gres": "gpu:rtx_6000:2", "GresUsed": "gpu:rtx_6000:2"}])
+    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda *args, **kwargs: jobs)
+    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value, *args, **kwargs: {value})
 
     assert not _post_victim_safe(_Candidate("node-a", "rtx_6000", "rtx6000"), 101, _Policy("normal", frozenset({"normal", "alternate"})))
 
@@ -267,7 +267,7 @@ def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(m
     }]
     jobs = _parse_job_rows("88|other|alternate|RUNNING|node[01-02]|gres/gpu=1|\n")
     policy = _Policy(victim_qos="normal", preemptible_qos=frozenset({"normal", "alternate"}))
-    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value: {"node-01", "node-02"})
+    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda *args, **kwargs: {"node-01", "node-02"})
 
     assert _find_candidate(nodes, jobs, policy) is None
 
@@ -309,7 +309,7 @@ def test_victim_script_has_no_time_limit_usr1_and_records_distinct_preemption_si
     victim, _ = _probe_scripts(_Candidate("node-a", "rtx_6000", "rtx6000"), Path("/home/probe-user/.slurmx/probes/example"), max_seconds=600, victim_qos="normal")
 
     assert "#SBATCH --signal=" not in victim
-    assert "trap 'record_signal TERM; exit 0' TERM" in victim
+    assert "trap 'record_signal TERM' TERM" in victim
     assert "trap 'record_signal USR1' USR1" in victim
     assert "#SBATCH --time=00:15:00" in victim
 
@@ -320,3 +320,152 @@ def test_probe_scripts_reject_directive_injection_from_scheduler_fields():
 
     with pytest.raises(_Refusal):
         _probe_scripts(_Candidate("node-a", "rtx_6000", "rtx6000\n#SBATCH --qos=evil"), Path("/home/probe-user/.slurmx/probes/run"), max_seconds=600, victim_qos="normal")
+
+
+def test_allocation_parser_normalizes_aggregate_and_typed_tres_without_double_counting():
+    """An aggregate plus matching typed GPU entry describes one allocation, not two."""
+    from slurm_mcp.preemption import _parse_job_rows
+
+    job = _parse_job_rows("101|probe-user|normal|RUNNING|node-a|gres/gpu=1,gres/gpu:rtx_6000=1||gres/gpu=1,gres/gpu:rtx_6000=1\n")[0]
+
+    assert job.gpu_sources == ({"rtx_6000": 1}, {"rtx_6000": 1})
+
+
+def test_allocation_parser_normalizes_matching_aggregate_and_typed_separate_sources():
+    """Per-job aggregate and allocated typed evidence agree on one typed GPU."""
+    from slurm_mcp.preemption import _parse_job_rows
+
+    job = _parse_job_rows("101|probe-user|normal|RUNNING|node-a|gres/gpu=1||gres/gpu:rtx_6000=1\n")[0]
+
+    assert job.gpu_sources == ({"rtx_6000": 1}, {"rtx_6000": 1})
+
+
+@pytest.mark.parametrize("evidence", [
+    "||",
+    "gres/gpu:rtx_6000:0,gres/gpu:broken||",
+    "gres/gpu:rtx_6000=1|gres/gpu:rtx_6000=2|",
+])
+def test_allocation_parser_refuses_missing_malformed_or_inconsistent_gpu_evidence(evidence):
+    """Any ambiguous GPU-bearing source makes a running job unsafe to ignore."""
+    from slurm_mcp.preemption import _parse_job_rows
+
+    with pytest.raises(Exception):
+        _parse_job_rows(f"88|other|normal|RUNNING|node-a|{evidence}\n")
+
+
+def test_exact_victim_requires_single_expanded_candidate_node(monkeypatch):
+    """A multi-node job that merely contains the candidate is not a pinned victim."""
+    from slurm_mcp.preemption import _Candidate, _Job, _Policy, _verify_victim
+
+    victim = _Job("101", "probe-user", "normal", "RUNNING", "node[01-02]", ({"rtx_6000": 1},))
+    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda *args, **kwargs: [victim])
+    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda *args, **kwargs: {"node-01", "node-02"})
+
+    assert not _verify_victim(101, _Candidate("node-01", "rtx_6000", "rtx6000"), _Policy("normal", frozenset({"normal"})), "probe-user")
+
+
+def test_victim_signal_handlers_keep_heartbeating_until_scheduler_requeues():
+    """A handler that exits itself cannot measure scheduler grace time."""
+    from slurm_mcp.preemption import _Candidate, _probe_scripts
+
+    victim, _ = _probe_scripts(_Candidate("node-a", "rtx_6000", "rtx6000"), Path("/home/probe-user/.slurmx/probes/run"), max_seconds=600, victim_qos="normal")
+
+    assert "trap 'record_signal TERM' TERM" in victim
+    assert "trap 'record_signal TERM; exit 0' TERM" not in victim
+
+
+def test_budget_refuses_before_a_mutation_after_a_slow_safety_query(monkeypatch):
+    """Once the bounded wall-clock budget is gone, the preemptor must not submit."""
+    from slurm_mcp.preemption import _Budget, _Refusal
+
+    ticks = iter((10.0, 11.1))
+    monkeypatch.setattr("slurm_mcp.preemption.time.monotonic", lambda: next(ticks))
+    budget = _Budget(1)
+    with pytest.raises(_Refusal, match="deadline"):
+        budget.before_mutation()
+
+
+def _mock_real_probe(monkeypatch, tmp_path, *, verify=True, post=True, measurement=(4, "TERM", True)):
+    """Install an end-to-end fake scheduler; no command reaches the cluster."""
+    import types
+    from slurm_mcp.preemption import _Candidate, _Policy
+
+    candidate = _Candidate("node-a", "rtx_6000", "rtx6000")
+    policy = _Policy("normal", frozenset({"normal"}))
+    submitted, cleaned = [], []
+    monkeypatch.setattr("slurm_mcp.preemption._probe_policy", lambda *args, **kwargs: policy)
+    monkeypatch.setattr("slurm_mcp.preemption._node_snapshot", lambda *args, **kwargs: [])
+    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda *args, **kwargs: [])
+    monkeypatch.setattr("slurm_mcp.preemption._find_candidate", lambda *args, **kwargs: candidate)
+    monkeypatch.setattr("slurm_mcp.preemption._authenticated_probe_root", lambda: str(tmp_path))
+    monkeypatch.setattr("slurm_mcp.preemption._probe_scripts", lambda *args, **kwargs: ("victim", "preemptor"))
+    monkeypatch.setattr("slurm_mcp.preemption.pwd.getpwuid", lambda _: types.SimpleNamespace(pw_name="probe-user"))
+    monkeypatch.setattr("slurm_mcp.preemption._verify_victim", lambda *args, **kwargs: verify)
+    monkeypatch.setattr("slurm_mcp.preemption._post_victim_safe", lambda *args, **kwargs: post)
+    monkeypatch.setattr("slurm_mcp.preemption._measurement", lambda *args, **kwargs: measurement)
+    monkeypatch.setattr("slurm_mcp.preemption._submit", lambda script, path, budget: submitted.append(script) or len(submitted) + 100)
+    monkeypatch.setattr("slurm_mcp.preemption._cleanup", lambda created, user, budget: cleaned.append((created, user)) or ["cleaned"])
+    return submitted, cleaned
+
+
+def test_real_probe_success_is_fully_mocked_and_reports_signal_timing(monkeypatch, tmp_path):
+    """A complete real-mode success path must be testable without SLURM access."""
+    from slurm_mcp.preemption import probe_preemption
+
+    submitted, cleaned = _mock_real_probe(monkeypatch, tmp_path)
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert "TERM warning/grace estimate: 4s (one-second precision)" in result
+    assert submitted == ["victim", "preemptor"]
+    assert cleaned == [([(101, "normal"), (102, "yisroel")], "probe-user")]
+
+
+def test_real_probe_post_victim_refusal_never_submits_preemptor(monkeypatch, tmp_path):
+    """A failed post-victim recheck leaves only the disposable victim to clean up."""
+    from slurm_mcp.preemption import probe_preemption
+
+    submitted, cleaned = _mock_real_probe(monkeypatch, tmp_path, post=False)
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert result.startswith("refused: post-victim safety check failed")
+    assert submitted == ["victim"]
+    assert cleaned == [([(101, "normal")], "probe-user")]
+
+
+def test_real_probe_query_failure_cleans_created_victim(monkeypatch, tmp_path):
+    """A scheduler query error after victim submission still enters disposable cleanup."""
+    from slurm_mcp.preemption import _QueryFailure, probe_preemption
+
+    submitted, cleaned = _mock_real_probe(monkeypatch, tmp_path)
+    monkeypatch.setattr("slurm_mcp.preemption._post_victim_safe", lambda *args, **kwargs: (_ for _ in ()).throw(_QueryFailure("controller lost")))
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert "scheduler query failed: controller lost" in result
+    assert submitted == ["victim"]
+    assert cleaned == [([(101, "normal")], "probe-user")]
+
+
+def test_real_probe_timeout_still_uses_bounded_cleanup(monkeypatch, tmp_path):
+    """Deadline expiry must skip the preemptor but retain a cleanup attempt for the victim."""
+    from slurm_mcp.preemption import probe_preemption
+
+    submitted, cleaned = _mock_real_probe(monkeypatch, tmp_path, verify=False)
+    clock = [0.0]
+    monkeypatch.setattr("slurm_mcp.preemption.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("slurm_mcp.preemption.time.sleep", lambda _: clock.__setitem__(0, 2.0))
+    result = probe_preemption(dry_run=False, max_seconds=1)
+
+    assert result.startswith("refused: timeout waiting for an exactly verified disposable victim")
+    assert submitted == ["victim"]
+    assert cleaned == [([(101, "normal")], "probe-user")]
+
+
+def test_cleanup_refuses_foreign_job_even_after_timeout(monkeypatch):
+    """A foreign job ID must never receive scancel during disposable cleanup."""
+    from slurm_mcp.preemption import _Budget, _cleanup
+
+    calls = _reply(monkeypatch, {("squeue", "-h", "-j", "101", "-o", "%i|%u|%q"): "101|other-user|normal\n"})
+    result = _cleanup([(101, "normal")], "probe-user", _Budget(5))
+
+    assert result == ["left 101: ownership/QoS verification failed"]
+    assert not any(command[0] == "scancel" for command in calls)

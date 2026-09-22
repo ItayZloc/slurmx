@@ -10,7 +10,7 @@ import subprocess
 _SBATCH_ENV_ALIASES = {"SLURM_CLUSTERS", "SLURM_HINT"}
 
 
-def _run(cmd: list[str]) -> str:
+def _run(cmd: list[str], timeout: float = 30) -> str:
     """Run a command and return stdout. Raises on failure."""
     env = None
     if os.path.basename(cmd[0]) == "sbatch":
@@ -19,7 +19,7 @@ def _run(cmd: list[str]) -> str:
             name: value for name, value in os.environ.items()
             if not name.startswith("SBATCH_") and name not in _SBATCH_ENV_ALIASES
         }
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
     return result.stdout

@@ -157,6 +157,11 @@ and event logs use the authenticated account's fixed
 `/home/<user>/.slurmx/probes/` directory, not `$HOME`, and remain there for
 diagnosis.
 
+`max_seconds` accepts 1 through 3600 and bounds scheduler calls and every
+submission decision. The victim records received TERM and USR1 signals without
+voluntarily ending, so a reported estimate is the first received preemption
+signal to the final one-second heartbeat before the scheduler requeues it.
+
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
 card's pending GPUs by user in dispatch order — like the Running block but
 ordered: consecutive jobs from the same user merge into one `user: N GPU(s)` row

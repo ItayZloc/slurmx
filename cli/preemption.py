@@ -18,7 +18,7 @@ def run_info(_args: argparse.Namespace) -> None:
 
 def add_probe_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--real", action="store_true", help="Submit the disposable probe after every safety check.")
-    parser.add_argument("--max-seconds", type=int, default=600, help="Bounded real-probe wait in seconds (default: 600).")
+    parser.add_argument("--max-seconds", type=int, default=600, help="Bounded real-probe wait, 1-3600 seconds (default: 600).")
 
 
 def run_probe(args: argparse.Namespace) -> None:
