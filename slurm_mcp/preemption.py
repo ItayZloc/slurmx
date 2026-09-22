@@ -80,10 +80,17 @@ class _Job:
     state: str
     node_list: str
     gpu_sources: tuple[dict[str, int], ...]
+    per_node_gpu: dict[str, int] | None = None
+    total_gpu: dict[str, int] | None = None
+    per_node_raw: str | None = None
+    per_job_raw: str | None = None
+    allocated_raw: str | None = None
 
     @property
     def uses_gpu(self) -> bool:
-        return any(sum(source.values()) > 0 for source in self.gpu_sources)
+        return any(sum(source.values()) > 0 for source in self.gpu_sources) or any(
+            sum(source.values()) > 0 for source in (self.per_node_gpu, self.total_gpu) if source
+        )
 
 
 def _required(cmd: list[str] | tuple[str, ...], budget: _Budget | None = None) -> str:
@@ -148,15 +155,42 @@ def preemption_info() -> str:
     return "\n".join(lines)
 
 
+def _top_level_tokens(value: str) -> list[str]:
+    tokens, start, depth = [], 0, 0
+    for index, char in enumerate(value):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                raise _QueryFailure(f"unbalanced GPU allocation annotation: {value}")
+        elif char == "," and depth == 0:
+            tokens.append(value[start:index].strip())
+            start = index + 1
+    if depth:
+        raise _QueryFailure(f"unbalanced GPU allocation annotation: {value}")
+    tokens.append(value[start:].strip())
+    if any(not token for token in tokens):
+        raise _QueryFailure(f"unparseable empty allocation fragment: {value}")
+    return tokens
+
+
 def _gpu_source(value: str) -> dict[str, int] | None:
     value = value.strip()
-    if not value or value in {"(null)", "N/A", "None"}:
+    if not value or value == "(null)":
         return None
     aggregate: int | None = None
     typed: dict[str, int] = {}
-    for fragment in value.split(","):
-        clean = re.sub(r"\([^)]*\)$", "", fragment.strip())
+    for fragment in _top_level_tokens(value):
+        if "(" in fragment:
+            if not fragment.endswith(")"):
+                raise _QueryFailure(f"unparseable GPU allocation annotation: {fragment}")
+            clean = fragment.split("(", 1)[0].strip()
+        else:
+            clean = fragment
         if "gpu" not in clean.lower():
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_./-]*(?:=|:)[A-Za-z0-9_.+:-]+", clean):
+                raise _QueryFailure(f"unparseable allocation fragment: {fragment}")
             continue
         match = re.fullmatch(r"(?:gres/)?gpu(?::([A-Za-z0-9_.-]+))?(?:=|:)(\d+)", clean)
         if match is None:
@@ -178,7 +212,24 @@ def _gpu_source(value: str) -> dict[str, int] | None:
 
 
 def _gpu_counts(value: str) -> dict[str, int]:
-    return _gpu_source(value) or {}
+    source = _gpu_source(value)
+    if source is None:
+        raise _QueryFailure("missing GPU allocation evidence")
+    return source
+
+
+def _normalize_allocation_sources(sources: list[dict[str, int]]) -> dict[str, int]:
+    """Coalesce a matching aggregate and typed scheduler representation."""
+    typed = [source for source in sources if "" not in source]
+    aggregate = [source for source in sources if set(source) == {""}]
+    if typed:
+        canonical = typed[0]
+        if any(source != canonical for source in typed) or any(source[""] != sum(canonical.values()) for source in aggregate):
+            raise _QueryFailure("inconsistent aggregate and typed GPU allocation sources")
+        return canonical
+    if len({tuple(sorted(source.items())) for source in sources}) != 1:
+        raise _QueryFailure("inconsistent GPU allocation sources for running job")
+    return sources[0]
 
 
 def _node_fields(line: str) -> dict[str, str]:
@@ -197,17 +248,21 @@ def _parse_job_rows(raw: str) -> list[_Job]:
         parsed = [_gpu_source(value) for value in fields[5:]]
         if all(source is None for source in parsed):
             raise _QueryFailure("missing GPU allocation evidence for running job")
-        sources = [source for source in parsed if source]
-        typed = [source for source in sources if "" not in source]
-        aggregate = [source for source in sources if set(source) == {""}]
-        if typed:
-            canonical = typed[0]
-            if any(source != canonical for source in typed) or any(source[""] != sum(canonical.values()) for source in aggregate):
-                raise _QueryFailure("inconsistent GPU allocation sources for running job")
-            sources = [canonical for _ in sources]
-        if len({tuple(sorted(source.items())) for source in sources}) > 1:
-            raise _QueryFailure("inconsistent GPU allocation sources for running job")
-        rows.append(_Job(*fields[:5], gpu_sources=tuple(sources)))
+        per_job, per_node = parsed[:2]
+        allocated = parsed[2] if len(parsed) == 3 else None
+        totals = [source for source in (per_job, allocated) if source is not None]
+        total = _normalize_allocation_sources(totals) if totals else None
+        if "[" not in fields[4] and per_node is not None and total is not None and per_node != total:
+            raise _QueryFailure("inconsistent single-node GPU allocation sources for running job")
+        sources = tuple(
+            total if source in totals else source
+            for source in parsed if source is not None
+        )
+        rows.append(_Job(
+            *fields[:5], gpu_sources=sources, per_node_gpu=per_node, total_gpu=total,
+            per_job_raw=fields[5], per_node_raw=fields[6],
+            allocated_raw=fields[7] if len(fields) == 8 else None,
+        ))
     return rows
 
 
@@ -227,7 +282,10 @@ def _detail_job(listed: list[str], budget: _Budget | None = None) -> _Job:
     values = (detail.get("TresPerJob", ""), detail.get("TresPerNode", ""), detail.get("AllocTRES", ""))
     if not any(values):
         raise _QueryFailure(f"missing GPU allocation detail for job {listed[0]}")
-    return _parse_job_rows("|".join([job_id, user, qos, state, node_list, *values]))[0]
+    return _Job(
+        job_id, user, qos, state, node_list, (), per_job_raw=values[0],
+        per_node_raw=values[1], allocated_raw=values[2],
+    )
 
 
 def _job_snapshot(job_id: int | None = None, budget: _Budget | None = None) -> list[_Job]:
@@ -268,6 +326,47 @@ def _job_on_node(job: _Job, node: str, budget: _Budget | None = None) -> bool:
     return node in _expand_nodelist(job.node_list, budget)
 
 
+def _multiply_allocation(source: dict[str, int], nodes: int) -> dict[str, int]:
+    return {gpu_type: count * nodes for gpu_type, count in source.items()}
+
+
+def _job_gpu_on_nodes(job: _Job, nodes: set[str]) -> dict[str, int]:
+    """Return one node's allocation only when scheduler fields prove it."""
+    if not nodes:
+        raise _QueryFailure("empty scheduler job allocation")
+    if job.per_node_raw is None and job.per_job_raw is None and job.allocated_raw is None:
+        if not job.gpu_sources:
+            raise _QueryFailure("missing GPU allocation evidence for running job")
+        if len({tuple(sorted(source.items())) for source in job.gpu_sources}) != 1:
+            raise _QueryFailure("inconsistent GPU allocation sources for running job")
+        return job.gpu_sources[0]
+
+    per_node = _gpu_source(job.per_node_raw or "")
+    totals = [
+        source for value in (job.per_job_raw, job.allocated_raw)
+        if value is not None and (source := _gpu_source(value or "")) is not None
+    ]
+    total = _normalize_allocation_sources(totals) if totals else None
+    if per_node is None and total is None:
+        raise _QueryFailure("missing GPU allocation evidence for running job")
+    if per_node is not None:
+        if total is not None and _multiply_allocation(per_node, len(nodes)) != total:
+            raise _QueryFailure("inconsistent per-node and total GPU allocation sources for running job")
+        return per_node
+    if total == {}:
+        return {}
+    if len(nodes) != 1:
+        raise _QueryFailure("cannot attribute a multi-node total GPU allocation to one node")
+    return total or {}
+
+
+def _job_gpu_on_candidate(job: _Job, node: str, budget: _Budget | None = None) -> dict[str, int] | None:
+    nodes = _expand_nodelist(job.node_list, budget)
+    if node not in nodes:
+        return None
+    return _job_gpu_on_nodes(job, nodes)
+
+
 def _probe_policy(budget: _Budget | None = None) -> _Policy:
     config = _config_values(_required(("scontrol", "show", "config"), budget))
     if "preempt/qos" not in _setting(config, "PreemptType").lower():
@@ -301,7 +400,15 @@ def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], policy: _Poli
                 continue
             if total.get(gpu_type, 0) - used.get(gpu_type, 0) != 1:
                 continue
-            if any(job.state == "RUNNING" and job.qos in policy.preemptible_qos and job.uses_gpu and _job_on_node(job, node, budget) for job in jobs):
+            occupied = False
+            for job in jobs:
+                if job.state != "RUNNING" or job.qos not in policy.preemptible_qos:
+                    continue
+                allocation = _job_gpu_on_candidate(job, node, budget)
+                if allocation is not None and sum(allocation.values()) > 0:
+                    occupied = True
+                    break
+            if occupied:
                 continue
             return _Candidate(node, gpu_type, golden_partition)
     return None
@@ -375,27 +482,42 @@ def _submit(script: str, path: Path, budget: _Budget) -> int:
     return int(match.group(1))
 
 
-def _exact_gpu(job: _Job, candidate: _Candidate) -> bool:
-    nonempty = [source for source in job.gpu_sources if source]
-    return bool(nonempty) and all(source == {candidate.gpu_type: 1} for source in nonempty)
+def _exact_gpu(job: _Job, candidate: _Candidate, nodes: set[str]) -> bool:
+    return _job_gpu_on_nodes(job, nodes) == {candidate.gpu_type: 1}
 
 
 def _verify_victim(job_id: int, candidate: _Candidate, policy: _Policy, user: str, budget: _Budget | None = None) -> bool:
     rows = _job_snapshot(job_id, budget)
-    return len(rows) == 1 and (
-        (job := rows[0]).job_id == str(job_id) and job.user == user and job.qos == policy.victim_qos
-        and job.state == "RUNNING" and _expand_nodelist(job.node_list, budget) == {candidate.node} and _exact_gpu(job, candidate)
-    )
+    if len(rows) != 1:
+        return False
+    job = rows[0]
+    try:
+        nodes = _expand_nodelist(job.node_list, budget)
+        return (
+            job.job_id == str(job_id) and job.user == user and job.qos == policy.victim_qos
+            and job.state == "RUNNING" and nodes == {candidate.node} and _exact_gpu(job, candidate, nodes)
+        )
+    except _QueryFailure:
+        return False
 
 
 def _post_victim_safe(candidate: _Candidate, victim_id: int, policy: _Policy, budget: _Budget | None = None) -> bool:
     fields = [node for node in _node_snapshot(budget) if node.get("NodeName") == candidate.node]
     if len(fields) != 1 or not _node_is_usable(fields[0].get("State", "")) or "GresUsed" not in fields[0]:
         return False
-    total = _gpu_counts(fields[0].get("Gres", "")).get(candidate.gpu_type, 0)
-    used = _gpu_counts(fields[0].get("GresUsed", "")).get(candidate.gpu_type, 0)
-    preemptible = [job for job in _job_snapshot(budget=budget) if job.qos in policy.preemptible_qos and job.uses_gpu and _job_on_node(job, candidate.node, budget)]
-    return total > 0 and used == total and len(preemptible) == 1 and preemptible[0].job_id == str(victim_id)
+    try:
+        total = _gpu_counts(fields[0].get("Gres", "")).get(candidate.gpu_type, 0)
+        used = _gpu_counts(fields[0].get("GresUsed", "")).get(candidate.gpu_type, 0)
+        preemptible = []
+        for job in _job_snapshot(budget=budget):
+            if job.qos not in policy.preemptible_qos:
+                continue
+            allocation = _job_gpu_on_candidate(job, candidate.node, budget)
+            if allocation is not None and sum(allocation.values()) > 0:
+                preemptible.append(job)
+        return total > 0 and used == total and len(preemptible) == 1 and preemptible[0].job_id == str(victim_id)
+    except _QueryFailure:
+        return False
 
 
 def _measurement(event_log: Path) -> tuple[int | None, str | None, bool]:
@@ -470,8 +592,9 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
         if candidate is None:
             raise _Refusal("no isolated node exists")
         budget.before_mutation()
-        probe_dir = Path(root) / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
-        probe_dir.mkdir(parents=True, mode=0o700)
+        created_dir = Path(root) / f"{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        created_dir.mkdir(parents=True, mode=0o700)
+        probe_dir = created_dir
         victim_script, preemptor_script = _probe_scripts(candidate, probe_dir, max_seconds=max_seconds, victim_qos=policy.victim_qos)
         victim_id = _submit(victim_script, probe_dir / "victim.sh", budget)
         created.append((victim_id, policy.victim_qos))
@@ -501,10 +624,9 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     except Exception as exc:
         outcome = f"refused: probe exception: {exc}"
     finally:
-        # Once the diagnostic budget is exhausted, cleanup still needs a short,
-        # separately bounded verification window. It never broadens the IDs it
-        # may cancel, and it avoids leaving a disposable victim behind.
-        cleanup_budget = budget if budget.remaining() > 0 else _Budget(5)
+        # Cleanup always has a distinct fixed window. It never broadens the IDs
+        # it may cancel, and does not make the diagnostic exceed its deadline.
+        cleanup_budget = _Budget(5)
         cleanup = _cleanup(created, user, cleanup_budget) if "user" in locals() else []
-    logs = str(probe_dir) if probe_dir is not None else "unavailable (probe directory was not created)"
-    return "\n".join((outcome, f"probe logs retained: {logs}", "cleanup: " + "; ".join(cleanup or ["no jobs created"])))
+    logs = f"probe logs retained: {probe_dir}" if probe_dir is not None and probe_dir.exists() else "probe logs unavailable: probe directory was not created"
+    return "\n".join((outcome, logs, "cleanup: " + "; ".join(cleanup or ["no jobs created"])))

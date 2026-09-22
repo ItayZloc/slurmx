@@ -158,9 +158,13 @@ and event logs use the authenticated account's fixed
 diagnosis.
 
 `max_seconds` accepts 1 through 3600 and bounds scheduler calls and every
-submission decision. The victim records received TERM and USR1 signals without
-voluntarily ending, so a reported estimate is the first received preemption
-signal to the final one-second heartbeat before the scheduler requeues it.
+submission decision. It excludes a separate, fixed five-second cleanup window
+that can only inspect and cancel IDs created by this probe after matching their
+owner and QoS. The result reports retained logs only when the probe directory
+was created successfully. The victim records received TERM and USR1 signals
+without voluntarily ending, so a reported estimate is the first received
+preemption signal to the final one-second heartbeat before the scheduler
+requeues it.
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
 card's pending GPUs by user in dispatch order — like the Running block but

@@ -235,7 +235,8 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
 
     Args:
         dry_run: Keep true unless a real scheduler diagnostic is authorized.
-        max_seconds: Complete real-probe wall-clock bound, from 1 to 3600 seconds.
+        max_seconds: Real-probe diagnostic wall-clock bound, from 1 to 3600 seconds.
+            Exact-ID ownership cleanup has a separate fixed five-second bound.
     """
     return slurm_mcp.probe_preemption(dry_run=dry_run, max_seconds=max_seconds)
 

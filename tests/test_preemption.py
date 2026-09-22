@@ -259,7 +259,7 @@ def test_tres_job_parser_uses_allocated_tres_when_job_and_node_requests_are_empt
 
 def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(monkeypatch):
     """A compressed allocation on the candidate node must block every preemptible QoS."""
-    from slurm_mcp.preemption import _Candidate, _Policy, _find_candidate, _parse_job_rows
+    from slurm_mcp.preemption import _Candidate, _Policy, _QueryFailure, _find_candidate, _parse_job_rows
 
     nodes = [{
         "NodeName": "node-01", "State": "MIXED", "Partitions": "main,rtx6000",
@@ -269,7 +269,8 @@ def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(m
     policy = _Policy(victim_qos="normal", preemptible_qos=frozenset({"normal", "alternate"}))
     monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda *args, **kwargs: {"node-01", "node-02"})
 
-    assert _find_candidate(nodes, jobs, policy) is None
+    with pytest.raises(_QueryFailure, match="cannot attribute"):
+        _find_candidate(nodes, jobs, policy)
 
 
 @pytest.mark.parametrize("state", ["DOWN", "DRAINING", "FAIL", "MAINT", "NO_RESPOND", "POWER_DOWN", "UNKNOWN"])
@@ -404,7 +405,7 @@ def _mock_real_probe(monkeypatch, tmp_path, *, verify=True, post=True, measureme
     monkeypatch.setattr("slurm_mcp.preemption._post_victim_safe", lambda *args, **kwargs: post)
     monkeypatch.setattr("slurm_mcp.preemption._measurement", lambda *args, **kwargs: measurement)
     monkeypatch.setattr("slurm_mcp.preemption._submit", lambda script, path, budget: submitted.append(script) or len(submitted) + 100)
-    monkeypatch.setattr("slurm_mcp.preemption._cleanup", lambda created, user, budget: cleaned.append((created, user)) or ["cleaned"])
+    monkeypatch.setattr("slurm_mcp.preemption._cleanup", lambda created, user, budget: cleaned.append((created, user, budget)) or ["cleaned"])
     return submitted, cleaned
 
 
@@ -417,7 +418,7 @@ def test_real_probe_success_is_fully_mocked_and_reports_signal_timing(monkeypatc
 
     assert "TERM warning/grace estimate: 4s (one-second precision)" in result
     assert submitted == ["victim", "preemptor"]
-    assert cleaned == [([(101, "normal"), (102, "yisroel")], "probe-user")]
+    assert cleaned[0][:2] == ([(101, "normal"), (102, "yisroel")], "probe-user")
 
 
 def test_real_probe_post_victim_refusal_never_submits_preemptor(monkeypatch, tmp_path):
@@ -429,7 +430,7 @@ def test_real_probe_post_victim_refusal_never_submits_preemptor(monkeypatch, tmp
 
     assert result.startswith("refused: post-victim safety check failed")
     assert submitted == ["victim"]
-    assert cleaned == [([(101, "normal")], "probe-user")]
+    assert cleaned[0][:2] == ([(101, "normal")], "probe-user")
 
 
 def test_real_probe_query_failure_cleans_created_victim(monkeypatch, tmp_path):
@@ -442,7 +443,7 @@ def test_real_probe_query_failure_cleans_created_victim(monkeypatch, tmp_path):
 
     assert "scheduler query failed: controller lost" in result
     assert submitted == ["victim"]
-    assert cleaned == [([(101, "normal")], "probe-user")]
+    assert cleaned[0][:2] == ([(101, "normal")], "probe-user")
 
 
 def test_real_probe_timeout_still_uses_bounded_cleanup(monkeypatch, tmp_path):
@@ -457,7 +458,7 @@ def test_real_probe_timeout_still_uses_bounded_cleanup(monkeypatch, tmp_path):
 
     assert result.startswith("refused: timeout waiting for an exactly verified disposable victim")
     assert submitted == ["victim"]
-    assert cleaned == [([(101, "normal")], "probe-user")]
+    assert cleaned[0][:2] == ([(101, "normal")], "probe-user")
 
 
 def test_cleanup_refuses_foreign_job_even_after_timeout(monkeypatch):
@@ -469,3 +470,199 @@ def test_cleanup_refuses_foreign_job_even_after_timeout(monkeypatch):
 
     assert result == ["left 101: ownership/QoS verification failed"]
     assert not any(command[0] == "scancel" for command in calls)
+
+
+@pytest.mark.parametrize("value", ["unavailable", "N/A", "mystery-value"])
+def test_gpu_allocation_unknown_markers_are_not_cpu_zero(value):
+    """Unknown nonempty allocation text must refuse rather than imply no GPU."""
+    from slurm_mcp.preemption import _QueryFailure, _gpu_source
+
+    with pytest.raises(_QueryFailure):
+        _gpu_source(value)
+
+
+def test_gpu_allocation_parser_keeps_parenthesized_index_commas_in_one_token():
+    """GRES index annotations contain commas but still describe one typed allocation."""
+    from slurm_mcp.preemption import _gpu_source
+
+    assert _gpu_source("gpu:rtx_6000:3(IDX:0,2-3)") == {"rtx_6000": 3}
+
+
+def test_gpu_allocation_parser_rejects_text_after_an_annotation():
+    """Only a complete parenthesized scheduler annotation may follow a GRES token."""
+    from slurm_mcp.preemption import _QueryFailure, _gpu_source
+
+    with pytest.raises(_QueryFailure):
+        _gpu_source("gpu:rtx_6000:3(IDX:0) unexpected")
+
+
+def test_candidate_refuses_unknown_node_gpu_usage():
+    """An unavailable GresUsed field cannot create a false isolated GPU."""
+    from slurm_mcp.preemption import _Policy, _QueryFailure, _find_candidate
+
+    nodes = [{
+        "NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000",
+        "Gres": "gpu:rtx_6000:2", "GresUsed": "unavailable",
+    }]
+    with pytest.raises(_QueryFailure):
+        _find_candidate(nodes, [], _Policy("normal", frozenset({"normal"})))
+
+
+def test_candidate_ignores_unrelated_multinode_allocation_before_gpu_parsing(monkeypatch):
+    """Malformed allocation data outside the candidate's expanded node set is irrelevant."""
+    from slurm_mcp.preemption import _Job, _Policy, _find_candidate
+
+    nodes = [{
+        "NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000",
+        "Gres": "gpu:rtx_6000:2", "GresUsed": "gpu:rtx_6000:1",
+    }]
+    job = _Job("99", "other", "normal", "RUNNING", "node[02-03]", (), "unavailable", "unavailable")
+    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value, *args, **kwargs: {"node-02", "node-03"})
+
+    assert _find_candidate(nodes, [job], _Policy("normal", frozenset({"normal"}))).node == "node-a"
+
+
+def test_multinode_per_node_and_total_gpu_evidence_are_scope_aware():
+    """A per-node request and a two-node total must agree after multiplying by nodes."""
+    from slurm_mcp.preemption import _parse_job_rows
+
+    job = _parse_job_rows(
+        "99|other|normal|RUNNING|node[01-02]||gres/gpu:rtx_6000=1|gres/gpu:rtx_6000=2\n"
+    )[0]
+
+    assert job.per_node_gpu == {"rtx_6000": 1}
+    assert job.total_gpu == {"rtx_6000": 2}
+
+
+def test_probe_cleanup_has_its_own_budget_after_diagnostic_deadline(monkeypatch, tmp_path):
+    """A spent diagnostic budget must not suppress exact-ID ownership cleanup."""
+    from slurm_mcp.preemption import _Budget, probe_preemption
+
+    submitted, cleaned = _mock_real_probe(monkeypatch, tmp_path, verify=False)
+    clock = [0.0]
+    monkeypatch.setattr("slurm_mcp.preemption.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("slurm_mcp.preemption.time.sleep", lambda _: clock.__setitem__(0, 2.0))
+    result = probe_preemption(dry_run=False, max_seconds=1)
+
+    assert result.startswith("refused: timeout waiting")
+    assert submitted == ["victim"]
+    assert cleaned[0][0] == [(101, "normal")]
+    assert isinstance(cleaned[0][2], _Budget)
+    assert cleaned[0][2].max_seconds == 5
+
+
+def _boundary_scheduler(monkeypatch, tmp_path, *, post_race=False, query_failure=False, foreign_cleanup=False, never_runs=False):
+    """Mock the scheduler process boundary and reject every unmodelled command."""
+    import types
+    from slurm_mcp import preemption
+
+    state = {"victim": False, "preemptor": False, "cancelled": [], "config_calls": 0}
+    victim = "101|probe-user|normal|RUNNING|node-a"
+    alternate = "202|other|alternate|RUNNING|node-a"
+
+    def detail(row):
+        job_id, user, qos, job_state, node = row.split("|")
+        return (
+            f"JobId={job_id} UserId={user}(1) QOS={qos} JobState={job_state} "
+            f"NodeList={node} TresPerNode=gres/gpu:rtx_6000=1 "
+            f"AllocTRES=gres/gpu=1,gres/gpu:rtx_6000=1\n"
+        )
+
+    def run(command, timeout=30):
+        cmd = tuple(command)
+        if cmd == ("scontrol", "show", "config"):
+            state["config_calls"] += 1
+            return CONFIG
+        if cmd == ("sacctmgr", "-nP", "show", "qos", "format=Name,Preempt,PreemptMode,GraceTime"):
+            return "normal||REQUEUE|0\nalternate||REQUEUE|0\nyisroel|normal,alternate|REQUEUE|120\n"
+        if cmd == NODE_DETAIL:
+            if query_failure and state["victim"]:
+                raise RuntimeError("controller lost")
+            return NODES_FULL if state["victim"] else NODES_ONE_FREE
+        if cmd == JOB_LIST:
+            if not state["victim"]:
+                return ""
+            return victim + "\n" + (alternate + "\n" if post_race else "")
+        if cmd[:4] == ("squeue", "-h", "-j", "101"):
+            if cmd[-1] == "%i|%u|%q":
+                owner = "other-user" if foreign_cleanup else "probe-user"
+                return f"101|{owner}|normal\n"
+            return victim + "\n" if state["victim"] and not never_runs else ""
+        if cmd[:4] == ("squeue", "-h", "-j", "102") and cmd[-1] == "%i|%u|%q":
+            return "102|probe-user|yisroel\n"
+        if cmd[:4] == ("scontrol", "show", "job", "-o"):
+            job_id = cmd[4]
+            if job_id == "101":
+                return detail(victim)
+            if job_id == "202":
+                return detail(alternate)
+        if cmd == ("scontrol", "show", "hostnames", "node-a"):
+            return "node-a\n"
+        if cmd[:2] == ("sbatch", "--parsable"):
+            if not state["victim"]:
+                state["victim"] = True
+                return "101\n"
+            state["preemptor"] = True
+            (Path(cmd[2]).parent / "victim-events.log").write_text("heartbeat 10\nsignal TERM 11\nheartbeat 12\nrestart 13\n")
+            return "102\n"
+        if cmd[:1] == ("scancel",):
+            state["cancelled"].append(cmd[1])
+            return ""
+        raise AssertionError(f"unexpected scheduler command: {command}")
+
+    monkeypatch.setattr(preemption.shell, "_run", run)
+    monkeypatch.setattr(preemption, "_authenticated_probe_root", lambda: str(tmp_path))
+    monkeypatch.setattr(preemption, "_probe_scripts", lambda *args, **kwargs: ("victim", "preemptor"))
+    monkeypatch.setattr(preemption.pwd, "getpwuid", lambda _: types.SimpleNamespace(pw_name="probe-user"))
+    return state
+
+
+def test_real_probe_boundary_success_uses_only_modelled_scheduler_commands(monkeypatch, tmp_path):
+    """The complete real lifecycle is isolated at the subprocess scheduler boundary."""
+    from slurm_mcp.preemption import probe_preemption
+
+    state = _boundary_scheduler(monkeypatch, tmp_path)
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert "probe completed: victim restart observed; TERM warning/grace estimate: 1s" in result
+    assert state["preemptor"]
+    assert state["cancelled"] == ["101", "102"]
+
+
+def test_real_probe_boundary_post_victim_race_refuses_before_preemptor(monkeypatch, tmp_path):
+    """A second controller-preemptible allocation blocks the golden submission."""
+    from slurm_mcp.preemption import probe_preemption
+
+    state = _boundary_scheduler(monkeypatch, tmp_path, post_race=True)
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert result.startswith("refused: post-victim safety check failed")
+    assert not state["preemptor"]
+    assert state["cancelled"] == ["101"]
+
+
+def test_real_probe_boundary_query_failure_cleans_exact_owned_victim(monkeypatch, tmp_path):
+    """A failed recheck still uses the independent cleanup window for the created victim."""
+    from slurm_mcp.preemption import probe_preemption
+
+    state = _boundary_scheduler(monkeypatch, tmp_path, query_failure=True)
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert "scheduler query failed: controller lost" in result
+    assert not state["preemptor"]
+    assert state["cancelled"] == ["101"]
+
+
+def test_real_probe_boundary_timeout_and_foreign_cleanup_never_cancel(monkeypatch, tmp_path):
+    """A timing expiry has cleanup time, but a foreign owner prevents scancel."""
+    from slurm_mcp.preemption import probe_preemption
+
+    state = _boundary_scheduler(monkeypatch, tmp_path, foreign_cleanup=True, never_runs=True)
+    clock = [0.0]
+    monkeypatch.setattr("slurm_mcp.preemption.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("slurm_mcp.preemption.time.sleep", lambda _: clock.__setitem__(0, 2.0))
+    result = probe_preemption(dry_run=False, max_seconds=1)
+
+    assert result.startswith("refused: timeout waiting")
+    assert not state["preemptor"]
+    assert state["cancelled"] == []
