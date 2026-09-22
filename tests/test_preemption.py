@@ -21,6 +21,17 @@ def _job_detail(job_id, user, qos, state, nodes, tres_job="gres/gpu:rtx_6000=1",
     return f"JobId={job_id} UserId={user}(1) QOS={qos} JobState={state} NodeList={nodes} TresPerJob={tres_job} TresPerNode={tres_node} AllocTRES={tres_job}\n"
 
 
+def _inprocess_scan(mode, budget, *, candidate=None, victim_id=None):
+    from slurm_mcp import preemption_scan_runtime
+
+    if mode == "candidate":
+        return preemption_scan_runtime.find_candidate(
+            preemption_scan_runtime._node_snapshot(budget),
+            preemption_scan_runtime._job_snapshot(budget=budget, details=False), budget,
+        )
+    return preemption_scan_runtime.post_victim_residency(candidate, victim_id, budget)
+
+
 def _reply(monkeypatch, responses):
     """Replace external scheduler commands with complete, command-keyed output."""
     from slurm_mcp import preemption
@@ -39,6 +50,7 @@ def _reply(monkeypatch, responses):
         return response
 
     monkeypatch.setattr(preemption.shell, "_run", run)
+    monkeypatch.setattr(preemption, "_scan_external", _inprocess_scan)
     return calls
 
 
@@ -191,9 +203,10 @@ def test_probe_skips_irrelevant_nodes_before_requiring_gpu_evidence(monkeypatch,
 ])
 def test_production_job_allocation_matrix(monkeypatch, per_node, per_job, allocated, want, exact):
     from slurm_mcp.preemption import (
-        _Candidate, _Policy, _QueryFailure, _find_candidate, _job_gpu_on_candidate,
+        _Candidate, _Policy, _QueryFailure, _job_gpu_on_candidate,
         _job_snapshot, _node_snapshot, _verify_victim,
     )
+    from slurm_mcp.preemption_scan_runtime import find_candidate
 
     _reply(monkeypatch, _allocation_responses(per_node=per_node, per_job=per_job, allocated=allocated))
     jobs = _job_snapshot()
@@ -203,7 +216,7 @@ def test_production_job_allocation_matrix(monkeypatch, per_node, per_job, alloca
             _job_gpu_on_candidate(jobs[0], "node-a")
     else:
         assert _job_gpu_on_candidate(jobs[0], "node-a") == want
-    assert _find_candidate(_node_snapshot(), jobs) is None
+    assert find_candidate(_node_snapshot(), jobs) is None
     assert _verify_victim(101, _Candidate("node-a", "rtx_6000", "rtx6000"), policy, "probe-user") is exact
 
 
@@ -390,19 +403,143 @@ def test_victim_verification_requires_exact_identity_owner_qos_node_state_and_gp
     assert not _verify_victim(101, candidate, policy, "other-user")
 
 
+@pytest.mark.parametrize("node_list", ["(Resources)", ""])
+def test_victim_verification_waits_while_its_job_is_pending(monkeypatch, node_list):
+    """A queued disposable victim is not a malformed global running-job row."""
+    from slurm_mcp.preemption import _Candidate, _Policy, _verify_victim
+
+    responses = _scan_responses()
+    responses[("squeue", "-h", "-j", "101", "-o", "%A|%u|%q|%T|%N")] = (
+        f"101|probe-user|normal|PENDING|{node_list}\n"
+    )
+    _reply(monkeypatch, responses)
+
+    assert not _verify_victim(
+        101, _Candidate("node-a", "rtx_6000", "rtx6000"),
+        _Policy("normal", frozenset({"normal"})), "probe-user",
+    )
+
+
+@pytest.mark.parametrize("state", ["RUNNIGN", "COMPLETING", "CANCELLED"])
+def test_targeted_victim_snapshot_rejects_unexpected_state(monkeypatch, state):
+    from slurm_mcp import preemption
+
+    responses = _scan_responses()
+    responses[("squeue", "-h", "-j", "101", "-o", "%A|%u|%q|%T|%N")] = (
+        f"101|probe-user|normal|{state}|node-a\n"
+    )
+    _reply(monkeypatch, responses)
+
+    with pytest.raises(preemption._QueryFailure, match="running-job row"):
+        preemption._job_snapshot(101, details=False)
+
+
+@pytest.mark.parametrize("unsafe_kind", ["writable", "symlink"])
+def test_home_scanner_refuses_untrusted_parent_directory(monkeypatch, tmp_path, unsafe_kind):
+    from slurm_mcp import preemption
+
+    actual_dir = tmp_path / "scanner_dir"
+    actual_dir.mkdir(mode=0o700)
+    scanner = actual_dir / "preemption_scan.py"
+    scanner.write_text("print('null')\n")
+    scanner.chmod(0o700)
+    if unsafe_kind == "writable":
+        actual_dir.chmod(0o777)
+        chosen_dir = actual_dir
+    else:
+        chosen_dir = tmp_path / "scanner_link"
+        chosen_dir.symlink_to(actual_dir, target_is_directory=True)
+    monkeypatch.setattr(preemption, "_authenticated_probe_root", lambda: str(chosen_dir / "probes"))
+
+    with pytest.raises(preemption._QueryFailure, match="scanner directory"):
+        preemption._scanner_path()
+
+
+def test_external_scanner_is_reloaded_from_home_on_each_call(monkeypatch, tmp_path):
+    """Changing the home script must affect the next call without an MCP reload."""
+    from slurm_mcp import preemption
+
+    scanner = tmp_path / "preemption_scan.py"
+    monkeypatch.setattr(preemption, "_scanner_path", lambda: scanner, raising=False)
+    scanner.write_text('import json\nprint(json.dumps({"node": "node-a", "gpu_type": "rtx_6000", "golden_partition": "rtx6000"}))\n')
+    first = preemption._scan_external("candidate", preemption._Budget(30))
+    scanner.write_text('import json\nprint(json.dumps({"node": "node-b", "gpu_type": "rtx_6000", "golden_partition": "rtx6000"}))\n')
+    second = preemption._scan_external("candidate", preemption._Budget(30))
+
+    assert first.node == "node-a"
+    assert second.node == "node-b"
+
+
+def test_external_scanner_runs_with_isolated_python(monkeypatch, tmp_path):
+    from slurm_mcp import preemption
+
+    scanner = tmp_path / "preemption_scan.py"
+    scanner.write_text('import sys\nprint("null" if sys.flags.isolated else "not json")\n')
+    monkeypatch.setattr(preemption, "_scanner_path", lambda: scanner)
+
+    assert preemption._scan_external("candidate", preemption._Budget(30)) is None
+
+
+def test_home_scanner_cli_reports_candidate_and_post_victim_residency(monkeypatch, capsys):
+    """The deployed scanner's process boundary returns structured scan evidence."""
+    import json
+    from slurm_mcp.preemption_scan_runtime import main
+
+    responses = _allocation_responses(per_node="gres/gpu:rtx_6000=1", allocated="gres/gpu=1")
+    responses[JOB_LIST] = NO_JOBS
+    _reply(monkeypatch, responses)
+    assert main(["preemption_scan.py", "candidate", "30"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "node": "node-a", "gpu_type": "rtx_6000", "golden_partition": "rtx6000",
+    }
+
+    responses[JOB_LIST] = "101|probe-user|normal|RUNNING|node-a\n"
+    responses[NODE_DETAIL] = NODES_FULL
+    assert main(["preemption_scan.py", "post", "30", "node-a", "rtx_6000", "rtx6000", "101"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"safe": True}
+
+
+def test_probe_refuses_a_missing_home_scanner_before_submission(monkeypatch, tmp_path):
+    """A missing deployed helper cannot turn an unknown node into a candidate."""
+    from slurm_mcp import preemption
+
+    real_scan = preemption._scan_external
+    calls = _reply(monkeypatch, _scan_responses())
+    monkeypatch.setattr(preemption, "_scan_external", real_scan)
+    monkeypatch.setattr(preemption, "_scanner_path", lambda: tmp_path / "missing.py")
+
+    result = preemption.probe_preemption()
+
+    assert "home preemption scanner failed" in result
+    assert not any(command[0] == "sbatch" for command in calls)
+
+
+def test_external_scanner_rejects_malformed_candidate_json(monkeypatch, tmp_path):
+    """The MCP side must validate an edited home script's response."""
+    from slurm_mcp import preemption
+
+    scanner = tmp_path / "preemption_scan.py"
+    scanner.write_text('print("not json")\n')
+    monkeypatch.setattr(preemption, "_scanner_path", lambda: scanner)
+
+    with pytest.raises(preemption._QueryFailure, match="home preemption scanner failed"):
+        preemption._scan_external("candidate", preemption._Budget(30))
+
+
 def test_post_victim_check_refuses_an_alternate_preemptible_race(monkeypatch):
     """A second QoS in the controller-derived preemptible set blocks the golden submit."""
-    from slurm_mcp.preemption import _Candidate, _Job, _Policy, _post_victim_safe
+    from slurm_mcp.preemption import _Candidate, _Job
+    from slurm_mcp.preemption_scan_runtime import post_victim_residency
 
     jobs = [
         _Job("101", "probe-user", "normal", "RUNNING", "node-a", per_node_raw="gres/gpu:rtx_6000=1"),
         _Job("102", "other", "alternate", "RUNNING", "node-a", per_node_raw="gres/gpu:rtx_6000=1"),
     ]
-    monkeypatch.setattr("slurm_mcp.preemption._node_snapshot", lambda *args, **kwargs: [{"NodeName": "node-a", "State": "ALLOCATED", "Gres": "gpu:rtx_6000:2", "GresUsed": "gpu:rtx_6000:2"}])
-    monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda *args, **kwargs: jobs)
-    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value, *args, **kwargs: {value})
+    monkeypatch.setattr("slurm_mcp.preemption_scan_runtime._node_snapshot", lambda *args, **kwargs: [{"NodeName": "node-a", "State": "ALLOCATED", "Gres": "gpu:rtx_6000:2", "GresUsed": "gpu:rtx_6000:2"}])
+    monkeypatch.setattr("slurm_mcp.preemption_scan_runtime._job_snapshot", lambda *args, **kwargs: jobs)
+    monkeypatch.setattr("slurm_mcp.preemption_scan_runtime._expand_nodelist", lambda value, *args, **kwargs: {value})
 
-    assert not _post_victim_safe(_Candidate("node-a", "rtx_6000", "rtx6000"), 101, _Policy("normal", frozenset({"normal", "alternate"})), "probe-user")
+    assert not post_victim_residency(_Candidate("node-a", "rtx_6000", "rtx6000"), 101)
 
 
 def test_measurement_requires_a_received_preemption_signal(tmp_path):
@@ -506,7 +643,8 @@ def test_tres_job_parser_uses_allocated_tres_when_job_and_node_requests_are_empt
 
 def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(monkeypatch):
     """A compressed allocation on the candidate node must block every preemptible QoS."""
-    from slurm_mcp.preemption import _find_candidate, _job_snapshot
+    from slurm_mcp.preemption import _job_snapshot
+    from slurm_mcp.preemption_scan_runtime import find_candidate
 
     nodes = [{
         "NodeName": "node-01", "State": "MIXED", "Partitions": "main,rtx6000",
@@ -518,7 +656,7 @@ def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(m
     responses[detail] = responses[detail].replace("normal", "alternate")
     _reply(monkeypatch, responses)
     jobs = _job_snapshot()
-    assert _find_candidate(nodes, jobs) is None
+    assert find_candidate(nodes, jobs) is None
 
 
 @pytest.mark.parametrize("state", ["DOWN", "DRAINING", "FAIL", "MAINT", "NO_RESPOND", "POWER_DOWN", "UNKNOWN"])
@@ -531,11 +669,12 @@ def test_candidate_rejects_non_usable_node_states(state):
 
 def test_candidate_requires_detailed_gres_used_field():
     """Missing GresUsed must not be interpreted as an unused GPU."""
-    from slurm_mcp.preemption import _QueryFailure, _find_candidate
+    from slurm_mcp.preemption import _QueryFailure
+    from slurm_mcp.preemption_scan_runtime import find_candidate
 
     nodes = [{"NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000", "Gres": "gpu:rtx_6000:2"}]
     with pytest.raises(_QueryFailure, match="missing GPU allocation"):
-        _find_candidate(nodes, [])
+        find_candidate(nodes, [])
 
 
 def test_authenticated_probe_root_ignores_malicious_home_and_rejects_bad_account_path(monkeypatch):
@@ -650,7 +789,7 @@ def _mock_real_probe(monkeypatch, tmp_path, *, verify=True, post=True, measureme
     monkeypatch.setattr("slurm_mcp.preemption._probe_policy", lambda *args, **kwargs: policy)
     monkeypatch.setattr("slurm_mcp.preemption._node_snapshot", lambda *args, **kwargs: [])
     monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda *args, **kwargs: [])
-    monkeypatch.setattr("slurm_mcp.preemption._find_candidate", lambda *args, **kwargs: candidate)
+    monkeypatch.setattr("slurm_mcp.preemption._scan_external", lambda *args, **kwargs: candidate)
     monkeypatch.setattr("slurm_mcp.preemption._authenticated_probe_root", lambda: str(tmp_path))
     monkeypatch.setattr("slurm_mcp.preemption._probe_scripts", lambda *args, **kwargs: ("victim", "preemptor"))
     monkeypatch.setattr("slurm_mcp.preemption.pwd.getpwuid", lambda _: types.SimpleNamespace(pw_name="probe-user"))
@@ -751,28 +890,30 @@ def test_gpu_allocation_parser_rejects_text_after_an_annotation():
 
 def test_candidate_refuses_unknown_node_gpu_usage():
     """An unavailable GresUsed field cannot create a false isolated GPU."""
-    from slurm_mcp.preemption import _QueryFailure, _find_candidate
+    from slurm_mcp.preemption import _QueryFailure
+    from slurm_mcp.preemption_scan_runtime import find_candidate
 
     nodes = [{
         "NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000",
         "Gres": "gpu:rtx_6000:2", "GresUsed": "unavailable",
     }]
     with pytest.raises(_QueryFailure):
-        _find_candidate(nodes, [])
+        find_candidate(nodes, [])
 
 
 def test_candidate_ignores_unrelated_multinode_allocation_before_gpu_parsing(monkeypatch):
     """Malformed allocation data outside the candidate's expanded node set is irrelevant."""
-    from slurm_mcp.preemption import _Job, _find_candidate
+    from slurm_mcp.preemption import _Job
+    from slurm_mcp.preemption_scan_runtime import find_candidate
 
     nodes = [{
         "NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000",
         "Gres": "gpu:rtx_6000:2", "GresUsed": "gpu:rtx_6000:1",
     }]
     job = _Job("99", "other", "normal", "RUNNING", "node[02-03]", per_node_raw="unavailable", allocated_raw="unavailable")
-    monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value, *args, **kwargs: {"node-02", "node-03"})
+    monkeypatch.setattr("slurm_mcp.preemption_scan_runtime._expand_nodelist", lambda value, *args, **kwargs: {"node-02", "node-03"})
 
-    assert _find_candidate(nodes, [job]).node == "node-a"
+    assert find_candidate(nodes, [job]).node == "node-a"
 
 
 def test_multinode_per_node_and_total_gpu_evidence_are_scope_aware(monkeypatch):
@@ -875,6 +1016,7 @@ def _boundary_scheduler(
         raise AssertionError(f"unexpected scheduler command: {command}")
 
     monkeypatch.setattr(preemption.shell, "_run", run)
+    monkeypatch.setattr(preemption, "_scan_external", _inprocess_scan)
     monkeypatch.setattr(preemption, "_authenticated_probe_root", lambda: str(tmp_path))
     monkeypatch.setattr(preemption, "_probe_scripts", lambda *args, **kwargs: ("victim", "preemptor"))
     monkeypatch.setattr(preemption.pwd, "getpwuid", lambda _: types.SimpleNamespace(pw_name="probe-user"))
@@ -976,6 +1118,7 @@ def test_post_victim_requires_exact_sole_resident_identity(monkeypatch, job_id, 
     responses = {
         NODE_DETAIL: NODES_FULL,
         JOB_LIST: f"{job_id}|{user}|{qos}|{state}|{node}\n",
+        ("squeue", "-h", "-j", "101", "-o", "%A|%u|%q|%T|%N"): f"{job_id}|{user}|{qos}|{state}|{node}\n",
         ("scontrol", "show", "job", "-o", job_id): (
             f"JobId={job_id} UserId={user}(1) QOS={qos} JobState={state} NodeList={node} "
             "AllocTRES=gres/gpu=1 TresPerNode=gres/gpu:rtx_6000=1 Exclusive=NODE OverSubscribe=NO\n"

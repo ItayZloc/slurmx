@@ -144,6 +144,16 @@ slurmx probe-preemption
 slurmx probe-preemption --real --max-seconds 600
 ```
 
+Read-only candidate and post-victim scans run from
+`/home/<user>/.slurmx/preemption_scan.py` in a fresh Python process for each
+scan. `setup.sh` installs the versioned `slurm_mcp/preemption_scan_runtime.py`
+there if no home copy exists; it leaves an existing copy alone. Update the home
+copy to change scan logic without restarting the MCP server. The registered
+tool keeps job submission, exact-victim verification, and cleanup. A missing,
+unreadable, or malformed scanner refuses the probe. The scanner file and its
+directory must be user-owned and not group- or world-writable. Installing this
+bridge requires one MCP restart; later scanner-only edits do not.
+
 Real mode is only appropriate after an explicit decision to test the scheduler.
 Before submitting the victim, it rechecks isolation: the node must be in `main` and
 the chosen golden partition, have exactly one free GPU of that type, be in a
@@ -175,6 +185,7 @@ verification accepts a consistent aggregate count of one using the probe's
 submitted typed request, and rejects conflicting counts or types.
 
 The victim requests `--exclusive` so another job cannot start alongside it.
+It may wait in the queue; a pending victim is not treated as a running job.
 Before submitting the preemptor, the probe verifies that the victim is the sole
 running job on the node and checks its exact ID, owner, QoS, node, state, GPU
 allocation, and scheduler-reported `Exclusive=NODE` with `OverSubscribe=NO`.

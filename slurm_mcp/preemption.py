@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import math
 import os
 from pathlib import Path
 import pwd
 import re
 import shlex
+import stat
+import subprocess
+import sys
 import time
 import uuid
 
@@ -262,8 +267,14 @@ def _job_snapshot(job_id: int | None = None, budget: _Budget | None = None, *, d
         if not line.strip():
             continue
         fields = [field.strip() for field in line.split("|")]
-        if (len(fields) != 5 or any(not field for field in fields)
-                or not re.fullmatch(r"[0-9]+", fields[0]) or fields[3] != "RUNNING"):
+        if (len(fields) != 5 or any(not field for field in fields[:4])
+                or not re.fullmatch(r"[0-9]+", fields[0])):
+            raise _QueryFailure("unparseable or incomplete running-job row")
+        if fields[3] != "RUNNING":
+            if job_id is not None and fields[3] == "PENDING":
+                continue
+            raise _QueryFailure("unparseable or incomplete running-job row")
+        if not fields[4]:
             raise _QueryFailure("unparseable or incomplete running-job row")
         listed.append(fields)
     if details:
@@ -357,31 +368,6 @@ def _probe_policy(budget: _Budget | None = None) -> _Policy:
     return _Policy(victim_qos="normal", preemptible_qos=frozenset(tokens))
 
 
-def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], budget: _Budget | None = None) -> _Candidate | None:
-    golden = {gpu.name: gpu.golden_partition for gpu in GPU_TYPES if gpu.golden_partition}
-    for fields in nodes:
-        node = fields.get("NodeName", "")
-        if not _SAFE_ATOM.fullmatch(node) or not _node_is_usable(fields.get("State", "")):
-            continue
-        partitions = set(fields.get("Partitions", "").split(","))
-        relevant = {gpu_type: partition for gpu_type, partition in golden.items() if partition in partitions}
-        if MAIN_PARTITION not in partitions or not relevant:
-            continue
-        total, used = _node_gpu_allocations(fields)
-        for gpu_type, golden_partition in relevant.items():
-            if total.get(gpu_type, 0) - used.get(gpu_type, 0) != 1:
-                continue
-            occupied = False
-            for job in jobs:
-                if node in _expand_nodelist(job.node_list, budget):
-                    occupied = True
-                    break
-            if occupied:
-                continue
-            return _Candidate(node, gpu_type, golden_partition)
-    return None
-
-
 def _authenticated_probe_root() -> str:
     account = pwd.getpwuid(os.getuid())
     user, home = account.pw_name, account.pw_dir
@@ -392,6 +378,52 @@ def _authenticated_probe_root() -> str:
     if any(ord(char) < 32 or char.isspace() for char in root) or not root.startswith("/home/"):
         raise _Refusal("unsafe authenticated probe directory")
     return root
+
+
+def _scanner_path() -> Path:
+    directory = Path(_authenticated_probe_root()).parent
+    path = directory / "preemption_scan.py"
+    try:
+        directory_metadata = directory.lstat()
+        metadata = path.lstat()
+    except OSError as exc:
+        raise _QueryFailure(f"home preemption scanner is unavailable: {exc}") from exc
+    if (not stat.S_ISDIR(directory_metadata.st_mode) or directory_metadata.st_uid != os.getuid()
+            or directory_metadata.st_mode & 0o022):
+        raise _QueryFailure("home preemption scanner directory must be user-owned and non-group-writable")
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        raise _QueryFailure("home preemption scanner must be a user-owned, non-group-writable regular file")
+    return path
+
+
+def _scan_external(mode: str, budget: _Budget, *, candidate: _Candidate | None = None, victim_id: int | None = None) -> _Candidate | bool | None:
+    timeout = budget.query_timeout()
+    command = [sys.executable, "-I", str(_scanner_path()), mode, str(math.ceil(timeout))]
+    if mode == "post" and candidate is not None and victim_id is not None:
+        command.extend((candidate.node, candidate.gpu_type, candidate.golden_partition, str(victim_id)))
+    elif mode != "candidate":
+        raise _QueryFailure("invalid home preemption scanner request")
+    try:
+        output = subprocess.run(command, cwd=Path(__file__).resolve().parent.parent, capture_output=True, text=True, timeout=timeout, check=True).stdout
+        data = json.loads(output)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise _QueryFailure(f"home preemption scanner failed: {exc}") from exc
+    if mode == "post":
+        if not isinstance(data, dict) or set(data) != {"safe"} or not isinstance(data["safe"], bool):
+            raise _QueryFailure("home preemption scanner returned invalid post-victim evidence")
+        return data["safe"]
+    if data is None:
+        return None
+    if not isinstance(data, dict) or set(data) != {"node", "gpu_type", "golden_partition"}:
+        raise _QueryFailure("home preemption scanner returned an invalid candidate")
+    values = tuple(data[key] for key in ("node", "gpu_type", "golden_partition"))
+    if not all(isinstance(value, str) and _SAFE_ATOM.fullmatch(value) for value in values):
+        raise _QueryFailure("home preemption scanner returned unsafe candidate fields")
+    choice = _Candidate(*values)
+    expected = {gpu.name: gpu.golden_partition for gpu in GPU_TYPES}
+    if expected.get(choice.gpu_type) != choice.golden_partition:
+        raise _QueryFailure("home preemption scanner returned an invalid GPU partition")
+    return choice
 
 
 def _time_limit(seconds: int) -> str:
@@ -481,21 +513,7 @@ def _verify_victim(job_id: int, candidate: _Candidate, policy: _Policy, user: st
 
 
 def _post_victim_safe(candidate: _Candidate, victim_id: int, policy: _Policy, user: str, budget: _Budget | None = None) -> bool:
-    fields = [node for node in _node_snapshot(budget) if node.get("NodeName") == candidate.node]
-    if len(fields) != 1 or not _node_is_usable(fields[0].get("State", "")) or "GresUsed" not in fields[0]:
-        return False
-    try:
-        inventory, usage = _node_gpu_allocations(fields[0])
-        total, used = inventory.get(candidate.gpu_type, 0), usage.get(candidate.gpu_type, 0)
-        residents = []
-        for job in _job_snapshot(budget=budget, details=False):
-            if candidate.node in _expand_nodelist(job.node_list, budget):
-                residents.append(job)
-        if total <= 0 or used != total or len(residents) != 1:
-            return False
-        return residents[0].job_id == str(victim_id) and _verify_victim(victim_id, candidate, policy, user, budget)
-    except _QueryFailure:
-        return False
+    return _scan_external("post", budget, candidate=candidate, victim_id=victim_id) is True and _verify_victim(victim_id, candidate, policy, user, budget)
 
 
 def _measurement(event_log: Path) -> tuple[int | None, str | None, bool]:
@@ -542,7 +560,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     budget = _Budget(max_seconds)
     try:
         policy = _probe_policy(budget)
-        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget, details=False), budget)
+        candidate = _scan_external("candidate", budget)
     except _Refusal as exc:
         return f"refused: {exc}; no jobs submitted."
     except _QueryFailure as exc:
@@ -566,7 +584,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
         user = pwd.getpwuid(os.getuid()).pw_name
         budget.before_mutation()
         policy = _probe_policy(budget)
-        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget, details=False), budget)
+        candidate = _scan_external("candidate", budget)
         if candidate is None:
             raise _Refusal("no isolated node exists")
         budget.before_mutation()

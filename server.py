@@ -229,6 +229,8 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     Dry run is the default and submits nothing. It reports the isolated node,
     safety evidence, and the two generated scripts. Real mode repeats the
     safety scan across all running jobs, including CPU-only and golden jobs.
+    The read-only scanner is loaded fresh from /home/<user>/.slurmx/
+    preemption_scan.py on each scan; submission and cleanup stay in this tool.
     The candidate must have no co-resident jobs. Its pinned victim requests
     --exclusive; the scheduler must report Exclusive=NODE and OverSubscribe=NO,
     and the exact owned victim must be the sole running job before preemption.
