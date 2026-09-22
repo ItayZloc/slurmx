@@ -13,7 +13,7 @@ NODES_ONE_FREE = "NodeName=node-a State=IDLE Partitions=main,rtx6000 Gres=gpu:rt
 NODES_FULL = "NodeName=node-a State=ALLOCATED Partitions=main,rtx6000 Gres=gpu:rtx_6000:1 GresUsed=gpu:rtx_6000:1\n"
 NO_JOBS = ""
 VICTIM_RUNNING = "101|probe-user|normal|RUNNING|node-a|gpu:rtx_6000:1\n"
-JOB_LIST = ("squeue", "--all", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")
+JOB_LIST = ("squeue", "--all", "-h", "-t", "RUNNING", "-o", "%A|%u|%q|%T|%N")
 NODE_DETAIL = ("scontrol", "show", "node", "-d", "-o")
 
 
@@ -62,7 +62,7 @@ def _allocation_responses(*, per_job="(null)", per_node="(null)", allocated="(nu
     responses = _scan_responses()
     responses.update({
         JOB_LIST: row,
-        ("squeue", "-h", "-j", "101", "-o", "%i|%u|%q|%T|%N"): row,
+        ("squeue", "-h", "-j", "101", "-o", "%A|%u|%q|%T|%N"): row,
         ("scontrol", "show", "job", "-o", "101"): (
             "JobId=101 UserId=probe-user(1) QOS=normal JobState=RUNNING "
             f"NodeList={node_list} TresPerJob={per_job} TresPerNode={per_node} AllocTRES={allocated} "
@@ -71,6 +71,25 @@ def _allocation_responses(*, per_job="(null)", per_node="(null)", allocated="(nu
         ("scontrol", "show", "hostnames", node_list): expanded,
     })
     return responses
+
+
+def test_probe_dry_run_accepts_running_array_task_with_numeric_job_id(monkeypatch):
+    """A CPU array task must not block scanning an otherwise free GPU node."""
+    from slurm_mcp.preemption import probe_preemption
+
+    responses = _scan_responses()
+    responses[JOB_LIST] = (
+        "21592212|other-user|normal|RUNNING|cpu-a\n"
+    )
+    responses[("scontrol", "show", "job", "-o", "21592212")] = (
+        "JobId=21592212 ArrayJobId=21592211 ArrayTaskId=0 "
+        "UserId=other-user(2) QOS=normal JobState=RUNNING NodeList=cpu-a "
+        "TresPerJob=(null) TresPerNode=(null) AllocTRES=cpu=1\n"
+    )
+    responses[("scontrol", "show", "hostnames", "cpu-a")] = "cpu-a\n"
+    _reply(monkeypatch, responses)
+
+    assert "candidate: node=node-a gpu=rtx_6000" in probe_preemption()
 
 
 @pytest.mark.parametrize("partitions", ["cpu", "main", "rtx6000", "main,other"])
@@ -884,8 +903,6 @@ def test_candidate_scan_includes_jobs_in_hidden_partitions(monkeypatch):
     from slurm_mcp.preemption import probe_preemption
 
     responses = _allocation_responses(allocated="cpu=2,mem=4G,node=1")
-    row = responses.pop(JOB_LIST)
-    responses[("squeue", "--all", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")] = row
     _reply(monkeypatch, responses)
 
     assert probe_preemption().startswith("refused: no isolated node exists")

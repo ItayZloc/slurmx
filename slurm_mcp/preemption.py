@@ -18,7 +18,7 @@ from . import shell
 from .gpu_catalog import GPU_TYPES, PRIMARY_QOS
 
 
-_LIST_JOBS = ("squeue", "--all", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")
+_LIST_JOBS = ("squeue", "--all", "-h", "-t", "RUNNING", "-o", "%A|%u|%q|%T|%N")
 _CONFIG_KEYS = (
     ("SLURM version", "SLURM_VERSION"), ("PreemptType", "PreemptType"),
     ("PreemptMode", "PreemptMode"), ("PreemptParameters", "PreemptParameters"),
@@ -256,7 +256,7 @@ def _detail_job(listed: list[str], budget: _Budget | None = None) -> _Job:
 def _job_snapshot(job_id: int | None = None, budget: _Budget | None = None) -> list[_Job]:
     command = list(_LIST_JOBS)
     if job_id is not None:
-        command = ["squeue", "-h", "-j", str(job_id), "-o", "%i|%u|%q|%T|%N"]
+        command = ["squeue", "-h", "-j", str(job_id), "-o", "%A|%u|%q|%T|%N"]
     listed = []
     for line in _required(command, budget).splitlines():
         if not line.strip():

@@ -149,7 +149,8 @@ Before submitting the victim, it rechecks isolation: the node must be in `main` 
 the chosen golden partition, have exactly one free GPU of that type, be in a
 known usable state, and have no running job of any QoS. This includes CPU-only
 work and existing golden jobs. The scan includes hidden partitions and resolves
-compressed node lists. It fails closed if the scheduler leaves allocation
+compressed node lists. It uses each array task's unique numeric job ID when
+cross-checking `squeue` against `scontrol`. It fails closed if the scheduler leaves allocation
 detail unclear. It pins only its disposable victim and preemptor internally;
 `submit_job` still accepts no caller resource or node
 overrides. The probe cancels only created IDs that live scheduler output
