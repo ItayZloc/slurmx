@@ -149,9 +149,12 @@ Before submitting the victim, it rechecks isolation: the node must be in `main` 
 the chosen golden partition, have exactly one free GPU of that type, be in a
 known usable state, and have no running job of any QoS. This includes CPU-only
 work and existing golden jobs. The scan includes hidden partitions and resolves
-compressed node lists. It uses each array task's unique numeric job ID when
-cross-checking `squeue` against `scontrol`. It fails closed if the scheduler leaves allocation
-detail unclear. It pins only its disposable victim and preemptor internally;
+compressed node lists. It checks node occupancy from the running-job listing,
+without requiring detailed records for jobs on other nodes. An unreadable job
+listing or node list refuses the probe. It cross-checks `squeue` against
+`scontrol` for its own victim, using the array task's numeric job ID, and fails
+closed if that job's allocation detail is unclear. It pins only its disposable
+victim and preemptor internally;
 `submit_job` still accepts no caller resource or node
 overrides. The probe cancels only created IDs that live scheduler output
 confirms belong to the authenticated user with the expected QoS. Its scripts
@@ -160,9 +163,9 @@ and event logs use the authenticated account's fixed
 diagnosis.
 
 The scan filters node partitions before checking GPU accounting, so CPU nodes
-outside the required partitions do not block a GPU candidate. Relevant nodes
-and jobs must have conclusive allocation evidence; unknown nonempty values
-refuse the probe.
+outside the required partitions do not block a GPU candidate. Candidate nodes
+and the probe's own victim must have conclusive GPU allocation evidence;
+unknown nonempty values refuse the probe.
 Per-node requests and job totals must agree after accounting for the expanded
 node count. Matching aggregate and typed GPU counts describe the same GPUs.
 An untyped positive node usage count is usable only when the inventory has one

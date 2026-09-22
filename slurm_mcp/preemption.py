@@ -253,7 +253,7 @@ def _detail_job(listed: list[str], budget: _Budget | None = None) -> _Job:
     )
 
 
-def _job_snapshot(job_id: int | None = None, budget: _Budget | None = None) -> list[_Job]:
+def _job_snapshot(job_id: int | None = None, budget: _Budget | None = None, *, details: bool = True) -> list[_Job]:
     command = list(_LIST_JOBS)
     if job_id is not None:
         command = ["squeue", "-h", "-j", str(job_id), "-o", "%A|%u|%q|%T|%N"]
@@ -262,10 +262,13 @@ def _job_snapshot(job_id: int | None = None, budget: _Budget | None = None) -> l
         if not line.strip():
             continue
         fields = [field.strip() for field in line.split("|")]
-        if len(fields) != 5 or any(not field for field in fields):
+        if (len(fields) != 5 or any(not field for field in fields)
+                or not re.fullmatch(r"[0-9]+", fields[0]) or fields[3] != "RUNNING"):
             raise _QueryFailure("unparseable or incomplete running-job row")
         listed.append(fields)
-    return [_detail_job(fields, budget) for fields in listed]
+    if details:
+        return [_detail_job(fields, budget) for fields in listed]
+    return [_Job(*fields) for fields in listed]
 
 
 def _node_snapshot(budget: _Budget | None = None) -> list[dict[str, str]]:
@@ -368,8 +371,7 @@ def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], budget: _Budg
                 continue
             occupied = False
             for job in jobs:
-                allocation = _job_gpu_on_candidate(job, node, budget)
-                if allocation is not None:
+                if node in _expand_nodelist(job.node_list, budget):
                     occupied = True
                     break
             if occupied:
@@ -484,14 +486,12 @@ def _post_victim_safe(candidate: _Candidate, victim_id: int, policy: _Policy, us
         inventory, usage = _node_gpu_allocations(fields[0])
         total, used = inventory.get(candidate.gpu_type, 0), usage.get(candidate.gpu_type, 0)
         residents = []
-        for job in _job_snapshot(budget=budget):
-            allocation = _job_gpu_on_candidate(job, candidate.node, budget)
-            if allocation is not None:
+        for job in _job_snapshot(budget=budget, details=False):
+            if candidate.node in _expand_nodelist(job.node_list, budget):
                 residents.append(job)
         if total <= 0 or used != total or len(residents) != 1:
             return False
-        victim = residents[0]
-        return _victim_matches(victim, victim_id, candidate, policy, user, _expand_nodelist(victim.node_list, budget))
+        return residents[0].job_id == str(victim_id) and _verify_victim(victim_id, candidate, policy, user, budget)
     except _QueryFailure:
         return False
 
@@ -540,7 +540,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     budget = _Budget(max_seconds)
     try:
         policy = _probe_policy(budget)
-        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget), budget)
+        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget, details=False), budget)
     except _Refusal as exc:
         return f"refused: {exc}; no jobs submitted."
     except _QueryFailure as exc:
@@ -564,7 +564,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
         user = pwd.getpwuid(os.getuid()).pw_name
         budget.before_mutation()
         policy = _probe_policy(budget)
-        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget), budget)
+        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget, details=False), budget)
         if candidate is None:
             raise _Refusal("no isolated node exists")
         budget.before_mutation()

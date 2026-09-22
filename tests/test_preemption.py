@@ -92,6 +92,53 @@ def test_probe_dry_run_accepts_running_array_task_with_numeric_job_id(monkeypatc
     assert "candidate: node=node-a gpu=rtx_6000" in probe_preemption()
 
 
+def test_probe_ignores_unrelated_cpu_job_detail_mismatch(monkeypatch):
+    """A CPU job on another node must not block a free GPU candidate."""
+    from slurm_mcp.preemption import probe_preemption
+
+    responses = _scan_responses()
+    responses[JOB_LIST] = "21455143|other-user|normal|RUNNING|cpu-a\n"
+    responses[("scontrol", "show", "hostnames", "cpu-a")] = "cpu-a\n"
+    responses[("scontrol", "show", "job", "-o", "21455143")] = _job_detail(
+        "21455143", "other-user", "other-qos", "RUNNING", "cpu-a",
+    )
+    _reply(monkeypatch, responses)
+
+    assert "candidate: node=node-a gpu=rtx_6000" in probe_preemption()
+
+
+@pytest.mark.parametrize("job_id,state", [("garbage", "RUNNING"), ("21455143", "RUNNIGN")])
+def test_probe_refuses_malformed_unrelated_running_job_row(monkeypatch, job_id, state):
+    """An invalid listing cannot establish that a candidate node is empty."""
+    from slurm_mcp.preemption import probe_preemption
+
+    responses = _scan_responses()
+    responses[JOB_LIST] = f"{job_id}|other-user|normal|{state}|cpu-a\n"
+    responses[("scontrol", "show", "hostnames", "cpu-a")] = "cpu-a\n"
+    _reply(monkeypatch, responses)
+
+    assert probe_preemption().startswith("refused: scheduler safety query failed: unparseable or incomplete running-job row")
+
+
+def test_post_victim_ignores_unrelated_cpu_job_detail_mismatch(monkeypatch):
+    """Only the verified victim's detail is needed at the final safety gate."""
+    from slurm_mcp.preemption import _Candidate, _Policy, _post_victim_safe
+
+    responses = _allocation_responses(per_node="gres/gpu:rtx_6000=1", allocated="gres/gpu=1")
+    responses[NODE_DETAIL] = NODES_FULL
+    responses[JOB_LIST] += "21455143|other-user|normal|RUNNING|cpu-a\n"
+    responses[("scontrol", "show", "hostnames", "cpu-a")] = "cpu-a\n"
+    responses[("scontrol", "show", "job", "-o", "21455143")] = _job_detail(
+        "21455143", "other-user", "other-qos", "RUNNING", "cpu-a",
+    )
+    _reply(monkeypatch, responses)
+
+    assert _post_victim_safe(
+        _Candidate("node-a", "rtx_6000", "rtx6000"), 101,
+        _Policy("normal", frozenset({"normal"})), "probe-user",
+    )
+
+
 @pytest.mark.parametrize("partitions", ["cpu", "main", "rtx6000", "main,other"])
 @pytest.mark.parametrize("gres", ["(null)", "unavailable"])
 def test_probe_skips_irrelevant_nodes_before_requiring_gpu_evidence(monkeypatch, partitions, gres):
@@ -143,11 +190,9 @@ def test_production_job_allocation_matrix(monkeypatch, per_node, per_job, alloca
     if want is None:
         with pytest.raises(_QueryFailure):
             _job_gpu_on_candidate(jobs[0], "node-a")
-        with pytest.raises(_QueryFailure):
-            _find_candidate(_node_snapshot(), jobs)
     else:
         assert _job_gpu_on_candidate(jobs[0], "node-a") == want
-        assert _find_candidate(_node_snapshot(), jobs) is None
+    assert _find_candidate(_node_snapshot(), jobs) is None
     assert _verify_victim(101, _Candidate("node-a", "rtx_6000", "rtx6000"), policy, "probe-user") is exact
 
 
@@ -450,7 +495,7 @@ def test_tres_job_parser_uses_allocated_tres_when_job_and_node_requests_are_empt
 
 def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(monkeypatch):
     """A compressed allocation on the candidate node must block every preemptible QoS."""
-    from slurm_mcp.preemption import _QueryFailure, _find_candidate, _job_snapshot
+    from slurm_mcp.preemption import _find_candidate, _job_snapshot
 
     nodes = [{
         "NodeName": "node-01", "State": "MIXED", "Partitions": "main,rtx6000",
@@ -462,8 +507,7 @@ def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(m
     responses[detail] = responses[detail].replace("normal", "alternate")
     _reply(monkeypatch, responses)
     jobs = _job_snapshot()
-    with pytest.raises(_QueryFailure, match="cannot attribute"):
-        _find_candidate(nodes, jobs)
+    assert _find_candidate(nodes, jobs) is None
 
 
 @pytest.mark.parametrize("state", ["DOWN", "DRAINING", "FAIL", "MAINT", "NO_RESPOND", "POWER_DOWN", "UNKNOWN"])
