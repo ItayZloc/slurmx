@@ -228,8 +228,12 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
 
     Dry run is the default and submits nothing. It reports the isolated node,
     safety evidence, and the two generated scripts. Real mode repeats the
-    safety scan, resolves node-list membership, uses internal node pinning,
-    submits only disposable jobs, and cancels only IDs it can re-verify as
+    safety scan across all running jobs, including CPU-only and golden jobs.
+    The candidate must have no co-resident jobs. Its pinned victim requests
+    --exclusive; the scheduler must report Exclusive=NODE and OverSubscribe=NO,
+    and the exact owned victim must be the sole running job before preemption.
+    Missing exclusivity evidence refuses the probe. It submits only disposable
+    jobs and cancels only IDs it can re-verify as
     owned by the authenticated user with the expected QoS. Probe logs are
     retained under /home/<user>/.slurmx/probes/ rather than inherited $HOME.
 

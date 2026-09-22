@@ -9,11 +9,11 @@ import pytest
 
 CONFIG = "SLURM_VERSION = 25.11.1\nPreemptType = preempt/qos\nPreemptMode = REQUEUE\nPreemptParameters = send_user_signal\nJobRequeue = 1\nKillWait = 30\n"
 QOS = "normal||REQUEUE|0\nyisroel|normal|REQUEUE|120\n"
-NODES_ONE_FREE = "NodeName=node-a State=MIXED Partitions=main,rtx6000 Gres=gpu:rtx_6000:2 GresUsed=gpu:rtx_6000:1\n"
-NODES_FULL = "NodeName=node-a State=ALLOCATED Partitions=main,rtx6000 Gres=gpu:rtx_6000:2 GresUsed=gpu:rtx_6000:2\n"
+NODES_ONE_FREE = "NodeName=node-a State=IDLE Partitions=main,rtx6000 Gres=gpu:rtx_6000:1 GresUsed=gpu:rtx_6000:0\n"
+NODES_FULL = "NodeName=node-a State=ALLOCATED Partitions=main,rtx6000 Gres=gpu:rtx_6000:1 GresUsed=gpu:rtx_6000:1\n"
 NO_JOBS = ""
 VICTIM_RUNNING = "101|probe-user|normal|RUNNING|node-a|gpu:rtx_6000:1\n"
-JOB_LIST = ("squeue", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")
+JOB_LIST = ("squeue", "--all", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")
 NODE_DETAIL = ("scontrol", "show", "node", "-d", "-o")
 
 
@@ -65,7 +65,8 @@ def _allocation_responses(*, per_job="(null)", per_node="(null)", allocated="(nu
         ("squeue", "-h", "-j", "101", "-o", "%i|%u|%q|%T|%N"): row,
         ("scontrol", "show", "job", "-o", "101"): (
             "JobId=101 UserId=probe-user(1) QOS=normal JobState=RUNNING "
-            f"NodeList={node_list} TresPerJob={per_job} TresPerNode={per_node} AllocTRES={allocated}\n"
+            f"NodeList={node_list} TresPerJob={per_job} TresPerNode={per_node} AllocTRES={allocated} "
+            "Exclusive=NODE OverSubscribe=NO\n"
         ),
         ("scontrol", "show", "hostnames", node_list): expanded,
     })
@@ -124,11 +125,10 @@ def test_production_job_allocation_matrix(monkeypatch, per_node, per_job, alloca
         with pytest.raises(_QueryFailure):
             _job_gpu_on_candidate(jobs[0], "node-a")
         with pytest.raises(_QueryFailure):
-            _find_candidate(_node_snapshot(), jobs, policy)
+            _find_candidate(_node_snapshot(), jobs)
     else:
         assert _job_gpu_on_candidate(jobs[0], "node-a") == want
-        candidate = _find_candidate(_node_snapshot(), jobs, policy)
-        assert (candidate is not None) == (want == {})
+        assert _find_candidate(_node_snapshot(), jobs) is None
     assert _verify_victim(101, _Candidate("node-a", "rtx_6000", "rtx6000"), policy, "probe-user") is exact
 
 
@@ -206,9 +206,9 @@ def test_production_unrelated_job_allocation_is_not_required(monkeypatch, eviden
 
 
 @pytest.mark.parametrize("used,safe", [
-    ("gres/gpu=2", True),
-    ("gres/gpu=1", False),
-    ("gres/gpu=2,gres/gpu:rtx_6000=2", True),
+    ("gres/gpu=1", True),
+    ("gres/gpu=0", False),
+    ("gres/gpu=1,gres/gpu:rtx_6000=1", True),
     ("cpu=unavailable", False),
     ("(null)", False),
     ("gpu:other:2", False),
@@ -217,12 +217,12 @@ def test_post_victim_reconciles_node_usage_at_scheduler_boundary(monkeypatch, us
     from slurm_mcp.preemption import _Candidate, _Policy, _post_victim_safe
 
     responses = _allocation_responses(per_node="gres/gpu:rtx_6000=1", allocated="gres/gpu=1")
-    responses[NODE_DETAIL] = f"NodeName=node-a State=MIXED Partitions=main,rtx6000 Gres=gpu:rtx_6000:2 GresUsed={used}\n"
+    responses[NODE_DETAIL] = f"NodeName=node-a State=ALLOCATED Partitions=main,rtx6000 Gres=gpu:rtx_6000:1 GresUsed={used}\n"
     _reply(monkeypatch, responses)
 
     assert _post_victim_safe(
         _Candidate("node-a", "rtx_6000", "rtx6000"), 101,
-        _Policy("normal", frozenset({"normal"})),
+        _Policy("normal", frozenset({"normal"})), "probe-user",
     ) is safe
 
 
@@ -295,7 +295,9 @@ def test_probe_dry_run_reports_internal_pinning_scripts_and_evidence(monkeypatch
     assert "#SBATCH --nodelist=node-a" in result
     assert "#SBATCH --qos=normal" in result
     assert "#SBATCH --qos=yisroel" in result
-    assert "safety evidence: one free GPU; no running QoS that the primary golden QoS can preempt" in result
+    assert "safety evidence: one free GPU; no running jobs of any QoS on the candidate" in result
+    assert "victim requests --exclusive" in result
+    assert "Exclusive=NODE and OverSubscribe=NO" in result
     assert not any(command[0] == "sbatch" for command in calls)
 
 
@@ -303,7 +305,7 @@ def test_victim_verification_requires_exact_identity_owner_qos_node_state_and_gp
     """Relaxing any post-victim identity field would allow an unrelated job to trigger preemption."""
     from slurm_mcp.preemption import _Candidate, _Job, _Policy, _verify_victim
 
-    victim = _Job("101", "probe-user", "normal", "RUNNING", "node-01", per_node_raw="gres/gpu:rtx_6000=1")
+    victim = _Job("101", "probe-user", "normal", "RUNNING", "node-01", per_node_raw="gres/gpu:rtx_6000=1", exclusive="NODE", oversubscribe="NO")
     monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda *args, **kwargs: [victim])
     monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda *args, **kwargs: {"node-01"})
     candidate = _Candidate("node-01", "rtx_6000", "rtx6000")
@@ -325,7 +327,7 @@ def test_post_victim_check_refuses_an_alternate_preemptible_race(monkeypatch):
     monkeypatch.setattr("slurm_mcp.preemption._job_snapshot", lambda *args, **kwargs: jobs)
     monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value, *args, **kwargs: {value})
 
-    assert not _post_victim_safe(_Candidate("node-a", "rtx_6000", "rtx6000"), 101, _Policy("normal", frozenset({"normal", "alternate"})))
+    assert not _post_victim_safe(_Candidate("node-a", "rtx_6000", "rtx6000"), 101, _Policy("normal", frozenset({"normal", "alternate"})), "probe-user")
 
 
 def test_measurement_requires_a_received_preemption_signal(tmp_path):
@@ -429,7 +431,7 @@ def test_tres_job_parser_uses_allocated_tres_when_job_and_node_requests_are_empt
 
 def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(monkeypatch):
     """A compressed allocation on the candidate node must block every preemptible QoS."""
-    from slurm_mcp.preemption import _Policy, _QueryFailure, _find_candidate, _job_snapshot
+    from slurm_mcp.preemption import _QueryFailure, _find_candidate, _job_snapshot
 
     nodes = [{
         "NodeName": "node-01", "State": "MIXED", "Partitions": "main,rtx6000",
@@ -441,10 +443,8 @@ def test_candidate_rejects_compressed_nodelist_and_alternative_preemptible_qos(m
     responses[detail] = responses[detail].replace("normal", "alternate")
     _reply(monkeypatch, responses)
     jobs = _job_snapshot()
-    policy = _Policy(victim_qos="normal", preemptible_qos=frozenset({"normal", "alternate"}))
-
     with pytest.raises(_QueryFailure, match="cannot attribute"):
-        _find_candidate(nodes, jobs, policy)
+        _find_candidate(nodes, jobs)
 
 
 @pytest.mark.parametrize("state", ["DOWN", "DRAINING", "FAIL", "MAINT", "NO_RESPOND", "POWER_DOWN", "UNKNOWN"])
@@ -457,11 +457,11 @@ def test_candidate_rejects_non_usable_node_states(state):
 
 def test_candidate_requires_detailed_gres_used_field():
     """Missing GresUsed must not be interpreted as an unused GPU."""
-    from slurm_mcp.preemption import _Policy, _QueryFailure, _find_candidate
+    from slurm_mcp.preemption import _QueryFailure, _find_candidate
 
     nodes = [{"NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000", "Gres": "gpu:rtx_6000:2"}]
     with pytest.raises(_QueryFailure, match="missing GPU allocation"):
-        _find_candidate(nodes, [], _Policy("normal", frozenset({"normal"})))
+        _find_candidate(nodes, [])
 
 
 def test_authenticated_probe_root_ignores_malicious_home_and_rejects_bad_account_path(monkeypatch):
@@ -677,19 +677,19 @@ def test_gpu_allocation_parser_rejects_text_after_an_annotation():
 
 def test_candidate_refuses_unknown_node_gpu_usage():
     """An unavailable GresUsed field cannot create a false isolated GPU."""
-    from slurm_mcp.preemption import _Policy, _QueryFailure, _find_candidate
+    from slurm_mcp.preemption import _QueryFailure, _find_candidate
 
     nodes = [{
         "NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000",
         "Gres": "gpu:rtx_6000:2", "GresUsed": "unavailable",
     }]
     with pytest.raises(_QueryFailure):
-        _find_candidate(nodes, [], _Policy("normal", frozenset({"normal"})))
+        _find_candidate(nodes, [])
 
 
 def test_candidate_ignores_unrelated_multinode_allocation_before_gpu_parsing(monkeypatch):
     """Malformed allocation data outside the candidate's expanded node set is irrelevant."""
-    from slurm_mcp.preemption import _Job, _Policy, _find_candidate
+    from slurm_mcp.preemption import _Job, _find_candidate
 
     nodes = [{
         "NodeName": "node-a", "State": "MIXED", "Partitions": "main,rtx6000",
@@ -698,7 +698,7 @@ def test_candidate_ignores_unrelated_multinode_allocation_before_gpu_parsing(mon
     job = _Job("99", "other", "normal", "RUNNING", "node[02-03]", per_node_raw="unavailable", allocated_raw="unavailable")
     monkeypatch.setattr("slurm_mcp.preemption._expand_nodelist", lambda value, *args, **kwargs: {"node-02", "node-03"})
 
-    assert _find_candidate(nodes, [job], _Policy("normal", frozenset({"normal"}))).node == "node-a"
+    assert _find_candidate(nodes, [job]).node == "node-a"
 
 
 def test_multinode_per_node_and_total_gpu_evidence_are_scope_aware(monkeypatch):
@@ -734,12 +734,14 @@ def _boundary_scheduler(
     monkeypatch, tmp_path, *, post_race=False, query_failure=False,
     foreign_cleanup=False, never_runs=False, per_node="gres/gpu:rtx_6000=1",
     allocated="gres/gpu=1,gres/gpu:rtx_6000=1", untyped_node_usage=False,
+    co_resident=None, initial_co_resident=False,
+    exclusive_fields="Exclusive=NODE OverSubscribe=NO",
 ):
     """Mock the scheduler process boundary and reject every unmodelled command."""
     import types
     from slurm_mcp import preemption
 
-    state = {"victim": False, "preemptor": False, "cancelled": [], "config_calls": 0}
+    state = {"victim": False, "preemptor": False, "cancelled": [], "config_calls": 0, "scripts": []}
     victim = "101|probe-user|normal|RUNNING|node-a"
     alternate = "202|other|alternate|RUNNING|node-a"
 
@@ -747,7 +749,7 @@ def _boundary_scheduler(
         job_id, user, qos, job_state, node = row.split("|")
         return (
             f"JobId={job_id} UserId={user}(1) QOS={qos} JobState={job_state} "
-            f"NodeList={node} TresPerNode={per_node} AllocTRES={allocated}\n"
+            f"NodeList={node} TresPerNode={per_node} AllocTRES={allocated} {exclusive_fields}\n"
         )
 
     def run(command, timeout=30):
@@ -766,8 +768,8 @@ def _boundary_scheduler(
             return "NodeName=cpu-a State=IDLE Partitions=cpu Gres=(null) GresUsed=(null)\n" + output
         if cmd == JOB_LIST:
             if not state["victim"]:
-                return ""
-            return victim + "\n" + (alternate + "\n" if post_race else "")
+                return co_resident[0] + "\n" if initial_co_resident else ""
+            return victim + "\n" + (alternate + "\n" if post_race else "") + (co_resident[0] + "\n" if co_resident else "")
         if cmd[:4] == ("squeue", "-h", "-j", "101"):
             if cmd[-1] == "%i|%u|%q":
                 owner = "other-user" if foreign_cleanup else "probe-user"
@@ -781,9 +783,12 @@ def _boundary_scheduler(
                 return detail(victim)
             if job_id == "202":
                 return detail(alternate)
+            if job_id == "303" and co_resident:
+                return co_resident[1]
         if cmd == ("scontrol", "show", "hostnames", "node-a"):
             return "node-a\n"
         if cmd[:2] == ("sbatch", "--parsable"):
+            state["scripts"].append(Path(cmd[2]).read_text())
             if not state["victim"]:
                 state["victim"] = True
                 return "101\n"
@@ -800,6 +805,117 @@ def _boundary_scheduler(
     monkeypatch.setattr(preemption, "_probe_scripts", lambda *args, **kwargs: ("victim", "preemptor"))
     monkeypatch.setattr(preemption.pwd, "getpwuid", lambda _: types.SimpleNamespace(pw_name="probe-user"))
     return state
+
+
+@pytest.mark.parametrize("qos,allocation", [
+    ("normal", "cpu=2,mem=4G,node=1"),
+    ("alternate", "cpu=2,mem=4G,node=1"),
+    ("yisroel", "cpu=2,mem=4G,node=1,gres/gpu=1"),
+])
+@pytest.mark.parametrize("initial", [True, False])
+def test_real_probe_rejects_every_co_resident_at_scheduler_boundary(monkeypatch, tmp_path, qos, allocation, initial):
+    from slurm_mcp.preemption import probe_preemption
+
+    resident = (
+        f"303|other|{qos}|RUNNING|node-a",
+        f"JobId=303 UserId=other(2) QOS={qos} JobState=RUNNING NodeList=node-a "
+        f"TresPerJob=(null) TresPerNode=(null) AllocTRES={allocation}\n",
+    )
+    state = _boundary_scheduler(monkeypatch, tmp_path, co_resident=resident, initial_co_resident=initial)
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert result.startswith("refused:")
+    assert not state["preemptor"]
+    assert state["cancelled"] == ([] if initial else ["101"])
+    assert state["victim"] is (not initial)
+
+
+@pytest.mark.parametrize("exclusive_fields", [
+    "", "OverSubscribe=NO", "Shared=0", "Exclusive=NO OverSubscribe=NO",
+    "Exclusive=USER OverSubscribe=NO", "Exclusive=MCS OverSubscribe=NO",
+    "Exclusive=unknown OverSubscribe=NO", "Exclusive=NODE OverSubscribe=YES",
+    "Exclusive=NODE OverSubscribe=unknown",
+])
+def test_real_probe_refuses_without_affirmative_node_exclusivity(monkeypatch, tmp_path, exclusive_fields):
+    from slurm_mcp.preemption import probe_preemption
+
+    state = _boundary_scheduler(monkeypatch, tmp_path, exclusive_fields=exclusive_fields)
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert result.startswith("refused:")
+    assert "exclusive" in result
+    assert not state["preemptor"]
+    assert state["cancelled"] == ["101"]
+
+
+def test_real_probe_submits_node_exclusive_victim(monkeypatch, tmp_path):
+    from slurm_mcp import preemption
+
+    scripts = preemption._probe_scripts
+    state = _boundary_scheduler(monkeypatch, tmp_path)
+    monkeypatch.setattr(preemption, "_probe_scripts", lambda candidate, directory, **kwargs: scripts(
+        candidate, Path("/home/probe-user/.slurmx/probes/check"), **kwargs,
+    ))
+    result = preemption.probe_preemption(dry_run=False, max_seconds=5)
+
+    assert result.startswith("probe completed:")
+    assert "#SBATCH --exclusive\n" in state["scripts"][0]
+    assert state["cancelled"] == ["101", "102"]
+
+
+@pytest.mark.parametrize("row,detail", [
+    ("303||normal|RUNNING|node-a", ""),
+    ("303|other|normal|RUNNING|node-a", "JobId=303 QOS=normal JobState=RUNNING NodeList=node-a AllocTRES=cpu=2"),
+    ("303|other|normal|RUNNING|node-a", "JobId=303 UserId=other(2) QOS=normal JobState=RUNNING NodeList=node-a AllocTRES=cpu=unknown"),
+])
+@pytest.mark.parametrize("initial", [True, False])
+def test_real_probe_unknown_co_resident_fails_closed(monkeypatch, tmp_path, row, detail, initial):
+    from slurm_mcp.preemption import probe_preemption
+
+    state = _boundary_scheduler(monkeypatch, tmp_path, co_resident=(row, detail), initial_co_resident=initial)
+    result = probe_preemption(dry_run=False, max_seconds=5)
+
+    assert result.startswith("refused:")
+    assert not state["preemptor"]
+    assert state["cancelled"] == ([] if initial else ["101"])
+
+
+def test_candidate_scan_includes_jobs_in_hidden_partitions(monkeypatch):
+    from slurm_mcp.preemption import probe_preemption
+
+    responses = _allocation_responses(allocated="cpu=2,mem=4G,node=1")
+    row = responses.pop(JOB_LIST)
+    responses[("squeue", "--all", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")] = row
+    _reply(monkeypatch, responses)
+
+    assert probe_preemption().startswith("refused: no isolated node exists")
+
+
+@pytest.mark.parametrize("job_id,user,qos,state,node", [
+    ("101", "other", "normal", "RUNNING", "node-a"),
+    ("101", "probe-user", "yisroel", "RUNNING", "node-a"),
+    ("101", "probe-user", "normal", "COMPLETING", "node-a"),
+    ("101", "probe-user", "normal", "RUNNING", "node-b"),
+    ("102", "probe-user", "normal", "RUNNING", "node-a"),
+])
+def test_post_victim_requires_exact_sole_resident_identity(monkeypatch, job_id, user, qos, state, node):
+    from slurm_mcp.preemption import _Candidate, _Policy, _post_victim_safe
+
+    responses = {
+        NODE_DETAIL: NODES_FULL,
+        JOB_LIST: f"{job_id}|{user}|{qos}|{state}|{node}\n",
+        ("scontrol", "show", "job", "-o", job_id): (
+            f"JobId={job_id} UserId={user}(1) QOS={qos} JobState={state} NodeList={node} "
+            "AllocTRES=gres/gpu=1 TresPerNode=gres/gpu:rtx_6000=1 Exclusive=NODE OverSubscribe=NO\n"
+        ),
+        ("scontrol", "show", "hostnames", node): node + "\n",
+    }
+    _reply(monkeypatch, responses)
+
+    assert not _post_victim_safe(
+        _Candidate("node-a", "rtx_6000", "rtx6000"), 101,
+        _Policy("normal", frozenset({"normal"})), "probe-user",
+    )
 
 
 @pytest.mark.parametrize("per_node,allocated,untyped_node_usage", [

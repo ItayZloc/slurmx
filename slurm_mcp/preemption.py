@@ -18,7 +18,7 @@ from . import shell
 from .gpu_catalog import GPU_TYPES, PRIMARY_QOS
 
 
-_LIST_JOBS = ("squeue", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")
+_LIST_JOBS = ("squeue", "--all", "-h", "-t", "RUNNING", "-o", "%i|%u|%q|%T|%N")
 _CONFIG_KEYS = (
     ("SLURM version", "SLURM_VERSION"), ("PreemptType", "PreemptType"),
     ("PreemptMode", "PreemptMode"), ("PreemptParameters", "PreemptParameters"),
@@ -82,6 +82,8 @@ class _Job:
     per_node_raw: str = ""
     per_job_raw: str = ""
     allocated_raw: str = ""
+    exclusive: str = ""
+    oversubscribe: str = ""
 
 
 def _required(cmd: list[str] | tuple[str, ...], budget: _Budget | None = None) -> str:
@@ -247,6 +249,7 @@ def _detail_job(listed: list[str], budget: _Budget | None = None) -> _Job:
     return _Job(
         job_id, user, qos, state, node_list, per_job_raw=values[0],
         per_node_raw=values[1], allocated_raw=values[2],
+        exclusive=detail.get("Exclusive", ""), oversubscribe=detail.get("OverSubscribe", ""),
     )
 
 
@@ -349,7 +352,7 @@ def _probe_policy(budget: _Budget | None = None) -> _Policy:
     return _Policy(victim_qos="normal", preemptible_qos=frozenset(tokens))
 
 
-def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], policy: _Policy, budget: _Budget | None = None) -> _Candidate | None:
+def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], budget: _Budget | None = None) -> _Candidate | None:
     golden = {gpu.name: gpu.golden_partition for gpu in GPU_TYPES if gpu.golden_partition}
     for fields in nodes:
         node = fields.get("NodeName", "")
@@ -365,10 +368,8 @@ def _find_candidate(nodes: list[dict[str, str]], jobs: list[_Job], policy: _Poli
                 continue
             occupied = False
             for job in jobs:
-                if job.state != "RUNNING" or job.qos not in policy.preemptible_qos:
-                    continue
                 allocation = _job_gpu_on_candidate(job, node, budget)
-                if allocation is not None and sum(allocation.values()) > 0:
+                if allocation is not None:
                     occupied = True
                     break
             if occupied:
@@ -412,6 +413,7 @@ def _probe_scripts(candidate: _Candidate, probe_dir: Path, *, max_seconds: int, 
 #SBATCH --gres=gpu:{candidate.gpu_type}:1
 #SBATCH --time={_time_limit(max_seconds)}
 #SBATCH --requeue
+#SBATCH --exclusive
 #SBATCH --output={output_dir}/victim-%j.out
 set -u
 event_log={shlex.quote(str(event_log))}
@@ -451,6 +453,17 @@ def _exact_gpu(job: _Job, candidate: _Candidate, nodes: set[str]) -> bool:
     return allocation in ({candidate.gpu_type: 1}, {"": 1})
 
 
+def _victim_matches(job: _Job, job_id: int, candidate: _Candidate, policy: _Policy, user: str, nodes: set[str]) -> bool:
+    if not (
+        job.job_id == str(job_id) and job.user == user and job.qos == policy.victim_qos
+        and job.state == "RUNNING" and nodes == {candidate.node} and _exact_gpu(job, candidate, nodes)
+    ):
+        return False
+    if job.exclusive != "NODE" or job.oversubscribe != "NO":
+        raise _Refusal("scheduler did not establish a node-exclusive victim; preemptor was not submitted")
+    return True
+
+
 def _verify_victim(job_id: int, candidate: _Candidate, policy: _Policy, user: str, budget: _Budget | None = None) -> bool:
     rows = _job_snapshot(job_id, budget)
     if len(rows) != 1:
@@ -458,29 +471,27 @@ def _verify_victim(job_id: int, candidate: _Candidate, policy: _Policy, user: st
     job = rows[0]
     try:
         nodes = _expand_nodelist(job.node_list, budget)
-        return (
-            job.job_id == str(job_id) and job.user == user and job.qos == policy.victim_qos
-            and job.state == "RUNNING" and nodes == {candidate.node} and _exact_gpu(job, candidate, nodes)
-        )
+        return _victim_matches(job, job_id, candidate, policy, user, nodes)
     except _QueryFailure:
         return False
 
 
-def _post_victim_safe(candidate: _Candidate, victim_id: int, policy: _Policy, budget: _Budget | None = None) -> bool:
+def _post_victim_safe(candidate: _Candidate, victim_id: int, policy: _Policy, user: str, budget: _Budget | None = None) -> bool:
     fields = [node for node in _node_snapshot(budget) if node.get("NodeName") == candidate.node]
     if len(fields) != 1 or not _node_is_usable(fields[0].get("State", "")) or "GresUsed" not in fields[0]:
         return False
     try:
         inventory, usage = _node_gpu_allocations(fields[0])
         total, used = inventory.get(candidate.gpu_type, 0), usage.get(candidate.gpu_type, 0)
-        preemptible = []
+        residents = []
         for job in _job_snapshot(budget=budget):
-            if job.qos not in policy.preemptible_qos:
-                continue
             allocation = _job_gpu_on_candidate(job, candidate.node, budget)
-            if allocation is not None and sum(allocation.values()) > 0:
-                preemptible.append(job)
-        return total > 0 and used == total and len(preemptible) == 1 and preemptible[0].job_id == str(victim_id)
+            if allocation is not None:
+                residents.append(job)
+        if total <= 0 or used != total or len(residents) != 1:
+            return False
+        victim = residents[0]
+        return _victim_matches(victim, victim_id, candidate, policy, user, _expand_nodelist(victim.node_list, budget))
     except _QueryFailure:
         return False
 
@@ -529,7 +540,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     budget = _Budget(max_seconds)
     try:
         policy = _probe_policy(budget)
-        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget), policy, budget)
+        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget), budget)
     except _Refusal as exc:
         return f"refused: {exc}; no jobs submitted."
     except _QueryFailure as exc:
@@ -544,7 +555,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
     except _Refusal as exc:
         return f"refused: {exc}; no jobs submitted."
     if dry_run:
-        return "\n".join(("dry run: no jobs submitted.", f"candidate: node={candidate.node} gpu={candidate.gpu_type} golden_partition={candidate.golden_partition}", "safety evidence: one free GPU; no running QoS that the primary golden QoS can preempt", "--- victim script ---", victim_script, "--- preemptor script ---", preemptor_script))
+        return "\n".join(("dry run: no jobs submitted.", f"candidate: node={candidate.node} gpu={candidate.gpu_type} golden_partition={candidate.golden_partition}", "safety evidence: one free GPU; no running jobs of any QoS on the candidate", "real-mode gate: victim requests --exclusive; scheduler must report Exclusive=NODE and OverSubscribe=NO, with the exact owned victim as the sole running job", "--- victim script ---", victim_script, "--- preemptor script ---", preemptor_script))
 
     probe_dir: Path | None = None
     created: list[tuple[int, str]] = []
@@ -553,7 +564,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
         user = pwd.getpwuid(os.getuid()).pw_name
         budget.before_mutation()
         policy = _probe_policy(budget)
-        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget), policy, budget)
+        candidate = _find_candidate(_node_snapshot(budget), _job_snapshot(budget=budget), budget)
         if candidate is None:
             raise _Refusal("no isolated node exists")
         budget.before_mutation()
@@ -569,7 +580,7 @@ def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
             time.sleep(1)
         else:
             raise _Refusal("timeout waiting for an exactly verified disposable victim")
-        if not _post_victim_safe(candidate, victim_id, policy, budget) or not _verify_victim(victim_id, candidate, policy, user, budget):
+        if not _post_victim_safe(candidate, victim_id, policy, user, budget) or not _verify_victim(victim_id, candidate, policy, user, budget):
             raise _Refusal("post-victim safety check failed; preemptor was not submitted")
         budget.before_mutation()
         preemptor_id = _submit(preemptor_script, probe_dir / "preemptor.sh", budget)

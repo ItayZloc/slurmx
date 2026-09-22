@@ -17,7 +17,7 @@ def run_info(_args: argparse.Namespace) -> None:
 
 
 def add_probe_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--real", action="store_true", help="Submit the disposable probe after every safety check.")
+    parser.add_argument("--real", action="store_true", help="Run the disposable probe on an empty node with a verified exclusive victim.")
     parser.add_argument("--max-seconds", type=int, default=600, help="Bounded real-probe diagnostic, 1-3600 seconds; cleanup has a fixed 5-second window (default: 600).")
 
 

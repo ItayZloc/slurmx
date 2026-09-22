@@ -25,7 +25,7 @@ MCP TOOLS (invoked by Claude in chat)
   job_history              recent jobs from sacct, finished ones included
   preemption_info          read controller and QoS preemption settings
   probe_preemption         dry-run-first guarded preemption diagnostic;
-                           real mode verifies all preemptible QoS work and
+                           requires an empty node and verified exclusive victim;
                            retains logs under /home/<user>/.slurmx/probes/
 
   None of them raise on failure — they return it. Read what comes back.

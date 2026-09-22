@@ -145,12 +145,13 @@ slurmx probe-preemption --real --max-seconds 600
 ```
 
 Real mode is only appropriate after an explicit decision to test the scheduler.
-It rechecks isolation before each submission: the node must be in `main` and
+Before submitting the victim, it rechecks isolation: the node must be in `main` and
 the chosen golden partition, have exactly one free GPU of that type, be in a
-known usable state, and have no running GPU job in any QoS the primary golden
-QoS can preempt. It resolves compressed node lists and fails closed if the
-scheduler leaves allocation detail unclear. It pins only its disposable victim
-and preemptor internally; `submit_job` still accepts no caller resource or node
+known usable state, and have no running job of any QoS. This includes CPU-only
+work and existing golden jobs. The scan includes hidden partitions and resolves
+compressed node lists. It fails closed if the scheduler leaves allocation
+detail unclear. It pins only its disposable victim and preemptor internally;
+`submit_job` still accepts no caller resource or node
 overrides. The probe cancels only created IDs that live scheduler output
 confirms belong to the authenticated user with the expected QoS. Its scripts
 and event logs use the authenticated account's fixed
@@ -167,6 +168,15 @@ An untyped positive node usage count is usable only when the inventory has one
 GPU type; mixed inventories need typed evidence for positive usage. Victim
 verification accepts a consistent aggregate count of one using the probe's
 submitted typed request, and rejects conflicting counts or types.
+
+The victim requests `--exclusive` so another job cannot start alongside it.
+Before submitting the preemptor, the probe verifies that the victim is the sole
+running job on the node and checks its exact ID, owner, QoS, node, state, GPU
+allocation, and scheduler-reported `Exclusive=NODE` with `OverSubscribe=NO`.
+Missing, unknown, or contradictory exclusivity evidence refuses the real probe
+and triggers disposable-job cleanup. Older scheduler output that omits
+`Exclusive` therefore refuses; `OverSubscribe=NO` alone is insufficient. See
+the [SLURM job exclusivity fields](https://slurm.schedmd.com/squeue.html).
 
 `max_seconds` accepts 1 through 3600 and bounds scheduler calls and every
 submission decision. It excludes a separate, fixed five-second cleanup window
