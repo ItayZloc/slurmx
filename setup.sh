@@ -68,19 +68,6 @@ fi
 echo "==> Running 'uv sync' (creates .venv if missing)"
 uv sync
 
-# --- Install the reloadable, read-only preemption scanner ----------------- #
-SCAN_DIR="$("$REPO/.venv/bin/python" -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir + "/.slurmx")')"
-SCAN_PATH="$SCAN_DIR/preemption_scan.py"
-if [ ! -e "$SCAN_PATH" ] && [ ! -L "$SCAN_PATH" ]; then
-    if [ ! -d "$SCAN_DIR" ]; then
-        install -d -m 700 "$SCAN_DIR"
-    fi
-    install -m 700 "$REPO/slurm_mcp/preemption_scan_runtime.py" "$SCAN_PATH"
-    echo "==> Installed reloadable preemption scanner: $SCAN_PATH"
-else
-    echo "==> Keeping existing preemption scanner: $SCAN_PATH"
-fi
-
 # --- Symlink every bin/*.sh into ~/.local/bin/ (with .sh stripped) -------- #
 mkdir -p "$LINKS_DIR"
 shopt -s nullglob

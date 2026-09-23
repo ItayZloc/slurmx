@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backing commands for SLURM preemption inspection and the guarded probe."""
+"""Backing command for read-only SLURM preemption inspection."""
 
 from __future__ import annotations
 
@@ -14,12 +14,3 @@ def add_info_arguments(parser: argparse.ArgumentParser) -> None:
 
 def run_info(_args: argparse.Namespace) -> None:
     print(slurm_mcp.preemption_info())
-
-
-def add_probe_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--real", action="store_true", help="Run the disposable probe on an empty node with a verified exclusive victim.")
-    parser.add_argument("--max-seconds", type=int, default=600, help="Bounded real-probe diagnostic, 1-3600 seconds; cleanup has a fixed 5-second window (default: 600).")
-
-
-def run_probe(args: argparse.Namespace) -> None:
-    print(slurm_mcp.probe_preemption(dry_run=not args.real, max_seconds=args.max_seconds))

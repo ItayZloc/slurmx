@@ -1,5 +1,9 @@
 # Standalone preemption probe implementation plan
 
+Status: superseded by the user's simpler native RTX 6000 test on 2026-09-23.
+The current procedure and code are in `scripts/preemption_probe.py` and
+`scripts/PREEMPTION_PROBE.md`; do not execute the plan below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the MCP preemption probe with a self-contained one-off diagnostic in `/home/itayzloc/preemption-probe/` and measure only on the user's RTX 6000 or RTX 6000 Pro golden allocation.

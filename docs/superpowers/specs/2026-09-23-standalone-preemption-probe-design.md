@@ -1,6 +1,8 @@
 # Standalone preemption probe
 
-Status: design approved in chat on 2026-09-23; written spec awaiting review.
+Status: superseded by the user's simpler native RTX 6000 test on 2026-09-23.
+The current procedure and code are in `scripts/preemption_probe.py` and
+`scripts/PREEMPTION_PROBE.md`; the design below is historical.
 
 ## Purpose
 

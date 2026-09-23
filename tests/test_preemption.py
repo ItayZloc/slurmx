@@ -552,25 +552,24 @@ def test_measurement_requires_a_received_preemption_signal(tmp_path):
     assert _measurement(events) == (None, None, True)
 
 
-def test_cli_exposes_inspection_and_dry_run_probe(monkeypatch, capsys):
-    """The CLI must keep the real probe opt-in and pass its bounded wait through."""
+def test_cli_exposes_inspection_but_not_probe(monkeypatch, capsys):
+    """The one-off probe must not remain a CLI command."""
+    import pytest
     from cli import preemption as cli_preemption
     from cli import slurmx
 
     parser = slurmx.build_parser()
     inspect_args = parser.parse_args(["preemption-info"])
-    probe_args = parser.parse_args(["probe-preemption", "--real", "--max-seconds", "42"])
     monkeypatch.setattr(cli_preemption.slurm_mcp, "preemption_info", lambda: "INFO")
-    monkeypatch.setattr(cli_preemption.slurm_mcp, "probe_preemption", lambda **kwargs: repr(kwargs))
 
     inspect_args._run(inspect_args)
     assert capsys.readouterr().out == "INFO\n"
-    probe_args._run(probe_args)
-    assert capsys.readouterr().out == "{'dry_run': False, 'max_seconds': 42}\n"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["probe-preemption"])
 
 
-def test_mcp_exposes_preemption_operations(monkeypatch):
-    """The server adapter must preserve the probe's dry-run default."""
+def test_mcp_exposes_inspection_but_not_probe(monkeypatch):
+    """The MCP server must not register the one-off diagnostic."""
     import sys
     import types
 
@@ -593,10 +592,10 @@ def test_mcp_exposes_preemption_operations(monkeypatch):
     try:
         import server
         monkeypatch.setattr(server.slurm_mcp, "preemption_info", lambda: "INFO")
-        monkeypatch.setattr(server.slurm_mcp, "probe_preemption", lambda **kwargs: repr(kwargs))
 
         assert server.preemption_info() == "INFO"
-        assert server.probe_preemption() == "{'dry_run': True, 'max_seconds': 600}"
+        assert not hasattr(server, "probe_preemption")
+        assert not hasattr(server.slurm_mcp, "probe_preemption")
     finally:
         if previous is None:
             sys.modules.pop("server", None)

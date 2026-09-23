@@ -52,7 +52,6 @@ finishes.
 | `diagnose_job` | Classify a *finished* job's failure (OOM, timeout, missing module, dependency, killed, code error) and show the log tail. Running/pending jobs short-circuit. |
 | `cancel_jobs` | Cancel by ID, or every job you own. The count returned is cancels requested, not confirmed. |
 | `preemption_info` | Read the controller and configured QoS preemption settings. Failed scheduler queries are shown as unavailable. |
-| `probe_preemption` | Default dry run for a guarded, node-pinned normal-vs-golden scheduler diagnostic. Real mode is explicit and retains logs under `~/.slurmx/probes/`. |
 
 Every tool reports failure in its return value instead of raising, so a call that
 returned isn't necessarily a call that worked. Each docstring spells out its own
@@ -135,73 +134,17 @@ controller's preemption settings and the normal plus configured golden QoS
 relationships. Query failures, missing values, and unset QoS fields are shown
 separately, so an empty-looking result never implies a default policy.
 
-`probe_preemption` is a scheduler diagnostic, not a normal submission path.
-It defaults to dry run and reports a candidate node, safety evidence, and its
-two generated scripts without calling `sbatch`. The CLI equivalent is:
+The old MCP/CLI probe has been retired. The one-off RTX 6000 measurement lives
+in `scripts/preemption_probe.py` and is installed at
+`~/preemption-probe/probe.py`. It submits a normal-QoS exclusive victim on
+`main`, reads its assigned node, checks that no other jobs are there, then
+submits a `yisroel` job pinned to that node. The script records signal,
+heartbeat, and restart timestamps in `~/preemption-probe/runs/` and cancels
+only its own job IDs. Run it without `--run` for a no-submit preview. This is
+a one-off diagnostic, not part of normal `submit_job` behavior.
 
-```bash
-slurmx probe-preemption
-slurmx probe-preemption --real --max-seconds 600
-```
-
-Read-only candidate and post-victim scans run from
-`/home/<user>/.slurmx/preemption_scan.py` in a fresh Python process for each
-scan. `setup.sh` installs the versioned `slurm_mcp/preemption_scan_runtime.py`
-there if no home copy exists; it leaves an existing copy alone. Update the home
-copy to change scan logic without restarting the MCP server. The registered
-tool keeps job submission, exact-victim verification, and cleanup. A missing,
-unreadable, or malformed scanner refuses the probe. The scanner file and its
-directory must be user-owned and not group- or world-writable. Installing this
-bridge requires one MCP restart; later scanner-only edits do not.
-
-Real mode is only appropriate after an explicit decision to test the scheduler.
-Before submitting the victim, it rechecks isolation: the node must be in `main` and
-the chosen golden partition, have exactly one free GPU of that type, be in a
-known usable state, and have no running job of any QoS. This includes CPU-only
-work and existing golden jobs. The scan includes hidden partitions and resolves
-compressed node lists, while plain single-node names need no extra scheduler
-query. It checks node occupancy from the running-job listing,
-without requiring detailed records for jobs on other nodes. An unreadable job
-listing or node list refuses the probe. It cross-checks `squeue` against
-`scontrol` for its own victim, using the array task's numeric job ID, and fails
-closed if that job's allocation detail is unclear. It pins only its disposable
-victim and preemptor internally;
-`submit_job` still accepts no caller resource or node
-overrides. The probe cancels only created IDs that live scheduler output
-confirms belong to the authenticated user with the expected QoS. Its scripts
-and event logs use the authenticated account's fixed
-`/home/<user>/.slurmx/probes/` directory, not `$HOME`, and remain there for
-diagnosis.
-
-The scan filters node partitions before checking GPU accounting, so CPU nodes
-outside the required partitions do not block a GPU candidate. Candidate nodes
-and the probe's own victim must have conclusive GPU allocation evidence;
-unknown nonempty values refuse the probe.
-Per-node requests and job totals must agree after accounting for the expanded
-node count. Matching aggregate and typed GPU counts describe the same GPUs.
-An untyped positive node usage count is usable only when the inventory has one
-GPU type; mixed inventories need typed evidence for positive usage. Victim
-verification accepts a consistent aggregate count of one using the probe's
-submitted typed request, and rejects conflicting counts or types.
-
-The victim requests `--exclusive` so another job cannot start alongside it.
-It may wait in the queue; a pending victim is not treated as a running job.
-Before submitting the preemptor, the probe verifies that the victim is the sole
-running job on the node and checks its exact ID, owner, QoS, node, state, GPU
-allocation, and scheduler-reported `Exclusive=NODE` with `OverSubscribe=NO`.
-Missing, unknown, or contradictory exclusivity evidence refuses the real probe
-and triggers disposable-job cleanup. Older scheduler output that omits
-`Exclusive` therefore refuses; `OverSubscribe=NO` alone is insufficient. See
-the [SLURM job exclusivity fields](https://slurm.schedmd.com/squeue.html).
-
-`max_seconds` accepts 1 through 3600 and bounds scheduler calls and every
-submission decision. It excludes a separate, fixed five-second cleanup window
-that can only inspect and cancel IDs created by this probe after matching their
-owner and QoS. The result reports retained logs only when the probe directory
-was created successfully. The victim records received TERM and USR1 signals
-without voluntarily ending, so a reported estimate is the first received
-preemption signal to the final one-second heartbeat before the scheduler
-requeues it.
+The 2026-09-23 result and exact job IDs are in
+[`scripts/PREEMPTION_PROBE.md`](scripts/PREEMPTION_PROBE.md).
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
 card's pending GPUs by user in dispatch order — like the Running block but

@@ -45,9 +45,7 @@ Check with MCP cluster_summary or squeue, not ps aux.
 - Use cluster_summary as the single dashboard tool: it covers jobs AND GPU availability.
   Use view="jobs" or view="gpu" to narrow the output.
 - Use diagnose_job to classify failures (OOM, timeout, missing module, code error).
-- Use preemption_info for read-only controller/QoS preemption settings. The
-  probe_preemption tool is dry-run-first; do not use real mode unless a
-  scheduler diagnostic was explicitly authorized.
+- Use preemption_info for read-only controller/QoS preemption settings.
 - These tools report failure in their return value rather than raising, so read what
   comes back: "success: false" from submit_job, "No log file found ..." from
   read_job_log, state UNKNOWN from get_job_status. A call that returned is not a
@@ -220,31 +218,6 @@ def preemption_info() -> str:
     never reported as an empty/default setting.
     """
     return slurm_mcp.preemption_info()
-
-
-@mcp.tool()
-def probe_preemption(dry_run: bool = True, max_seconds: int = 600) -> str:
-    """Preview or explicitly run a tightly scoped normal-vs-golden preemption probe.
-
-    Dry run is the default and submits nothing. It reports the isolated node,
-    safety evidence, and the two generated scripts. Real mode repeats the
-    safety scan across all running jobs, including CPU-only and golden jobs.
-    The read-only scanner is loaded fresh from /home/<user>/.slurmx/
-    preemption_scan.py on each scan; submission and cleanup stay in this tool.
-    The candidate must have no co-resident jobs. Its pinned victim requests
-    --exclusive; the scheduler must report Exclusive=NODE and OverSubscribe=NO,
-    and the exact owned victim must be the sole running job before preemption.
-    Missing exclusivity evidence refuses the probe. It submits only disposable
-    jobs and cancels only IDs it can re-verify as
-    owned by the authenticated user with the expected QoS. Probe logs are
-    retained under /home/<user>/.slurmx/probes/ rather than inherited $HOME.
-
-    Args:
-        dry_run: Keep true unless a real scheduler diagnostic is authorized.
-        max_seconds: Real-probe diagnostic wall-clock bound, from 1 to 3600 seconds.
-            Exact-ID ownership cleanup has a separate fixed five-second bound.
-    """
-    return slurm_mcp.probe_preemption(dry_run=dry_run, max_seconds=max_seconds)
 
 
 @mcp.tool()

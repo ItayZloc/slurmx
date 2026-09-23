@@ -24,9 +24,6 @@ MCP TOOLS (invoked by Claude in chat)
   cancel_jobs              cancel by ID, all, or pending-only
   job_history              recent jobs from sacct, finished ones included
   preemption_info          read controller and QoS preemption settings
-  probe_preemption         dry-run-first guarded preemption diagnostic;
-                           requires an empty node and verified exclusive victim;
-                           retains logs under /home/<user>/.slurmx/probes/
 
   None of them raise on failure — they return it. Read what comes back.
 
@@ -46,10 +43,6 @@ CLI COMMANDS
                              slurmx history               recent finished jobs (sacct)
                              slurmx cancel ID|--all       cancel jobs
                              slurmx preemption-info        read preemption settings
-                             slurmx probe-preemption       preview guarded probe
-                             slurmx probe-preemption --real
-                                                          run it only after an
-                                                          explicit safety decision
                              slurmx config                edit config.py in a form
                                                           (--show prints it as text;
                                                            creates it on first run)
