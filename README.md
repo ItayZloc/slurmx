@@ -143,8 +143,9 @@ heartbeat, and restart timestamps in `~/preemption-probe/runs/` and cancels
 only its own job IDs. Run it without `--run` for a no-submit preview. This is
 a one-off diagnostic, not part of normal `submit_job` behavior.
 
-The 2026-09-23 result and exact job IDs are in
-[`scripts/PREEMPTION_PROBE.md`](scripts/PREEMPTION_PROBE.md).
+The [2026-09-23 conclusion](docs/preemption-conclusion.md) records the
+measured interval and what it means for checkpointing. The exact procedure
+and job IDs are in [`scripts/PREEMPTION_PROBE.md`](scripts/PREEMPTION_PROBE.md).
 
 When a golden ticket is **full**, `slurmx status` and `cluster_summary` list the
 card's pending GPUs by user in dispatch order — like the Running block but
